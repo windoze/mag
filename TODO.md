@@ -142,7 +142,7 @@
   相等 / 非法 SessionId → Err / 保守能力位断言）；3) `cargo clippy --all-targets -- -D warnings` 无警告；
   4) `cargo test --workspace` 全通过；5) `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无缺 doc 警告。
 
-### [TODO] M1-2 bin 装配 + `initialize` handler + 内存管道 e2e 骨架
+### [DONE] M1-2 bin 装配 + `initialize` handler + 内存管道 e2e 骨架
 
 **上下文**：
 
@@ -177,6 +177,47 @@
 - 聚焦测试：`cargo test -p mag-acp initialize`（含内存管道 `initialize` 往返 e2e）在 1 分钟内绿。
 - 完整验证序列 1–5；clippy 无警告；`cargo doc` 无缺 doc 警告。
 - 依赖边界自检：`mag-acp` 仍不依赖 `mag-core`/`agent-lib`；只有新 `mag` bin crate 依赖二者。
+
+**完成记录（M1-2）**：
+
+- **`serve` 库入口**（`crates/mag-acp/src/lib.rs`）：`pub async fn serve<T>(service: Arc<dyn MagService>,
+  transport: T) -> Result<(), agent_client_protocol::Error> where T: ConnectTo<Agent> + 'static`。内部
+  `Agent.builder().name("mag-acp")` 注册 `initialize` + `authenticate` 两个 request handler（经
+  `on_receive_request!()` 宏），`.connect_to(transport).await` 跑 run loop。`service` 已进签名（未被
+  initialize/authenticate 消费，后续 handler 捕获用；Rust 不对未用函数参数告警）。
+- **handlers**（`crates/mag-acp/src/handlers.rs`，`pub(crate) async fn`，带 rustdoc）：
+  - `initialize`：回 `InitializeResponse::new(req.protocol_version).agent_capabilities(map::agent_capabilities())`
+    （版本协商回传 §7 + 复用 M1-1 保守能力 §3.1）。
+  - `authenticate`：`initialize` 不宣告 `auth_methods`，正常 client 不会调用；占位返回
+    `AuthenticateResponse::new()`（空成功）以稳健应对探测（§3.1）。
+- **`mag` bin crate**（`crates/mag/`，已加入根 `Cargo.toml` `[workspace] members`）：依赖
+  `mag-core` + `mag-acp` + `mag-service` + `agent-client-protocol`（唯一同时见 mag-core 与 mag-acp 的装配点，
+  保住 mag-acp 库依赖边界）。`mag --acp` → `Arc::new(Engine::new()) as Arc<dyn MagService>` →
+  `mag_acp::serve(service, Stdio::new()).await`；无 `--acp` 打印 usage 并 exit(2)。provider/model 装配随来源
+  配置后续里程碑补齐（ACP 不传 LLM 选择），M1-2 bin 为握手骨架。
+- **内存管道夹具 + e2e**（`crates/mag-acp/tests/e2e.rs`）：直接复用 acp crate **自带**的
+  `agent_client_protocol::Channel::duplex()`（纯内存 mpsc 交叉连接，`impl<R:Role> ConnectTo<R> for Channel`）
+  作内存传输——已有现成内存构造子，故**未**自搭 `tokio::io::duplex` 适配（任务放行条件："若 acp 无现成内存
+  构造子才搭"；如需字节级序列化可改用 `ByteStreams`(AsyncRead/Write)，备选已核实）。测试用真实
+  `Client.builder().connect_with(client_transport, |cx| …)` 发 `InitializeRequest::new(ProtocolVersion::V1)`，
+  断言回吐的 `agent_capabilities` 与 `map::agent_capabilities()` 全等且保守位（`load_session`/`image` 为
+  `false`）。服务端 `tokio::spawn`，客户端调用包 `timeout(10s)` 防挂起，完成后 `server.abort()`。
+- **锚点核对**（就地对 cargo 缓存 acp v1.2.0 / schema v1.4.0）：agent 端 role-marker + builder + typed-handler
+  模型属实（`Agent.builder()`/`on_receive_request(closure, on_receive_request!())`/`connect_to(impl
+  ConnectTo<Agent>+'static)`）；handler 闭包 `async move |req, responder: Responder<Resp>, cx:
+  ConnectionTo<Client>| -> Result<(), Error>`，`responder.respond(resp)->Result<(),Error>`（`()`→
+  `Handled::Yes`）；`InitializeResponse::new(pv).agent_capabilities(..)` / `AuthenticateResponse::new()` /
+  `ProtocolVersion::V1`（在 `schema::ProtocolVersion`，不在 `schema::v1`）均属实。与 `docs/ACP.md` §1 一致，
+  **无需修正锚点**。
+- **验证（全绿）**：1) `cargo fmt --all -- --check` OK；2) `cargo test -p mag-acp initialize` 1 passed（内存
+  管道 `initialize` 往返，<0.01s，无挂起）；3) `cargo clippy --all-targets -- -D warnings` 无警告；
+  4) `cargo test --workspace` 全通过（含 mag-acp e2e 1 + map:: 3，无失败）；5) `RUSTDOCFLAGS="-D warnings"
+  cargo doc --no-deps --workspace` 无缺 doc 警告（修正 bin 一处 redundant-explicit-link）。额外真实 stdio 冒烟：
+  `echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}' | mag --acp` 正确回
+  `agentCapabilities`（`loadSession:false`、多模态位全 `false`、`authMethods:[]`）。
+- **依赖边界自检**：`crates/mag-acp/Cargo.toml` 正常依赖仍只 `mag-service` + `agent-client-protocol`（新增
+  `async-trait`/`futures`/`tokio` 仅 dev-dependencies，供 e2e 的 fake `Arc<dyn MagService>` 与运行时用）；
+  无 `mag-core`/`agent-lib`/`tauri`/`axum`。
 
 ### [TODO] M1-3 `session/new` handler → `create_session`（cwd → `SessionConfig`）
 

@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/mag",
     "crates/mag-acp",
     "crates/mag-core",
     "crates/mag-service",

@@ -6,3 +6,8 @@ edition.workspace = true
 [dependencies]
 mag-service = { path = "../mag-service" }
 agent-client-protocol = "1"
+
+[dev-dependencies]
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

@@ -1,0 +1,15 @@
+[package]
+name = "mag"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "mag"
+path = "src/main.rs"
+
+[dependencies]
+mag-acp = { path = "../mag-acp" }
+mag-core = { path = "../mag-core" }
+mag-service = { path = "../mag-service" }
+agent-client-protocol = "1"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
