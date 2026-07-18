@@ -2,10 +2,10 @@
 
 //! Transport-neutral engine core for mag.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn placeholder_core_crate_is_testable() {
-        assert_eq!("mag-core", env!("CARGO_PKG_NAME"));
-    }
-}
+mod engine;
+mod event_bus;
+mod ids;
+
+pub use engine::{CommandOutput, Engine, EngineError, SessionInfo};
+pub use event_bus::{EventBus, EventStream};
+pub use ids::MagIds;

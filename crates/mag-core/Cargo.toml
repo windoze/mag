@@ -8,3 +8,9 @@ agent-lib.workspace = true
 mag-protocol = { path = "../mag-protocol" }
 mag-sources = { path = "../mag-sources" }
 mag-tools = { path = "../mag-tools" }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tokio-stream = { workspace = true, features = ["sync"] }
+uuid.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

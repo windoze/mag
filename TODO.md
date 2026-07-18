@@ -114,7 +114,7 @@
   doctest 全绿）、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`（30 分钟上限包装，8 个单元测试 +
   doctest 全绿）、`cargo doc --no-deps --workspace`。
 
-### [TODO] C0-3 `Engine` 空壳 + 内存事件总线 + id source
+### [DONE] C0-3 `Engine` 空壳 + 内存事件总线 + id source
 
 **上下文**：
 
@@ -139,6 +139,24 @@
 - 单元测试：`MagIds` 产的 id 唯一；`continuing_after` 从给定水位续号不回退。
 - 聚焦：`cargo test -p mag-core engine::skeleton`（或相应模块名）。
 - 完整验证序列 1–5。
+
+**完成记录（2026-07-18）**：
+
+- 在 `mag-core` 新增 `Engine` 空壳，持有内存 `SessionManager` 与 `EventBus`；`CreateSession` 生成稳定
+  `SessionId`、登记会话并 emit `Event::SessionCreated`。
+- `ListSessions` 通过 `CommandOutput::Sessions(Vec<SessionInfo>)` 返回当前内存会话列表；会话级未实现命令
+  统一 emit `Event::RunError`，非会话级未实现命令返回 `EngineError::UnsupportedCommand`。
+- 新增基于 `tokio::sync::broadcast` 的内存事件总线，`subscribe()` 返回实现 `Stream<Item = Event>` 的
+  `EventStream`，多个订阅者可同时收到后续事件。
+- 新增 `MagIds`，使用 per-source 共享单调计数器从 1 开始生成 UUID-backed agent-lib ID；实现
+  `RequirementIds` 与 `ToolExecutionIds`，并提供 `seeded` / `continuing_after(high_water)` 续号入口及
+  `ConversationId`、`TurnId`、`MessageId`、`StepId`、`RunId`、`AgentId`、`ToolSetId`、`TraceNodeId`
+  等构造方法。
+- 添加 `mag-core` 单元测试覆盖 `CreateSession` 事件、`ListSessions`、多订阅者广播、会话级未实现错误事件、
+  `MagIds` 唯一性、clone 共享计数器、零种子钳制和高水位续号。
+- 验证通过：`cargo fmt --all`、`cargo fmt --all -- --check`、`cargo test -p mag-core engine::skeleton`、
+  `cargo test -p mag-core ids`、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`（30 分钟上限包装，
+  15 个单元测试 + doctest 全绿）、`cargo doc --no-deps --workspace`。
 
 ### [TODO] C0-R Review：骨架 + 协议一致性
 
