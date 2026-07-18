@@ -73,3 +73,32 @@
 - 全部验证通过：fmt --check、clippy -D warnings、cargo test -p mag-core engine::chat/driver、
   cargo test --workspace（mag-core 9 绿）、cargo doc --no-deps --workspace。
 - 已将 TODO.md C1-3 标 [DONE] 并补完成记录。下一步：git diff 复核并提交。
+
+## C1-R Review：纯对话流式贯通（facade 路径）（当前任务）
+
+### 目标
+Review 任务：核对 mag-core 已切到 facade `Agent`+`Agent::stream`（C1-3），未绕过
+`Conversation`/machine，`TextDelta` 语义与 `docs/DESIGN.md` §3.4 一致，`WireRunEvent`
+映射无丢事件，自组 scope 残留代码已清理。汇总缺口。跑完整验证序列 1–5。
+
+### Review 结论（代码核对）
+- driver.rs：`SessionDriver` 持 facade `Agent`（`Agent::builder().client().model()...build()`），
+  `send_message` 消费 `agent.stream(text)`，逐 `RunEvent::to_wire() -> WireRunEvent` 映射。✓ 走 facade。
+- 未自拼 message Vec / 不重写状态机；历史由 facade `Conversation` 跨轮累积。✓
+- `TextDelta` → `Event::TextDelta`；`Done` 折叠为 `RunOutput` 后 emit `RunFinished`，
+  与 §3.4「逐 RunEvent → to_wire → mag Event」一致。✓
+- `map_wire_event` 对纯对话产出的 `TextDelta`/`Done` 全覆盖，无丢事件；Tool/Approval/
+  Delegation/Raw 变体 C1 不产出，明确注释延后到 C3+（已在 C3 任务安排）。✓
+- 残留清理：无 `StreamingTapHandler`/`MagScope`/`drain`/`ids.rs`/`MagIds`/`llm.rs`；
+  仅 driver.rs 文档注释提及已下沉到 facade。✓
+- 无需插入新的前置/阻塞任务；前向缺口（工具/审批/委派映射）已由 C3+ 覆盖。
+
+### 步骤
+1. 跑验证序列：fmt --check → clippy -D warnings → cargo test --workspace → cargo doc。
+2. 标记 TODO.md C1-R `[DONE]` 并补完成记录（含 review 对照与缺口汇总）。
+3. 提交。
+
+### 进度（C1-R 完成）
+- 完整验证序列 1–5 全绿：fmt --check、clippy -D warnings（干净）、cargo test --workspace（mag-core 9 + mag-protocol 5 + mag-sources 1 + mag-tools 1）、cargo doc。
+- Review 未发现新阻塞缺口；前向变体映射已由 C3+ 覆盖。
+- 已将 TODO.md C1-R 标 [DONE] 并补完成记录。下一步：git 提交。

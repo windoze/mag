@@ -375,13 +375,40 @@
   `cargo clippy --all-targets -- -D warnings`（无死代码/警告）、`cargo test --workspace`（1800 秒上限包装，
   mag-core 9 + mag-protocol 5 + mag-sources 1 + mag-tools 1，doctest 全绿）、`cargo doc --no-deps --workspace`。
 
-### [TODO] C1-R Review：纯对话流式贯通（facade 路径）
+### [DONE] C1-R Review：纯对话流式贯通（facade 路径）
 
 **做什么**：核对 mag-core 已切到 facade `Agent`+`Agent::stream`（C1-3）、未绕过 `Conversation`/machine（facade
 内部仍走）；`TextDelta` 语义与 `docs/DESIGN.md` §3.4 一致；`WireRunEvent` 映射无丢事件；确认自组 scope 残留代码
 已清理。汇总缺口。
 
 **验证条件**：完整验证序列 1–5 全绿。
+
+**完成记录（2026-07-18）**：
+
+- **facade 路径核对**：`crates/mag-core/src/driver.rs` 的 `SessionDriver` 持有 facade `Agent`
+  （`Agent::builder().client(..).model(..).max_tokens(..).max_steps(..).build()`），`send_message` 消费
+  `agent.stream(text)` 产出的 `RunEvent`，逐个经官方 `RunEvent::to_wire() -> WireRunEvent` 投影再映射进 mag
+  `Event`。确认已切到 C1-3 目标接入面，无自组 `DefaultAgentMachine`/`HandlerScope`/`drain` 装配。
+- **未绕过 `Conversation`/machine**：driver 不自拼 message `Vec`、不重写状态机；多轮历史由 facade 内部
+  `Conversation` 自然累积（`chat::send_message_accumulates_history_in_one_session` 断言第二轮请求含首轮
+  user/assistant 消息）。符合 `docs/DESIGN.md` §9 不变量。
+- **`TextDelta` 语义与 §3.4 一致**：§3.4 要求「driver 逐 `RunEvent` → `to_wire()` → 映射进 mag `Event` 写
+  `event_bus`」。`map_wire_event` 将 `WireRunEvent::TextDelta(text)` 直接映射为 `Event::TextDelta { id, text }`，
+  终态 `WireRunEvent::Done` 折叠成 `RunOutput` 后由 driver emit `RunFinished`，事件序列
+  `RunStarted → TextDelta* → RunFinished` 与 §3.4/§4.2 一致，未回退。
+- **`WireRunEvent` 映射无丢事件**：纯对话路径仅产出 `TextDelta` 与终态 `Done`，两者均被 `map_wire_event` 覆盖，
+  无遗漏；`driver::tests` 覆盖 `TextDelta`/`Done` 映射与 `WireRunEvent` serde round-trip。`Tool`/`Approval`/
+  `Delegation`/`Raw` 变体在 C1 纯对话不产出，代码以显式注释延后到 C3+（`ToolStarted`/`ToolFinished` 见 C3-1/
+  C3-3、`InteractionRequested` 见 C3-2、委派见后续里程碑），非丢事件而是已排期的前向缺口。
+- **自组 scope 残留清理**：确认已无 `StreamingTapHandler`（C1-1）、`MagScope`/`DefaultAgentMachine`/`drain`
+  自组装配（C1-2）、`ids.rs`/`MagIds`（C0-3 残留）、`llm.rs`；全仓 grep 仅在 `driver.rs` 文档注释中提及这些已
+  下沉到 facade。clippy `-D warnings` 无死代码/未用符号告警。
+- **缺口汇总**：C1-R 未发现需插入 `TODO.md` 的新前置/阻塞缺口。前向未覆盖的 `WireRunEvent` 变体
+  （工具/审批/委派/Raw）映射均已由 C3+ 既有任务安排；持久化恢复的 `interaction_handler` 注入口缺口已在
+  `docs/DESIGN.md` §3.6 记录并由 C4-1 依赖跟踪。
+- 验证通过（完整序列 1–5）：`cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`（干净）、
+  `cargo test --workspace`（mag-core 9 + mag-protocol 5 + mag-sources 1 + mag-tools 1，doctest 全绿）、
+  `cargo doc --no-deps --workspace`。C1-R 仅改动文档（`TODO.md`/`memory`），编译产物自 C1-3 绿以来未变。
 
 ---
 
