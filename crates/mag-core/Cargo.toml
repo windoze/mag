@@ -5,6 +5,8 @@ edition.workspace = true
 
 [dependencies]
 agent-lib.workspace = true
+async-trait.workspace = true
+futures.workspace = true
 mag-protocol = { path = "../mag-protocol" }
 mag-sources = { path = "../mag-sources" }
 mag-tools = { path = "../mag-tools" }

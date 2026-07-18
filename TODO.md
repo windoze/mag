@@ -229,7 +229,7 @@
 目标：自组 `HandlerScope` + `drain` 驱动一次真实 LLM turn（用 fake client 离线），`StreamingTapHandler`
 逐 delta emit `TextDelta`，`SendMessage` → `TextDelta*` → `RunFinished`。这是引擎主干的第一次贯通。
 
-### [TODO] C1-1 fake `LlmClient` 测试夹具 + `StreamingTapHandler`
+### [DONE] C1-1 fake `LlmClient` 测试夹具 + `StreamingTapHandler`
 
 **上下文**：
 
@@ -252,6 +252,22 @@
   `Response` 文本完整、可 commit。
 - 聚焦：`cargo test -p mag-core llm::stream`。
 - 完整验证序列 1–5。
+
+**完成记录（2026-07-18）**：
+
+- 在 `mag-core` 新增 `llm` 模块并公开导出 `StreamingTapHandler`；handler 持有 `Arc<dyn LlmClient>`、
+  `EventBus` 与 `SessionId`，实现 agent-lib `LlmHandler`。
+- `StreamingTapHandler::fold` 使用 agent-lib `Accumulator` 折叠 `StreamEvent` 为完整 `Response`；遇到
+  `StreamEvent::BlockDelta { delta: Delta::Text(..) }` 时逐片段 emit `Event::TextDelta { id, text }`。
+- `LlmHandler::fulfill` 强制将请求切到 streaming 路径并调用 `chat_stream`，保持 machine 返回路径仍是
+  `RequirementResult::Llm(Result<Response, ClientError>)`。
+- 增加 `FakeLlmClient` 测试夹具，支持 raw script、纯文本流和 tool-use 响应脚本；同时记录 `chat` 与
+  `chat_stream` 请求，供当前和后续 driver 测试复用。
+- 添加 `llm::stream` 单元测试，覆盖 text delta 事件序列、完整文本 `Response` 折叠、fulfill 强制流式请求，以及
+  fake client 的 tool-use 脚本响应。
+- 验证通过：`cargo fmt --all`、`cargo fmt --all -- --check`、`cargo test -p mag-core llm::stream`、
+  `cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`（1800 秒超时包装，18 个单元测试 +
+  doctest 全绿）、`cargo doc --no-deps --workspace`。
 
 ### [TODO] C1-2 自组 scope 驱动一次对话 turn
 

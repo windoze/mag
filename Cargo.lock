@@ -541,6 +541,8 @@ name = "mag-core"
 version = "0.1.0"
 dependencies = [
  "agent-lib",
+ "async-trait",
+ "futures",
  "mag-protocol",
  "mag-sources",
  "mag-tools",

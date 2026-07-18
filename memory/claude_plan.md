@@ -1,36 +1,28 @@
 # 执行计划
 
-## 当前约束
+## 约束说明
 
-- 输出使用中文。
-- `TODO.md` 是任务顺序和完成状态的权威来源。
-- 本轮只完成第一个标题未带 `[DONE]` 的任务，然后停止。
-- 完成后需要更新 `TODO.md` 的任务标题和完成记录，并提交 Git commit。
-- 若发现阻塞当前任务的规格不匹配、缺失前置条件或未安排的测试失败，需要先修复，或把最小前置任务插入 `TODO.md` 后提交并停止。
-- 不把例行进展写入 `PLAN.md`，除非阶段级计划、依赖或完成标准发生变化。
+- 本文件用于记录可审计的执行计划、关键判断依据和进度更新。
+- 不记录逐字内部思考过程；改为记录足以复核的推理摘要、决策依据和操作步骤。
+- 输出与进度记录使用中文。
 
-## 步骤计划
+## 当前状态
 
-1. 读取 `TODO.md`，按文件顺序找出第一个标题未带 `[DONE]` 的任务。
-2. 检查最新提交信息是否明确提到与该任务直接相关的未完成问题。
-3. 读取当前任务涉及的代码、测试和文档，只做与当前任务相关的调查。
-4. 按任务要求实现完整变更；如遇必须先解决的阻塞问题，更新 `TODO.md` 记录前置任务并停止。
-5. 在关键实现步骤完成后更新本文件，记录实际进展和计划调整。
-6. 运行验证：先 `cargo fmt`，再 `cargo clippy --all-targets -- -D warnings`，最后运行任务要求的测试或完整测试套件。
-7. 若有未安排的测试失败，修复或在 `TODO.md` 中插入最小前置任务，不把当前任务标为完成。
-8. 成功后更新 `TODO.md`：在任务标题前加 `[DONE]`，补充完成记录和验证结果。
-9. 检查 Git diff，提交本轮所有相关变更。
-10. 停止，不处理下一个任务。
+- 已读取 `TODO.md`，第一个未完成任务是 `C1-1 fake LlmClient 测试夹具 + StreamingTapHandler`。
+- 已检查最新提交：`8dc99ca [C0-R] Review skeleton and protocol consistency`，未明确提到与 C1-1 直接相关的未完成问题。
+- 当前工作区未提交变更仅包含本计划文件。
+- 本次只完成 C1-1；完成后更新 `TODO.md`、执行验证、提交 Git，然后停止。
 
-## 进展记录
+## 初始执行步骤
 
-- 已创建本执行计划文件，下一步读取 `TODO.md` 确认本轮任务。
-- 已读取 `TODO.md`，首个未完成任务为 `C0-R Review：骨架 + 协议一致性`。
-- 最新提交为 `[C0-3] Add engine skeleton and id source`，与当前 review 相关，但提交信息未指出需要先处理的未完成 issue。
-- 当前执行重点：核对 `DESIGN.md` §2/§4 与 workspace/protocol 实现一致性，形成协议对照表，运行完整验证序列，通过后更新 `TODO.md` 并提交。
-- 协议对照发现 `DESIGN.md` §4.2 中的 `DelegationMessage` 事件尚未实现；这是当前 review 的直接一致性缺口，将在本轮补齐并增加 serde round-trip 覆盖。
-- 已补齐 `Event::DelegationMessage` 与 `DelegationMessageWire`，并加入事件 round-trip/tag 测试。
-- 已运行 `cargo fmt --all` 与 `cargo test -p mag-protocol`，当前均通过；`cargo tree -p mag-protocol` 确认无 `agent-lib` 依赖。
-- 完整验证已通过：`cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`（30 分钟上限包装）、`cargo doc --no-deps --workspace`。
-- 已将 `TODO.md` 中 `C0-R Review：骨架 + 协议一致性` 标记为 `[DONE]`，并补充完成记录、协议对照表和验证结果。
-- 下一步：复查 git diff/status，提交本轮变更后停止。
+1. 已根据 C1-1 读取 `agent-lib` 中 `LlmClient`、`LlmHandler`、`Accumulator`、`StreamEvent`、`Delta`、facade `StreamingTapHandler` 以及相关 fake client 测试样板。
+2. 已读取 `mag-core` 当前模块结构、事件总线和协议事件类型，确定将实现放在 `mag-core::llm`，并公开导出 `StreamingTapHandler`。
+3. 已在 `mag-core` 实现 `StreamingTapHandler`：包装 `Arc<dyn LlmClient>`，在流式 fold 中逐个文本 delta emit `Event::TextDelta`，并用 agent-lib accumulator 折叠成 `Response`。
+4. 已实现测试用 `FakeLlmClient`，支持脚本化纯文本流与带 tool-use 的响应。
+5. 已添加 C1-1 单元测试：断言 `TextDelta` 序列与脚本一致，折叠出的 `Response` 文本完整且可交回 agent-lib。
+6. 已运行 `cargo fmt --all` 与 `cargo fmt --all -- --check`，格式检查通过。
+7. 已运行聚焦测试 `cargo test -p mag-core llm::stream`，3 个 C1-1 测试通过。
+8. 已按要求运行 `cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`（1800 秒超时包装）、
+   `cargo doc --no-deps --workspace`，均通过。
+9. 已在 `TODO.md` 将 C1-1 标为 `[DONE]` 并补完成记录。
+10. 下一步检查工作区变更，提交所有本次任务相关文件，然后停止。
