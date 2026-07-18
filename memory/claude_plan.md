@@ -145,3 +145,63 @@ M1-1 / M1-2 均已 `[DONE]` 且提交，工作区干净。
 - 缺口汇总：无阻塞缺口，未插前置任务；后续项（M2 泵/映射、M3 审批、M4 cancel/load、M4-2 能力收口）已调度。
 - PLAN.md 无需改（无阶段计划变更）。
 - 下一个未完成任务：M2-1（map: ServiceEvent → SessionUpdate + ContentBlock → UserInput + stop reason）。
+
+---
+
+# 更新（本次调用）：实现 M2-1 `map`（ServiceEvent → SessionUpdate + ContentBlock → UserInput + stop reason）
+
+首个未完成任务 = **M2-1**（TODO.md:449，纯函数映射，全无 IO，集中在 `map` 模块）。
+
+## 已核实锚点（acp schema v1.4.0）
+- `SessionUpdate`（client.rs:99，非穷举）：`AgentMessageChunk(ContentChunk)`、`ToolCall(ToolCall)`、
+  `ToolCallUpdate(ToolCallUpdate)` 等。
+- `ContentChunk::new(ContentBlock)`；`ContentBlock: From<T: Into<String>>`（content.rs:118 → Text）。
+- `ToolCall::new(id: impl Into<ToolCallId>, title)`，builder：`.kind(ToolKind)`, `.status(ToolCallStatus)`,
+  `.raw_input(impl IntoOption<Value>)`, `.raw_output(..)`, `.content(Vec<ToolCallContent>)`。
+- `ToolCallUpdate::new(id, ToolCallUpdateFields)`；`ToolCallUpdateFields::new().status(..).content(..).raw_output(..)`。
+- `ToolCallStatus{Pending,InProgress,Completed,Failed}`（非默认 Pending）；`ToolKind`（默认 Other）。
+- `ToolCallContent: From<T: Into<ContentBlock>>`（tool_call.rs:520）→ 文本内容。
+- `StopReason{EndTurn,MaxTokens,MaxTurnRequests,Refusal,Cancelled}`（非穷举）。
+- `IntoOption<T> for Option<T>` 存在 → `Option<Value>` 可直接喂 `.raw_input(..)`。
+
+## mag-service 侧（非穷举需 catch-all `_`）
+- `ServiceEvent`：TextDelta/ToolStarted/ToolFinished/Delegation{Started,Finished,Failed,Message}/
+  RunFinished/RunError/InteractionRequested/SessionCreated/RunStarted/LocalAgentsProbed。
+- `ToolTrace{run_id,call_id:ToolCallIdWire,name,input:Option<Value>,output:Option<Value>,status:ToolStatusWire,message}`。
+- `ToolStatusWire{Started,Finished,Denied,Cancelled,Failed}`（非穷举）。
+- `DelegationTrace{run_id,delegate,task,output,message}`（无 call_id → 用 `delegate:{delegate}` 命名空间作 id，
+  与真实 UUID call_id 不冲突）。
+- `ContentBlock`（非穷举）→ 仅取 Text 拼接（换行连接）；Image/Audio/ResourceLink/Resource 忽略（能力未宣告）。
+
+## 落地映射
+1. `service_event_to_session_update(&ServiceEvent) -> Option<SessionUpdate>`：
+   - TextDelta{text} → AgentMessageChunk(text)
+   - ToolStarted{trace} → ToolCall(map_tool_call)
+   - ToolFinished{trace} → ToolCallUpdate(map_tool_call_update)
+   - DelegationStarted{trace} → ToolCall（id=delegate:{d}, status=InProgress）
+   - DelegationFinished{trace} → ToolCallUpdate（status=Completed, output→content/raw_output）
+   - DelegationFailed{trace} → ToolCallUpdate（status=Failed, message→content）
+   - DelegationMessage{message} → AgentMessageChunk(message.text)（降级为文本）
+   - InteractionRequested / RunFinished / RunError / SessionCreated / RunStarted / LocalAgentsProbed / `_` → None
+2. `map_tool_call(&ToolTrace) -> ToolCall`（pub）：id=call_id.to_string(), title=name,
+   status=tool_status_to_acp(status), raw_input=input.clone()。
+3. `map_tool_call_update(&ToolTrace) -> ToolCallUpdate`（pub）：id 同上，
+   fields.status=tool_status_to_acp, raw_output=output.clone(), message→content 文本。
+4. `content_blocks_to_user_input(&[ContentBlock]) -> UserInput`：Text 换行拼接，非文本忽略。
+5. `run_terminal_to_stop_reason(&ServiceEvent) -> Option<StopReason>`：RunFinished→EndTurn、RunError→Refusal、其余 None。
+6. 私有辅助 `agent_message_chunk`、`tool_status_to_acp`。
+
+## 测试（`cargo test -p mag-acp map::`）
+TextDelta/ToolStarted/ToolFinished(状态映射)/Delegation{Started,Finished,Failed,Message}/未映射事件→None、
+ContentBlock 单/多 Text 拼接 + 非文本忽略 + 空、stop reason 三分支。dev-dep 加 serde_json（构造 input Value）。
+
+## 验证序列 1–5 后提交并停止。
+
+## 完成状态：M2-1 已 [DONE]（本次）
+- map.rs 落地 5 个纯函数（+2 私有辅助），全带 rustdoc；委派表示为工具（delegate:{d} 命名空间 id），
+  未映射/未来变体保守降级，无臆造 ACP 语义。
+- Cargo.toml 加 serde_json dev-dep（构造 tool input/output Value）。
+- 16 个 map:: 单测全绿。验证序列 1–5 全绿（fmt/focused/clippy -D warnings/workspace/doc -D warnings）。
+  （doc 修正：public 函数 rustdoc 不得链私有 tool_status_to_acp，改为纯 code span。）
+- TODO.md M2-1 标 [DONE] + 完成记录。PLAN.md 无需改（无阶段计划变更；R-4/R-5 已预置本版决策）。
+- 下一个未完成任务：M2-2（session/prompt handler 泵）。

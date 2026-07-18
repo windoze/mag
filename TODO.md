@@ -446,7 +446,7 @@ cancel/load（M4）。M1-3→M1-4 依赖已在各自完成记录标注。
 以及支撑它的 `ServiceEvent → SessionUpdate` / `ContentBlock → UserInput` / stop reason 纯函数映射。
 对应 `docs/ACP.md` §3.4 / §4。
 
-### [TODO] M2-1 `map`：`ServiceEvent → SessionUpdate` + `ContentBlock → UserInput` + stop reason
+### [DONE] M2-1 `map`：`ServiceEvent → SessionUpdate` + `ContentBlock → UserInput` + stop reason
 
 **上下文**：
 
@@ -483,6 +483,33 @@ cancel/load（M4）。M1-3→M1-4 依赖已在各自完成记录标注。
 - 聚焦测试：`cargo test -p mag-acp map::`，覆盖 TextDelta/Tool*/Delegation/未知事件降级、ContentBlock 拼接与
   非文本忽略、stop reason 映射。
 - 完整验证序列 1–5；clippy / doc 无警告。
+
+**完成记录**（本次调用）：
+
+- 在 `crates/mag-acp/src/map.rs` 落地纯函数映射（全无 IO，均带 rustdoc）：
+  - `service_event_to_session_update(&ServiceEvent) -> Option<SessionUpdate>`：
+    `TextDelta→AgentMessageChunk`、`ToolStarted→ToolCall`、`ToolFinished→ToolCallUpdate`；
+    委派表示为工具（`PLAN.md` R-4，**不**臆造 `Plan`）——`DelegationStarted→ToolCall(InProgress)`、
+    `DelegationFinished→ToolCallUpdate(Completed)`、`DelegationFailed→ToolCallUpdate(Failed)`、
+    `DelegationMessage→AgentMessageChunk`（降级为文本）；`InteractionRequested`/`RunFinished`/`RunError`/
+    `SessionCreated`/`RunStarted`/`LocalAgentsProbed` + 未来变体 `_` → `None`。
+  - `pub map_tool_call(&ToolTrace)->ToolCall` / `pub map_tool_call_update(&ToolTrace)->ToolCallUpdate`
+    （call_id→ToolCallId、name→title、input→raw_input、output→raw_output、message→content 文本；
+    私有 `tool_status_to_acp`：`Started→InProgress`、`Finished→Completed`、`Denied/Cancelled/Failed→Failed`、
+    未来变体→`InProgress`）。委派无 call_id，用 `delegate:{delegate}` 命名空间 id（与真实 UUID 不冲突）。
+  - `content_blocks_to_user_input(&[ContentBlock])->UserInput`：仅取 `Text` 换行拼接；
+    `Image`/`Audio`/`ResourceLink`/`Resource` 及未来变体忽略（能力未宣告，按协商不会到来）。
+  - `run_terminal_to_stop_reason(&ServiceEvent)->Option<StopReason>`：`RunFinished→EndTurn`、
+    `RunError→Refusal`、其余 `None`（`MaxTokens`/`MaxTurnRequests` 需 service 侧区分，`PLAN.md` R-5，本版不猜）。
+- `crates/mag-acp/Cargo.toml` 加 `serde_json`（dev-dependency，构造 tool input/output `Value`；仍在允许边界内）。
+- 16 个 `map::` 单测覆盖：TextDelta、Tool{Started,Finished}、Denied/Cancelled/Failed 状态、
+  Delegation{Started,Finished,Failed,Message}、非 update 事件→`None`、ContentBlock 多 Text 拼接+非文本忽略+空、
+  stop reason 三分支。
+- 验证序列 1–5 全绿：`cargo fmt --all -- --check` 干净；`cargo test -p mag-acp map::` 16 passed；
+  `cargo clippy --all-targets -- -D warnings` 无警告；`cargo test --workspace` 全绿（mag-acp 16 + 其余 93，0 fail）；
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无警告（修正 public→private intra-doc link）。
+- 无阻塞缺口、无 workaround、未插前置任务；未映射变体保守降级，无臆造 ACP 语义。
+- 下一个未完成任务：M2-2（`session/prompt` handler 泵）。
 
 ### [TODO] M2-2 `session/prompt` handler 的泵（`subscribe` → `send_message` → loop → `PromptResponse`）
 
