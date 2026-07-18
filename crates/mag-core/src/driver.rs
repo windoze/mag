@@ -8,7 +8,18 @@
 //! [`RunEvent`](agent_lib::facade::RunEvent) is projected through the official
 //! [`RunEvent::to_wire`](agent_lib::facade::RunEvent::to_wire) bridge and mapped
 //! into a mag [`Event`].
+//!
+//! The agent is assembled with the session's tool surface and approval gate
+//! (`docs/DESIGN.md` §3.2/§3.3): every [`ToolPlugin`] from the [`ToolRegistry`]
+//! is projected into a facade [`Tool`] via
+//! [`Tool::function_with_schema`](agent_lib::facade::Tool::function_with_schema)
+//! (the facade injects the run-scoped [`ToolContext`] per call), and each tool
+//! that declares [`permission`](ToolPlugin::permission) is gated behind
+//! [`ApprovalPolicy::ask_tool`] so it pauses through the injected
+//! [`IpcApproval`]; tools without a permission stay auto-allowed and never
+//! interrupt the run.
 
+use std::convert::Infallible;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -17,9 +28,17 @@ use std::sync::{
 use agent_lib::{
     agent::InteractionHandler,
     client::LlmClient,
-    facade::{Agent, FacadeError, UsageSummary, WireRunEvent, WireRunOutput},
+    facade::{
+        Agent, ApprovalPolicy, FacadeError, Tool, ToolContext, ToolResult,
+        ToolTrace as FacadeToolTrace, UsageSummary, WireRunEvent, WireRunOutput,
+    },
 };
-use mag_service::{Event, RunId as WireRunId, RunOutput, SessionConfig, SessionId, UsageInfo};
+use mag_service::{
+    Event, RunId as WireRunId, RunOutput, SessionConfig, SessionId, ToolCallIdWire, ToolStatusWire,
+    ToolTrace, UsageInfo,
+};
+use mag_tools::{ToolPlugin, ToolRegistry};
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{EventBus, engine::approval::IpcApproval, session::CancelToken};
@@ -40,6 +59,13 @@ pub(crate) struct SessionDriver {
 impl SessionDriver {
     /// Builds a fresh facade [`Agent`] for the supplied session configuration.
     ///
+    /// The `tools` registry is projected onto the agent: each plugin becomes a
+    /// facade [`Tool`], and any plugin declaring a
+    /// [`permission`](ToolPlugin::permission) is gated behind
+    /// [`ApprovalPolicy::ask_tool`] so it pauses through `approval`. The shared
+    /// [`IpcApproval`] is injected as the interaction handler and stays the sole
+    /// authority answering a paused tool call (`docs/DESIGN.md` §3.3).
+    ///
     /// # Errors
     ///
     /// Returns any [`FacadeError`] raised while assembling the agent (for
@@ -47,15 +73,29 @@ impl SessionDriver {
     pub(crate) fn new(
         config: &SessionConfig,
         client: Arc<dyn LlmClient>,
+        tools: &ToolRegistry,
         approval: Arc<IpcApproval>,
     ) -> Result<Self, FacadeError> {
-        let agent = Agent::builder()
+        let mut builder = Agent::builder()
             .client(client)
             .model(config.model.clone())
             .max_tokens(DEFAULT_MAX_TOKENS)
             .max_steps(DEFAULT_MAX_STEPS)
-            .interaction_handler(approval as Arc<dyn InteractionHandler>)
-            .build()?;
+            .interaction_handler(approval as Arc<dyn InteractionHandler>);
+
+        // Register each tool and gate the ones carrying a permission spec: a
+        // gated tool pauses through the injected `IpcApproval`, while a
+        // permission-free tool (read-only, `permission() == None`) stays on the
+        // default auto-allow tier and runs without interrupting the user.
+        let mut policy = ApprovalPolicy::default();
+        for plugin in tools.plugins() {
+            if plugin.permission().is_some() {
+                policy = policy.ask_tool(plugin.name());
+            }
+            builder = builder.tool(facade_tool(Arc::clone(plugin)));
+        }
+
+        let agent = builder.approval(policy).build()?;
 
         Ok(Self {
             agent,
@@ -171,9 +211,15 @@ enum TurnOutcome {
 ///
 /// A terminal [`WireRunEvent::Done`] is folded into `final_output` and produces
 /// no streamed event (the caller emits [`RunFinished`](Event::RunFinished) once
-/// the stream drains). Tool, approval, delegation, and raw variants are produced
-/// only by later milestones (C3+); the pure-conversation path never yields them,
-/// so they are ignored here.
+/// the stream drains). Tool lifecycle events project into mag's
+/// [`ToolStarted`](Event::ToolStarted) / [`ToolFinished`](Event::ToolFinished).
+///
+/// The facade's [`ApprovalRequested`](WireRunEvent::ApprovalRequested) is
+/// intentionally dropped: it is a fire-and-forget notification, and mag's
+/// canonical pause event is the [`InteractionRequested`](Event::InteractionRequested)
+/// that [`IpcApproval`] emits independently on the pause point (`docs/DESIGN.md`
+/// §3.4). Delegation, escalation, and raw variants are not produced by the
+/// current milestone, so they are ignored here.
 fn map_wire_event(
     session_id: SessionId,
     event: WireRunEvent,
@@ -184,11 +230,60 @@ fn map_wire_event(
             id: session_id,
             text,
         }),
+        WireRunEvent::ToolStarted(trace) => Some(Event::ToolStarted {
+            id: session_id,
+            trace: tool_trace_from_wire(&trace, ToolStatusWire::Started),
+        }),
+        WireRunEvent::ToolFinished(trace) => Some(Event::ToolFinished {
+            id: session_id,
+            trace: tool_trace_from_wire(&trace, ToolStatusWire::Finished),
+        }),
         WireRunEvent::Done(output) => {
             *final_output = Some(run_output_from_wire(&output));
             None
         }
+        // `ApprovalRequested` is covered by `IpcApproval`'s `InteractionRequested`
+        // (see the function docs); every remaining variant is out of scope here.
         _ => None,
+    }
+}
+
+/// Projects one facade [`Tool`] from a [`ToolPlugin`].
+///
+/// The plugin's [`declaration`](ToolPlugin::declaration) supplies the model-facing
+/// name, description, and JSON input schema; the executor forwards the run-scoped
+/// [`ToolContext`] and raw JSON arguments to
+/// [`ToolPlugin::invoke`](ToolPlugin::invoke). The plugin already encodes success
+/// and recoverable failure in its [`ToolResult`] status, so the executor is
+/// infallible from the facade's point of view.
+fn facade_tool(plugin: Arc<dyn ToolPlugin>) -> Tool {
+    let declaration = plugin.declaration();
+    Tool::function_with_schema(
+        declaration.name,
+        declaration.description,
+        declaration.input_schema,
+        move |ctx: ToolContext, args: Value| {
+            let plugin = Arc::clone(&plugin);
+            async move { Ok::<ToolResult, Infallible>(plugin.invoke(ctx, args).await) }
+        },
+    )
+}
+
+/// Projects a facade [`ToolTrace`](FacadeToolTrace) into the wire
+/// [`ToolTrace`], stamping the lifecycle `status`.
+///
+/// The facade trace only carries the tool name and stringified framework call
+/// id; the richer input/output/message fields are populated by later milestones.
+fn tool_trace_from_wire(trace: &FacadeToolTrace, status: ToolStatusWire) -> ToolTrace {
+    ToolTrace {
+        run_id: None,
+        call_id: ToolCallIdWire::parse_str(&trace.call_id)
+            .unwrap_or_else(|_| ToolCallIdWire::new(Uuid::nil())),
+        name: trace.name.clone(),
+        input: None,
+        output: None,
+        status,
+        message: None,
     }
 }
 
@@ -212,6 +307,7 @@ fn usage_from_summary(summary: &UsageSummary) -> UsageInfo {
 
 #[cfg(test)]
 mod tests {
+    use agent_lib::facade::{ApprovalRequest, ToolTrace as FacadeToolTrace};
     use agent_lib::{
         client::Response,
         facade::{RunEvent, RunOutput as FacadeRunOutput, WireRunEvent},
@@ -222,7 +318,7 @@ mod tests {
             usage::Usage,
         },
     };
-    use mag_service::{Event, SessionId, UsageInfo};
+    use mag_service::{Event, SessionId, ToolCallIdWire, ToolStatusWire, ToolTrace, UsageInfo};
     use serde_json::Map;
     use uuid::Uuid;
 
@@ -292,5 +388,73 @@ mod tests {
                 total_tokens: 9,
             })
         );
+    }
+
+    /// Builds a facade [`ToolTrace`](FacadeToolTrace) via serde, since the type
+    /// is `#[non_exhaustive]` and has no public struct constructor.
+    fn facade_trace(name: &str, call: Uuid) -> FacadeToolTrace {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "call_id": call.to_string(),
+        }))
+        .expect("deserialize facade tool trace")
+    }
+
+    #[test]
+    fn tool_started_maps_and_round_trips() {
+        let call = Uuid::from_u128(0xabcd);
+        let wire = RunEvent::ToolStarted(facade_trace("shell", call)).to_wire();
+        round_trip(&wire);
+
+        let mut final_output = None;
+        let mapped = map_wire_event(session_id(), wire, &mut final_output);
+
+        assert_eq!(
+            mapped,
+            Some(Event::ToolStarted {
+                id: session_id(),
+                trace: ToolTrace {
+                    run_id: None,
+                    call_id: ToolCallIdWire::new(call),
+                    name: "shell".to_owned(),
+                    input: None,
+                    output: None,
+                    status: ToolStatusWire::Started,
+                    message: None,
+                },
+            })
+        );
+        assert!(final_output.is_none());
+    }
+
+    #[test]
+    fn tool_finished_maps_and_round_trips() {
+        let call = Uuid::from_u128(0x1234);
+        let wire = RunEvent::ToolFinished(facade_trace("read_file", call)).to_wire();
+        round_trip(&wire);
+
+        let mut final_output = None;
+        let mapped = map_wire_event(session_id(), wire, &mut final_output);
+
+        let Some(Event::ToolFinished { id, trace }) = mapped else {
+            panic!("expected tool_finished, got {mapped:?}");
+        };
+        assert_eq!(id, session_id());
+        assert_eq!(trace.call_id, ToolCallIdWire::new(call));
+        assert_eq!(trace.name, "read_file");
+        assert_eq!(trace.status, ToolStatusWire::Finished);
+    }
+
+    #[test]
+    fn approval_requested_is_dropped() {
+        // The canonical pause event is `IpcApproval`'s `InteractionRequested`;
+        // the facade's fire-and-forget `ApprovalRequested` must not map to a mag
+        // event (`docs/DESIGN.md` §3.4).
+        let wire = RunEvent::ApprovalRequested(ApprovalRequest::for_tool("shell")).to_wire();
+        round_trip(&wire);
+
+        let mut final_output = None;
+        assert!(map_wire_event(session_id(), wire, &mut final_output).is_none());
+        assert!(final_output.is_none());
     }
 }

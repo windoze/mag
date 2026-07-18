@@ -16,6 +16,7 @@ use mag_service::{
     InteractionResponseWire, MagService, RequestId, RunId, ServiceError, ServiceEvent,
     SessionConfig, SessionId, SessionInfo, SourceInfo, UserInput,
 };
+use mag_tools::ToolRegistry;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -46,15 +47,27 @@ impl Engine {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(EngineInner::new(None)),
+            inner: Arc::new(EngineInner::new(None, Arc::new(ToolRegistry::new()))),
         }
     }
 
-    /// Creates an engine that drives chat turns through `client`.
+    /// Creates an engine that drives chat turns through `client`, exposing the
+    /// built-in minimal tool set (`docs/DESIGN.md` §3.2/§7).
     #[must_use]
     pub fn with_llm_client(client: Arc<dyn LlmClient>) -> Self {
+        Self::with_llm_client_and_tools(client, ToolRegistry::with_builtins())
+    }
+
+    /// Creates an engine that drives chat turns through `client` with an explicit
+    /// tool registry.
+    ///
+    /// This is the injection point used to supply a custom or test tool surface;
+    /// [`with_llm_client`](Engine::with_llm_client) is the production default that
+    /// installs the built-in tool set.
+    #[must_use]
+    pub fn with_llm_client_and_tools(client: Arc<dyn LlmClient>, tools: ToolRegistry) -> Self {
         Self {
-            inner: Arc::new(EngineInner::new(Some(client))),
+            inner: Arc::new(EngineInner::new(Some(client), Arc::new(tools))),
         }
     }
 }
@@ -187,9 +200,9 @@ struct EngineInner {
 }
 
 impl EngineInner {
-    fn new(client: Option<Arc<dyn LlmClient>>) -> Self {
+    fn new(client: Option<Arc<dyn LlmClient>>, tools: Arc<ToolRegistry>) -> Self {
         let event_bus = EventBus::new();
-        let manager = SessionManager::new(client, event_bus.clone());
+        let manager = SessionManager::new(client, tools, event_bus.clone());
         Self {
             sessions: Mutex::new(BTreeMap::new()),
             event_bus,
@@ -907,6 +920,315 @@ mod session {
                 ServiceEvent::TextDelta { text, .. } if text == "resumed"
             )),
             "resumed run should stream its scripted follow-up text: {resumed:?}",
+        );
+    }
+}
+
+#[cfg(test)]
+mod tool_turn {
+    //! End-to-end, offline tool + approval turns driven through the public
+    //! [`MagService`] surface (`docs/DESIGN.md` §3.2/§3.3, C3-3).
+    //!
+    //! A scripted [`FakeLlmClient`] returns a tool call, and stub plugins provide
+    //! a gated `shell` and an auto-allowed `read_file`, so these tests exercise
+    //! the full pause/resume path (`InteractionRequested` -> `respond_interaction`
+    //! -> `ToolStarted` / `ToolFinished`) without a network or real filesystem.
+
+    use std::sync::Arc;
+
+    use agent_lib::{
+        client::LlmClient,
+        facade::{ToolContext, ToolResult},
+        model::{tool::Tool, usage::Usage},
+    };
+    use async_trait::async_trait;
+    use futures::stream::BoxStream;
+    use mag_service::{
+        ApprovalDecisionWire, InteractionKindWire, InteractionResponseWire, MagService,
+        RoutingMode, ServiceEvent, SessionConfig, SessionId, StepIdWire, ToolCallIdWire, UserInput,
+    };
+    use mag_tools::{PermissionSpec, ToolCategory, ToolPlugin, ToolRegistry, ToolRisk};
+    use serde_json::{Value, json};
+    use tokio::time::{Duration, timeout};
+    use uuid::Uuid;
+
+    use crate::test_support::{FakeLlmClient, text_stream_with_usage, tool_use_stream};
+
+    use super::Engine;
+
+    /// A canned tool plugin: it ignores its arguments and returns fixed text, so
+    /// a turn's tool events are deterministic and offline.
+    #[derive(Debug)]
+    struct StubTool {
+        name: &'static str,
+        output: &'static str,
+        permission: Option<PermissionSpec>,
+    }
+
+    #[async_trait]
+    impl ToolPlugin for StubTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn declaration(&self) -> Tool {
+            Tool {
+                name: self.name.to_owned(),
+                description: format!("stub {} tool", self.name),
+                input_schema: json!({ "type": "object", "properties": {} }),
+            }
+        }
+
+        async fn invoke(&self, _ctx: ToolContext, _args: Value) -> ToolResult {
+            ToolResult::text(self.output)
+        }
+
+        fn permission(&self) -> Option<PermissionSpec> {
+            self.permission
+        }
+    }
+
+    /// A registry with a gated `shell` and an auto-allowed `read_file`.
+    fn registry() -> ToolRegistry {
+        ToolRegistry::new()
+            .register(Arc::new(StubTool {
+                name: "shell",
+                output: "shell output",
+                permission: Some(PermissionSpec::new(ToolCategory::Shell, ToolRisk::Medium)),
+            }))
+            .register(Arc::new(StubTool {
+                name: "read_file",
+                output: "file contents",
+                permission: None,
+            }))
+    }
+
+    fn config() -> SessionConfig {
+        SessionConfig {
+            provider: "fake".to_owned(),
+            model: "fake-tool".to_owned(),
+            tool_profile: None,
+            routing: RoutingMode::ModelRouted,
+        }
+    }
+
+    fn usage(input: u32, output: u32) -> Usage {
+        Usage {
+            input,
+            output,
+            total: Some(input + output),
+            ..Usage::default()
+        }
+    }
+
+    fn engine(fake: Arc<FakeLlmClient>) -> Engine {
+        let client: Arc<dyn LlmClient> = fake;
+        Engine::with_llm_client_and_tools(client, registry())
+    }
+
+    /// The interface only supplies the decision; `step_id`/`call_id` are
+    /// reconstructed from the stored interaction, so nil placeholders are fine.
+    fn approval(decision: ApprovalDecisionWire) -> InteractionResponseWire {
+        InteractionResponseWire::Approval {
+            step_id: StepIdWire::new(Uuid::nil()),
+            call_id: ToolCallIdWire::new(Uuid::nil()),
+            decision,
+            message: None,
+        }
+    }
+
+    async fn next_event(events: &mut BoxStream<'static, ServiceEvent>) -> ServiceEvent {
+        timeout(Duration::from_secs(2), futures::StreamExt::next(events))
+            .await
+            .expect("event timed out")
+            .expect("event stream closed")
+    }
+
+    /// Reads events until (and including) the run's terminal event.
+    async fn collect_until_terminal(
+        events: &mut BoxStream<'static, ServiceEvent>,
+    ) -> Vec<ServiceEvent> {
+        let mut collected = Vec::new();
+        loop {
+            let event = next_event(events).await;
+            let terminal = matches!(
+                event,
+                ServiceEvent::RunFinished { .. } | ServiceEvent::RunError { .. }
+            );
+            collected.push(event);
+            if terminal {
+                return collected;
+            }
+        }
+    }
+
+    async fn create_session(engine: &Engine) -> SessionId {
+        engine
+            .create_session(config())
+            .await
+            .expect("create session")
+    }
+
+    #[tokio::test]
+    async fn gated_tool_pauses_then_runs_after_approve() {
+        let fake = FakeLlmClient::scripted(vec![
+            tool_use_stream("shell", "call-1", json!({ "command": "echo hi" })),
+            text_stream_with_usage(&["done"], usage(3, 1)),
+        ]);
+        let engine = engine(fake);
+        let session = create_session(&engine).await;
+        let mut events = engine.subscribe(Some(session));
+
+        let run_id = engine
+            .send_message(session, UserInput::text("run shell"))
+            .await
+            .expect("send message");
+
+        assert!(matches!(
+            next_event(&mut events).await,
+            ServiceEvent::RunStarted { id, run_id: started } if id == session && started == run_id
+        ));
+
+        // The gated shell tool pauses the run: `IpcApproval` emits an approval
+        // `InteractionRequested`, and no tool event has fired yet.
+        let request_id = match next_event(&mut events).await {
+            ServiceEvent::InteractionRequested {
+                id,
+                request_id,
+                kind,
+            } => {
+                assert_eq!(id, session);
+                assert!(
+                    matches!(kind, InteractionKindWire::Approval { .. }),
+                    "expected an approval interaction, got {kind:?}",
+                );
+                request_id
+            }
+            other => panic!("expected interaction_requested, got {other:?}"),
+        };
+
+        engine
+            .respond_interaction(session, request_id, approval(ApprovalDecisionWire::Approve))
+            .await
+            .expect("approve");
+
+        let rest = collect_until_terminal(&mut events).await;
+        assert!(
+            rest.iter().any(|event| matches!(
+                event,
+                ServiceEvent::ToolStarted { id, trace } if *id == session && trace.name == "shell"
+            )),
+            "an approved gated tool must emit ToolStarted: {rest:?}",
+        );
+        assert!(
+            rest.iter().any(|event| matches!(
+                event,
+                ServiceEvent::ToolFinished { id, trace } if *id == session && trace.name == "shell"
+            )),
+            "an approved gated tool must emit ToolFinished: {rest:?}",
+        );
+        assert!(
+            matches!(
+                rest.last().expect("terminal event"),
+                ServiceEvent::RunFinished { id, output } if *id == session && output.text == "done"
+            ),
+            "the approved turn must finish with the model's follow-up text: {rest:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn gated_tool_denied_skips_tool_but_run_finishes() {
+        let fake = FakeLlmClient::scripted(vec![
+            tool_use_stream("shell", "call-1", json!({ "command": "rm -rf /" })),
+            text_stream_with_usage(&["understood"], usage(2, 1)),
+        ]);
+        let engine = engine(fake);
+        let session = create_session(&engine).await;
+        let mut events = engine.subscribe(Some(session));
+
+        engine
+            .send_message(session, UserInput::text("run shell"))
+            .await
+            .expect("send message");
+
+        assert!(matches!(
+            next_event(&mut events).await,
+            ServiceEvent::RunStarted { .. }
+        ));
+        let request_id = match next_event(&mut events).await {
+            ServiceEvent::InteractionRequested { request_id, .. } => request_id,
+            other => panic!("expected interaction_requested, got {other:?}"),
+        };
+
+        engine
+            .respond_interaction(session, request_id, approval(ApprovalDecisionWire::Deny))
+            .await
+            .expect("deny");
+
+        let rest = collect_until_terminal(&mut events).await;
+        assert!(
+            !rest.iter().any(|event| matches!(
+                event,
+                ServiceEvent::ToolStarted { .. } | ServiceEvent::ToolFinished { .. }
+            )),
+            "a denied tool must never execute (no tool events): {rest:?}",
+        );
+        assert!(
+            matches!(
+                rest.last().expect("terminal event"),
+                ServiceEvent::RunFinished { id, .. } if *id == session
+            ),
+            "a denied tool is fed back to the model and the run still finishes: {rest:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_allowed_tool_runs_without_interaction() {
+        let fake = FakeLlmClient::scripted(vec![
+            tool_use_stream("read_file", "call-1", json!({ "path": "README.md" })),
+            text_stream_with_usage(&["summary"], usage(4, 2)),
+        ]);
+        let engine = engine(fake);
+        let session = create_session(&engine).await;
+        let mut events = engine.subscribe(Some(session));
+
+        engine
+            .send_message(session, UserInput::text("read it"))
+            .await
+            .expect("send message");
+
+        assert!(matches!(
+            next_event(&mut events).await,
+            ServiceEvent::RunStarted { .. }
+        ));
+
+        let rest = collect_until_terminal(&mut events).await;
+        assert!(
+            !rest
+                .iter()
+                .any(|event| matches!(event, ServiceEvent::InteractionRequested { .. })),
+            "an auto-allowed tool must not pause for approval: {rest:?}",
+        );
+        assert!(
+            rest.iter().any(|event| matches!(
+                event,
+                ServiceEvent::ToolStarted { trace, .. } if trace.name == "read_file"
+            )),
+            "the auto-allowed tool must emit ToolStarted: {rest:?}",
+        );
+        assert!(
+            rest.iter().any(|event| matches!(
+                event,
+                ServiceEvent::ToolFinished { trace, .. } if trace.name == "read_file"
+            )),
+            "the auto-allowed tool must emit ToolFinished: {rest:?}",
+        );
+        assert!(
+            matches!(
+                rest.last().expect("terminal event"),
+                ServiceEvent::RunFinished { id, .. } if *id == session
+            ),
+            "the auto-allowed turn must finish: {rest:?}",
         );
     }
 }

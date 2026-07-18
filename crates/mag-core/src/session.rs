@@ -29,6 +29,7 @@ use agent_lib::{client::LlmClient, facade::FacadeError};
 use mag_service::{
     Event, InteractionResponseWire, RequestId, RunId, ServiceError, SessionConfig, SessionId,
 };
+use mag_tools::ToolRegistry;
 use tokio::{
     runtime::Builder,
     sync::{Notify, mpsc, oneshot},
@@ -280,6 +281,7 @@ fn session_thread(
     session_id: SessionId,
     config: SessionConfig,
     client: Arc<dyn LlmClient>,
+    tools: Arc<ToolRegistry>,
     event_bus: EventBus,
     commands: mpsc::UnboundedReceiver<SessionCommand>,
 ) {
@@ -295,7 +297,7 @@ fn session_thread(
         event_bus.clone(),
         Arc::new(AskFrontendDecider),
     ));
-    let driver = SessionDriver::new(&config, client, approval.clone());
+    let driver = SessionDriver::new(&config, client, &tools, approval.clone());
     let actor = SessionActor::new(session_id, event_bus, driver, approval);
     local.block_on(&runtime, actor.run(commands));
 }
@@ -314,16 +316,23 @@ struct SessionHandle {
 /// a backend error, mirroring the engine's clientless behaviour.
 pub(crate) struct SessionManager {
     client: Option<Arc<dyn LlmClient>>,
+    tools: Arc<ToolRegistry>,
     event_bus: EventBus,
     handles: Mutex<HashMap<SessionId, SessionHandle>>,
 }
 
 impl SessionManager {
     /// Creates a manager bound to `event_bus`, spawning actors only when a
-    /// `client` is present.
-    pub(crate) fn new(client: Option<Arc<dyn LlmClient>>, event_bus: EventBus) -> Self {
+    /// `client` is present. Each spawned session assembles its agent with the
+    /// shared `tools` registry (`docs/DESIGN.md` §3.2).
+    pub(crate) fn new(
+        client: Option<Arc<dyn LlmClient>>,
+        tools: Arc<ToolRegistry>,
+        event_bus: EventBus,
+    ) -> Self {
         Self {
             client,
+            tools,
             event_bus,
             handles: Mutex::new(HashMap::new()),
         }
@@ -337,11 +346,14 @@ impl SessionManager {
         let Some(client) = self.client.clone() else {
             return;
         };
+        let tools = self.tools.clone();
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let event_bus = self.event_bus.clone();
         let thread = thread::Builder::new()
             .name(format!("mag-session-{session_id}"))
-            .spawn(move || session_thread(session_id, config, client, event_bus, commands_rx))
+            .spawn(move || {
+                session_thread(session_id, config, client, tools, event_bus, commands_rx)
+            })
             .expect("spawn mag session thread");
         self.handles.lock().expect("session handles lock").insert(
             session_id,

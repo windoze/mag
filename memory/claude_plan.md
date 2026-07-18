@@ -379,3 +379,43 @@ fmt → clippy -D warnings → cargo test -p mag-core engine::approval → cargo
 - [x] 测试（11 approval 单测）+ 更新既有 `respond_interaction` 测试（Unsupported→InteractionNotFound）
 - [x] 完整验证 1–5 全绿（fmt / clippy 0 警告 / mag-core 28 + 全工作区 / doc 无警告）
 - [x] TODO.md [DONE] + 完成记录；待提交后停止
+
+## C3-3 工具事件 + 审批接入完整 turn（当前任务）
+
+### 目标
+把 C3-1 工具（mag-tools `ToolRegistry`/`ToolPlugin`）与 C3-2 的 `IpcApproval` 接进 facade
+`Agent`：`.tool(..)` 注册每个工具、`.approval(policy)` 按 plugin `permission()` 配 gate
+（Some→`ask_tool`，None→默认 `auto_allow`）、`.interaction_handler(ipc)` 注入审批（已在 C3-2 接好）。
+driver 逐 `RunEvent::to_wire()` 投影 `ToolStarted`/`ToolFinished` 映射进 mag `Event`。
+
+### 关键设计依据（已核对源码）
+- 工具注入用 facade `Tool::function_with_schema(name, desc, schema, |ctx, args| plugin.invoke(ctx,args))`
+  —— facade `FacadeToolRegistry` 逐调用注入 run-scoped `ToolContext`（worktree/cancel/run_id）。
+  plugin `declaration() -> model::tool::Tool` 提供 name/desc/input_schema；`ToolResult: IntoToolResult`。
+  （C3-1 的 `PluginToolRegistry`/`bind` 需 build 时 `ToolContextParts`，run scope 尚不可得，故不用它注入。）
+- 审批 gate：`FacadeApproval::approval_requirement` 对非 AutoAllow 一律 `RequireApproval` → machine 发
+  NeedInteraction → 注入的 `IpcApproval` 应答（C3-2 已验证 auto_deny 路径）。`ask_tool` 设 `Ask(None)`，
+  同样触发 RequireApproval，故 shell 会暂停、read/list/grep（None→auto_allow）不打扰。
+- `ApprovalRequested` **不映射**：DESIGN §3.4 明确 facade `RunEvent::ApprovalRequested` 只是 fire-and-forget
+  通知，mag 以 `IpcApproval` 独立 emit 的 `InteractionRequested` 暂停语义为准，映射它会与 InteractionRequested 重复。
+- 工具事件顺序：auto-allow → ToolStarted/ToolFinished；gated approve → InteractionRequested→(respond)→
+  ToolStarted/ToolFinished；gated deny → 跳过工具（无 ToolStarted/Finished），回灌合成拒绝。
+- 映射 facade `ToolTrace{name, call_id:String}` → mag `ToolTrace{run_id:None, call_id:ToolCallIdWire(parse),
+  name, input:None, output:None, status:Started/Finished, message:None}`。
+
+### 步骤
+1. driver.rs：`SessionDriver::new` 增 `tools: &ToolRegistry` 参数；建 facade Tool + ApprovalPolicy；
+   `map_wire_event` 增 ToolStarted/ToolFinished 映射，忽略 ApprovalRequested（注释依据 §3.4）。
+2. 线程贯通 tools：`SessionManager` 持 `Arc<ToolRegistry>`；`session_thread` 传入 `SessionDriver::new`；
+   `Engine::with_llm_client` 默认 `ToolRegistry::with_builtins()`，加 `with_llm_client_and_tools` 供测试注入。
+3. 测试 `engine::tool_turn`（离线端到端，注入测试插件 shell(gated)/read_file(auto)）：
+   approve→ToolStarted/Finished→RunFinished；deny→无工具事件→RunFinished；read_file auto→无 InteractionRequested。
+4. 验证序列：fmt → clippy -D warnings → cargo test -p mag-core → cargo test --all --all-targets → doc。
+5. TODO.md C3-3 标 [DONE] + 完成记录；提交后停止。
+
+### 进度
+- [x] driver.rs 工具/审批装配 + 事件映射（facade_tool/tool_trace_from_wire；ToolStarted/Finished 映射；ApprovalRequested 刻意丢弃）
+- [x] 线程贯通 + Engine 注入点（session.rs Arc<ToolRegistry>；Engine::with_llm_client_and_tools；with_llm_client 挂 with_builtins）
+- [x] engine::tool_turn 测试（approve / deny / auto-allow 三路径 + driver 三单测）
+- [x] 验证 1–5（fmt ✓ / clippy -D warnings 0 警告 ✓ / mag-core 34 ✓ / 全工作区 34+10+1+6+13 ✓ / doc -D warnings 无警告 ✓）
+- [x] TODO.md [DONE] + 提交

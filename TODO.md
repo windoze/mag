@@ -825,7 +825,7 @@ Command/Event 归属 mag-service 且仍是 `ServiceEvent` 的投影。汇总缺�
   `IpcApproval` 只负责应答；C3-3 将把工具/审批事件（`ToolCallStarted`/`ApprovalRequested` 等）接入完整 turn 并
   在 driver 的 `map_wire_event` 投影这些变体（现只走纯对话路径）。
 
-### [TODO] C3-3 工具事件 + 审批接入完整 turn
+### [DONE] C3-3 工具事件 + 审批接入完整 turn
 
 **上下文**：
 
@@ -852,6 +852,30 @@ Command/Event 归属 mag-service 且仍是 `ServiceEvent` 的投影。汇总缺�
 - 单元测试：read_file（auto-allow）不触发 `InteractionRequested`，直接 `ToolStarted`/`Finished`。
 - 聚焦：`cargo test -p mag-core engine::tool_turn`。
 - 完整验证序列 1–5。
+
+**完成记录**：
+
+- driver `SessionDriver::new` 现接收 `&ToolRegistry`：用 builder 累加器把每个 `ToolPlugin` 经
+  `facade_tool()`（`Tool::function_with_schema` + 运行期注入的 `ToolContext`）注册进 facade `Agent`；对
+  `permission().is_some()` 的插件调用 `ApprovalPolicy::ask_tool(name)` gate（默认 `auto_allow`），并注入 C3-2 的
+  `IpcApproval` 做交互应答。`ToolRegistry` 经 `session.rs`（`SessionManager`/`session_thread` 新增
+  `Arc<ToolRegistry>` 字段与参数）与 `engine.rs`（新增 `Engine::with_llm_client_and_tools`；`with_llm_client`
+  改挂 `ToolRegistry::with_builtins()`）逐层贯通。
+- `map_wire_event` 新增 `WireRunEvent::ToolStarted`→`Event::ToolStarted`、`ToolFinished`→`Event::ToolFinished`
+  （经 `tool_trace_from_wire` 投影，`ToolStatusWire` 打 Started/Finished）；按 `docs/DESIGN.md` §3.4，facade 的
+  `ApprovalRequested` 为 fire-and-forget，mag 的规范暂停事件是 `IpcApproval` 独立发的 `InteractionRequested`，
+  故 `ApprovalRequested` 刻意不映射（由 `approval_requested_is_dropped` 单测锁定）。
+- `serde_json` 由 dev-dependency 提升为正式依赖（工具执行闭包在库代码里用到 `serde_json::Value`）。
+- 测试：driver 新增 `tool_started_maps_and_round_trips`/`tool_finished_maps_and_round_trips`/
+  `approval_requested_is_dropped`；engine 新增 `engine::tool_turn` 端到端离线模块——`StubTool` 实现
+  `ToolPlugin`（gated `shell` / auto-allow `read_file`），三路径：gated approve →
+  `RunStarted`→`InteractionRequested{Approval}`→respond approve→`ToolStarted`/`ToolFinished`→`RunFinished{"done"}`；
+  gated deny → 无工具事件、run 仍 `RunFinished`；auto-allow read_file → 无 `InteractionRequested`、直接
+  `ToolStarted`/`ToolFinished`→`RunFinished`。
+- 验证：`cargo fmt --all` ✓；`cargo clippy --all-targets -- -D warnings` 全绿 ✓；`cargo test -p mag-core`
+  （34 通过，含 `engine::tool_turn` 三例、`driver::tests` 三例）✓；`cargo test --all --all-targets`（mag-core 34 /
+  mag-service 10 / mag-sources 1 / mag-tools 6+13）全绿 ✓；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+  --workspace`（无警告）✓。
 
 ### [TODO] C3-R Review：工具 + 审批正确性（重点）
 
