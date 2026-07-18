@@ -10,10 +10,12 @@ use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{
     AuthenticateRequest, AuthenticateResponse, InitializeRequest, InitializeResponse,
-    NewSessionRequest, NewSessionResponse,
+    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionNotification,
+    StopReason,
 };
 use agent_client_protocol::{Client, ConnectionTo, Responder};
-use mag_service::MagService;
+use futures::StreamExt;
+use mag_service::{MagService, ServiceEvent};
 
 use crate::map;
 
@@ -62,6 +64,96 @@ pub(crate) async fn session_new(
             responder.respond_with_error(agent_client_protocol::Error::into_internal_error(error))
         }
     }
+}
+
+/// Handles the ACP `session/prompt` request (`docs/ACP.md` §3.4).
+///
+/// This is the core bridge between ACP's *request/response* prompt turn and mag's
+/// *asynchronous event stream*. ACP requires the handler to run until the turn
+/// terminates and then reply with a [`PromptResponse`] carrying the turn's
+/// [`StopReason`]; mag drives the turn through
+/// [`send_message`](MagService::send_message) and streams its progress through
+/// [`subscribe`](MagService::subscribe). The handler therefore runs a *pump* that
+/// translates each [`ServiceEvent`] into an outbound `session/update`
+/// notification until a terminal event decides the stop reason.
+///
+/// The pump follows `docs/ACP.md` §3.4 precisely:
+///
+/// 1. map the ACP `SessionId` back to a mag [`SessionId`](mag_service::SessionId)
+///    ([`map::acp_session_id_to_mag`]) and the prompt content blocks into a mag
+///    [`UserInput`](mag_service::UserInput) ([`map::content_blocks_to_user_input`]);
+/// 2. **subscribe before sending** — `subscribe(Some(sid))` is established *before*
+///    `send_message`, so no event produced by the run can be lost to a race;
+/// 3. pump: each event is mapped with [`map::service_event_to_session_update`] and,
+///    when it carries client-facing content, forwarded as a
+///    [`SessionNotification`] (`session/update`);
+///    [`RunFinished`](ServiceEvent::RunFinished) /
+///    [`RunError`](ServiceEvent::RunError) end the turn with the stop reason from
+///    [`map::run_terminal_to_stop_reason`]; a stream that ends without a terminal
+///    event falls back to [`StopReason::EndTurn`];
+/// 4. reply with the resolved [`PromptResponse`].
+///
+/// Because `subscribe(Some(sid))` filters by session, concurrent prompts for
+/// different sessions each pump their own stream without interference.
+///
+/// [`InteractionRequested`](ServiceEvent::InteractionRequested) is a placeholder
+/// in this milestone: it is left pending (the run stays paused on the service
+/// side) and will be bridged to `session/request_permission` in M3.
+///
+/// An invalid session id, or a [`ServiceError`](mag_service::ServiceError) from
+/// [`send_message`](MagService::send_message), is surfaced to the client as an
+/// internal JSON-RPC error.
+pub(crate) async fn session_prompt(
+    service: Arc<dyn MagService>,
+    request: PromptRequest,
+    responder: Responder<PromptResponse>,
+    connection: ConnectionTo<Client>,
+) -> Result<(), agent_client_protocol::Error> {
+    let session_id = match map::acp_session_id_to_mag(&request.session_id) {
+        Ok(session_id) => session_id,
+        Err(error) => {
+            return responder
+                .respond_with_error(agent_client_protocol::Error::into_internal_error(error));
+        }
+    };
+    let input = map::content_blocks_to_user_input(&request.prompt);
+
+    // Subscribe *before* sending so the run cannot emit an event before the pump
+    // is listening (`docs/ACP.md` §3.4).
+    let mut events = service.subscribe(Some(session_id));
+    if let Err(error) = service.send_message(session_id, input).await {
+        return responder
+            .respond_with_error(agent_client_protocol::Error::into_internal_error(error));
+    }
+
+    let stop_reason = loop {
+        let Some(event) = events.next().await else {
+            // The stream ended without an explicit terminal event; treat the turn
+            // as a normal completion.
+            break StopReason::EndTurn;
+        };
+
+        // Terminal events decide the stop reason and end the pump.
+        if let Some(stop_reason) = map::run_terminal_to_stop_reason(&event) {
+            break stop_reason;
+        }
+
+        // Approvals are bridged to `session/request_permission` in M3; until then
+        // the interaction is left pending and the pump keeps waiting.
+        if let ServiceEvent::InteractionRequested { .. } = event {
+            // TODO(M3): bridge_permission(&service, &connection, session_id, ..).
+            continue;
+        }
+
+        // Every other event that carries client-facing content is streamed to the
+        // client as a `session/update` notification (`docs/ACP.md` §4).
+        if let Some(update) = map::service_event_to_session_update(&event) {
+            connection
+                .send_notification(SessionNotification::new(request.session_id.clone(), update))?;
+        }
+    };
+
+    responder.respond(PromptResponse::new(stop_reason))
 }
 
 /// Handles the ACP `authenticate` request (`docs/ACP.md` §3.1).

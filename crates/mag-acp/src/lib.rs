@@ -10,12 +10,15 @@
 //! The design of record is [`docs/ACP.md`](../docs/ACP.md); the phase plan lives
 //! in [`PLAN.md`](../PLAN.md) and the task list in [`TODO.md`](../TODO.md).
 //!
-//! This milestone (M1-4) adds the `session/new` request handler on top of the
-//! M1-2 [`serve`] entry point: it assembles the ACP `Agent` builder, registers
-//! the `initialize`, `session/new`, and placeholder `authenticate` request
-//! handlers, and runs the connection over a caller-supplied transport. The
-//! single point that wires a concrete `mag-core::Engine` into `serve` is the
-//! top-level `mag` binary, which keeps this library's dependency boundary intact.
+//! This milestone (M2-2) adds the `session/prompt` request handler on top of the
+//! M1 `initialize` / `session/new` handlers: it assembles the ACP `Agent`
+//! builder, registers the `initialize`, `session/new`, `session/prompt`, and
+//! placeholder `authenticate` request handlers, and runs the connection over a
+//! caller-supplied transport. The `session/prompt` handler runs the *pump* that
+//! bridges ACP's request/response prompt turn to mag's asynchronous event stream
+//! (`docs/ACP.md` §3.4). The single point that wires a concrete
+//! `mag-core::Engine` into `serve` is the top-level `mag` binary, which keeps
+//! this library's dependency boundary intact.
 
 use std::sync::Arc;
 
@@ -50,10 +53,12 @@ pub async fn serve<T>(
 where
     T: ConnectTo<Agent> + 'static,
 {
-    // `service` is captured by the `session/new` handler closure (and later
-    // handlers as more ACP methods are implemented). The async closure moves the
-    // handle in and re-`Arc::clone`s it per invocation so the handler can be
-    // called for every inbound request.
+    // `service` is captured by the `session/new` and `session/prompt` handler
+    // closures (and later handlers as more ACP methods are implemented). Each
+    // async closure moves its own `Arc` clone in and re-`Arc::clone`s it per
+    // invocation so the handler can be called for every inbound request.
+    let service_for_new = Arc::clone(&service);
+    let service_for_prompt = service;
     Agent
         .builder()
         .name("mag-acp")
@@ -65,7 +70,20 @@ where
         )
         .on_receive_request(
             async move |request, responder, connection| {
-                handlers::session_new(Arc::clone(&service), request, responder, connection).await
+                handlers::session_new(Arc::clone(&service_for_new), request, responder, connection)
+                    .await
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request, responder, connection| {
+                handlers::session_prompt(
+                    Arc::clone(&service_for_prompt),
+                    request,
+                    responder,
+                    connection,
+                )
+                .await
             },
             on_receive_request!(),
         )

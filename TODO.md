@@ -511,7 +511,7 @@ cancel/load（M4）。M1-3→M1-4 依赖已在各自完成记录标注。
 - 无阻塞缺口、无 workaround、未插前置任务；未映射变体保守降级，无臆造 ACP 语义。
 - 下一个未完成任务：M2-2（`session/prompt` handler 泵）。
 
-### [TODO] M2-2 `session/prompt` handler 的泵（`subscribe` → `send_message` → loop → `PromptResponse`）
+### [DONE] M2-2 `session/prompt` handler 的泵（`subscribe` → `send_message` → loop → `PromptResponse`）
 
 **上下文**：
 
@@ -543,6 +543,45 @@ cancel/load（M4）。M1-3→M1-4 依赖已在各自完成记录标注。
 
 - 聚焦测试：`cargo test -p mag-acp prompt`（handler 级泵，scripted service），1 分钟内绿。
 - 完整验证序列 1–5；clippy / doc 无警告。
+
+**完成记录**（本次调用）：
+
+- `crates/mag-acp/src/handlers.rs` 新增 `session_prompt(service, req, responder, cx)` handler，按
+  `docs/ACP.md` §3.4 泵伪码实现：
+  1. `map::acp_session_id_to_mag(&req.session_id)` —— 解析失败经
+     `Error::into_internal_error` 回客户端内部错误（沿用 `session_new` 的错误约定）。
+  2. `map::content_blocks_to_user_input(&req.prompt)`（M2-1）。
+  3. **先 `subscribe(Some(sid))` 再 `send_message`**（防竞态丢事件）；`send_message` 失败同样回内部错误。
+  4. 泵 loop（`futures::StreamExt::next`）：`None`（流结束）→ `break EndTurn`；
+     `map::run_terminal_to_stop_reason(&ev)` = `Some(stop)` → `break stop`
+     （`RunFinished→EndTurn`、`RunError→Refusal`）；`InteractionRequested` → 显式占位 `continue`
+     （注释标 `TODO(M3)`，M3 接 `bridge_permission`，本任务不臆造权限语义）；其余事件经
+     `map::service_event_to_session_update(&ev)`，`Some(update)` 时
+     `cx.send_notification(SessionNotification::new(req.session_id.clone(), update))?`。
+  5. `responder.respond(PromptResponse::new(stop))`。
+- `crates/mag-acp/src/lib.rs`：注册 `session/prompt` handler（`service` 拆成 `service_for_new` /
+  `service_for_prompt` 两份 `Arc`，各自 move 进闭包并按调用 `Arc::clone`）；更新 crate 级 & `serve` rustdoc
+  反映 M2-2。
+- `crates/mag-acp/Cargo.toml`：`futures` 由 dev-dependency 提升为常规依赖（handler 需 `StreamExt::next()`；
+  `subscribe` 的 `BoxStream` 本就来自 `futures`，仍在 `mag-service` + `agent-client-protocol` + `futures`
+  依赖边界内，未引入 mag-core/agent-lib）。
+- `crates/mag-acp/tests/prompt.rs`（新测试模块，与 M1 的 `e2e.rs` 分离）：`ScriptedService` 脚本化
+  `subscribe` 事件流 + 记录 `subscribe`/`send_message` 调用顺序 + 记录映射后的 `UserInput`；经真实 ACP client
+  over in-memory pipe 驱动 `session/prompt`，客户端注册 `on_receive_notification::<SessionNotification>` 收集
+  `session/update`。3 个测试：
+  - `prompt_pump_streams_updates_and_ends_on_run_finished`：TextDelta×2 → ToolStarted → ToolFinished →
+    RunFinished ⇒ 4 条 update 序列一致（AgentMessageChunk×2 + ToolCall(InProgress) + ToolCallUpdate(Completed)）、
+    stop=`EndTurn`、`call_log==["subscribe","send_message"]`（subscribe 先于 send_message）、
+    recorded input==`UserInput::text("please read")`。
+  - `prompt_pump_maps_run_error_to_refusal`：TextDelta → RunError ⇒ 1 条 update、stop=`Refusal`。
+  - `prompt_pump_treats_empty_stream_as_end_turn`：空流 ⇒ 0 update、stop=`EndTurn`、仍 subscribe 先于 send_message。
+  （测试名带 `prompt_` 前缀，故 `cargo test -p mag-acp prompt` 按名过滤即可命中。）
+- 验证序列 1–5 全绿：`cargo fmt --all -- --check` 干净；`cargo clippy --all-targets -- -D warnings` 无警告；
+  `cargo test -p mag-acp prompt` 3 passed（<0.01s）；`cargo test --workspace` 全绿（mag-acp 16+2+3=21，
+  workspace 合计 112，0 fail）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无警告。
+- 无阻塞缺口、无 workaround、未插前置任务；`InteractionRequested` 仅显式占位（M2-1 映射本就返回 `None`，
+  M3 将接管），无臆造 ACP 语义。
+- 下一个未完成任务：M2-R（Review：M2 泵 + 类型映射）。
 
 ### [TODO] M2-R Review：M2 泵 + 类型映射
 

@@ -205,3 +205,49 @@ ContentBlock 单/多 Text 拼接 + 非文本忽略 + 空、stop reason 三分支
   （doc 修正：public 函数 rustdoc 不得链私有 tool_status_to_acp，改为纯 code span。）
 - TODO.md M2-1 标 [DONE] + 完成记录。PLAN.md 无需改（无阶段计划变更；R-4/R-5 已预置本版决策）。
 - 下一个未完成任务：M2-2（session/prompt handler 泵）。
+
+---
+
+# 更新（本次调用）：实现 M2-2 —— `session/prompt` handler 泵
+
+## 定位
+`TODO.md` 首个未完成任务 = **M2-2**（session/prompt handler 泵）。M2-1 已 [DONE] 且提交，工作区干净。
+M2-1 已提供全部纯函数映射（`service_event_to_session_update` / `content_blocks_to_user_input` /
+`run_terminal_to_stop_reason` / `map_tool_call*`）。本任务只做 handler 层的“泵”接线 + handler 级测试。
+
+## 就地核实（无契约缺口，可直接实现）
+- `MagService::subscribe(Some(sid)) -> BoxStream<'static, ServiceEvent>`（service.rs:123）——按会话过滤。
+- `MagService::send_message(sid, input) -> Result<RunId, ServiceError>`（service.rs:83）。
+- ACP handler 形状：`(service, req: PromptRequest, responder: Responder<PromptResponse>, cx: ConnectionTo<Client>)`。
+- 出站通知：`cx.send_notification(acp::SessionNotification::new(session_id, update))?`
+  （SessionNotification => "session/update"，schema v1）。
+- `PromptResponse::new(stop_reason)`。错误经 `agent_client_protocol::Error::into_internal_error(err)`（沿用 session_new）。
+
+## 实现
+1. `crates/mag-acp/Cargo.toml`：`futures` 从 dev-dependency 提升为常规依赖（handler 需 `StreamExt::next()`）。
+2. `handlers.rs` 新增 `session_prompt(service, req, responder, cx)`：
+   - `sid = acp_session_id_to_mag(&req.session_id)?`；解析失败 → respond_with_error(内部错误)。
+   - `input = content_blocks_to_user_input(&req.prompt)`（M2-1）。
+   - **先 subscribe 再 send_message**（防竞态丢事件）：`let mut events = service.subscribe(Some(sid));`
+     然后 `service.send_message(sid, input).await`；失败 → respond_with_error。
+   - 泵 loop（`events.next().await`）：
+     * `None`（流结束）→ break `EndTurn`。
+     * `run_terminal_to_stop_reason(&ev)` = Some(stop) → break stop（RunFinished→EndTurn / RunError→Refusal）。
+     * `InteractionRequested` → 本任务占位（M3 接 bridge_permission），continue（留显式分支+注释）。
+     * 其余 → `service_event_to_session_update(&ev)`，Some(update) 时 `cx.send_notification(...)?`。
+   - `responder.respond(PromptResponse::new(stop))`。
+3. `lib.rs`：注册 `session_prompt` handler（再 clone 一份 service）。
+4. handler 级测试（tests/e2e.rs 或新 tests/prompt.rs）：ScriptedService（脚本化 subscribe 事件流 +
+   记录 send_message 是否在 subscribe 之后调用），驱动真实 ACP client `session/prompt`，断言：
+   泵出的 session/update 序列与脚本一致、RunFinished→EndTurn、RunError→Refusal、空流→EndTurn。
+
+## 验证序列 1–5：fmt → clippy -D warnings → focused(`-p mag-acp prompt`) → workspace → doc -D warnings。
+
+## 完成状态：M2-2 已 [DONE]（本次）
+- handlers.rs 新增 `session_prompt` 泵；lib.rs 注册 handler + 更新 rustdoc；Cargo.toml `futures` 提升为常规依赖。
+- tests/prompt.rs 新增 3 个 handler 级泵测试（ScriptedService + 真实 ACP client over pipe + 通知收集）：
+  全序列→EndTurn（含 subscribe 先于 send_message + input 映射断言）、RunError→Refusal、空流→EndTurn。
+- 验证序列 1–5 全绿（fmt/clippy -D warnings/`test -p mag-acp prompt` 3 passed/workspace 112 passed 0 fail/doc -D warnings）。
+- TODO.md M2-2 标 [DONE] + 完成记录。PLAN.md 无需改（无阶段计划变更；§3.4 泵结构与 R-4/R-5 已预置）。
+- InteractionRequested 仅显式占位（TODO(M3)），无臆造 ACP 语义；无 workaround、无前置任务。
+- 下一个未完成任务：M2-R（Review）。
