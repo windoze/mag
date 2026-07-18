@@ -269,7 +269,7 @@
   `cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`（1800 秒超时包装，18 个单元测试 +
   doctest 全绿）、`cargo doc --no-deps --workspace`。
 
-### [TODO] C1-2 自组 scope 驱动一次对话 turn
+### [DONE] C1-2 自组 scope 驱动一次对话 turn
 
 **上下文**：
 
@@ -296,6 +296,23 @@
   `ChatRequest.messages` 含首轮）。
 - 聚焦：`cargo test -p mag-core engine::chat`。
 - 完整验证序列 1–5。
+
+**完成记录（2026-07-18）**：
+
+- 新增 `mag-core` driver 模块，按 `agent_chat.rs` 模式自组 `AgentSpec`、`AgentState`、
+  `DefaultAgentMachine`、`RunContext` 与 `drain`，会话内机器保持跨轮复用，未绕过 `Conversation`/machine。
+- 实现 `MagScope`，当前只挂 `StreamingTapHandler` 作为 LLM handler；无工具、无审批路径保持未接入，留给 C2/C3。
+- `SessionDriver::send_message` 为每轮生成 run id，emit `RunStarted`，由 tap handler 逐片段 emit
+  `TextDelta`，drain 完成后从 `machine.state().conversation()` 的最后提交 turn 提取最终 assistant 文本与 usage，
+  emit `RunFinished`。
+- `Engine` 增加 `with_llm_client(Arc<dyn LlmClient>)` 注入点；`CreateSession` 建立 per-session driver；
+  `SendMessage` 路由到该 driver。未配置 LLM client 或未知 session 时按会话命令语义 emit `RunError`。
+- 添加 `engine::chat` 单元测试，覆盖 `CreateSession` + `SendMessage("hi")` 的有序
+  `RunStarted` → `TextDelta*` → `RunFinished` 事件、最终文本与非空 usage，并覆盖同一会话多轮历史累积
+  （第二轮 fake client 请求包含第一轮 user/assistant 上下文）。
+- 验证通过：`cargo fmt --all`、`cargo fmt --all -- --check`、`cargo test -p mag-core engine::chat`、
+  `cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`（1800 秒上限包装，20 个单元测试 +
+  doctest 全绿）、`cargo doc --no-deps --workspace`。
 
 ### [TODO] C1-R Review：纯对话流式贯通
 

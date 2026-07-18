@@ -2,6 +2,7 @@
 
 //! Transport-neutral engine core for mag.
 
+mod driver;
 mod engine;
 mod event_bus;
 mod ids;

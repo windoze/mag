@@ -10,17 +10,18 @@ use std::{
     },
 };
 
+use agent_lib::client::LlmClient;
 use mag_protocol::{Command, Event, SessionConfig, SessionId};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::{EventBus, EventStream};
+use crate::{EventBus, EventStream, driver::SessionDriver};
 
 /// Transport-neutral command engine.
 ///
-/// The skeleton stores session records in memory, emits lifecycle events through
-/// an [`EventBus`], and leaves agent-lib driver execution for later milestones.
-#[derive(Clone, Debug)]
+/// The engine stores session records in memory, emits lifecycle events through
+/// an [`EventBus`], and drives pure chat turns through agent-lib.
+#[derive(Clone)]
 pub struct Engine {
     inner: Arc<EngineInner>,
 }
@@ -34,6 +35,14 @@ impl Engine {
         }
     }
 
+    /// Creates an engine that drives chat turns through `client`.
+    #[must_use]
+    pub fn with_llm_client(client: Arc<dyn LlmClient>) -> Self {
+        Self {
+            inner: Arc::new(EngineInner::with_llm_client(client)),
+        }
+    }
+
     /// Subscribes to future engine events.
     #[must_use]
     pub fn subscribe(&self) -> EventStream {
@@ -43,8 +52,8 @@ impl Engine {
     /// Handles one command and returns any immediate command output.
     ///
     /// Lifecycle events are emitted through [`subscribe`](Engine::subscribe).
-    /// Commands that need the future agent driver currently emit or return a
-    /// clear "not implemented" error instead of silently succeeding.
+    /// Session-scoped commands that are not implemented in the current
+    /// milestone emit a clear `RunError` instead of silently succeeding.
     ///
     /// # Errors
     ///
@@ -79,8 +88,10 @@ impl Engine {
                 self.emit_unimplemented(id, "delete_session");
                 Ok(CommandOutput::None)
             }
-            Command::SendMessage { session_id, .. } => {
-                self.emit_unimplemented(session_id, "send_message");
+            Command::SendMessage {
+                session_id, text, ..
+            } => {
+                self.send_message(session_id, text).await;
                 Ok(CommandOutput::None)
             }
             Command::CancelRun { session_id } => {
@@ -107,6 +118,38 @@ impl Engine {
             message: format!("command `{command}` is not implemented yet"),
         });
     }
+
+    async fn send_message(&self, session_id: SessionId, text: String) {
+        let Some(client) = self.inner.llm_client.clone() else {
+            self.emit_run_error(session_id, "no LLM client configured");
+            return;
+        };
+        let Some(driver) = self.session_driver(session_id).await else {
+            self.emit_run_error(session_id, "session not found");
+            return;
+        };
+
+        let result = driver
+            .lock()
+            .await
+            .send_message(session_id, text, client, self.inner.event_bus.clone())
+            .await;
+
+        if let Err(error) = result {
+            self.emit_run_error(session_id, error.to_string());
+        }
+    }
+
+    async fn session_driver(&self, session_id: SessionId) -> Option<Arc<Mutex<SessionDriver>>> {
+        self.inner.sessions.lock().await.session_driver(session_id)
+    }
+
+    fn emit_run_error(&self, id: SessionId, message: impl Into<String>) {
+        let _ = self.inner.event_bus.emit(Event::RunError {
+            id,
+            message: message.into(),
+        });
+    }
 }
 
 impl Default for Engine {
@@ -115,11 +158,11 @@ impl Default for Engine {
     }
 }
 
-#[derive(Debug)]
 struct EngineInner {
     sessions: Mutex<SessionManager>,
     event_bus: EventBus,
     session_ids: SessionIdSource,
+    llm_client: Option<Arc<dyn LlmClient>>,
 }
 
 impl Default for EngineInner {
@@ -128,7 +171,23 @@ impl Default for EngineInner {
             sessions: Mutex::new(SessionManager::default()),
             event_bus: EventBus::new(),
             session_ids: SessionIdSource::new(),
+            llm_client: None,
         }
+    }
+}
+
+impl EngineInner {
+    fn with_llm_client(client: Arc<dyn LlmClient>) -> Self {
+        Self {
+            llm_client: Some(client),
+            ..Self::default()
+        }
+    }
+}
+
+impl fmt::Debug for Engine {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("Engine").finish_non_exhaustive()
     }
 }
 
@@ -176,21 +235,44 @@ impl fmt::Display for EngineError {
 
 impl Error for EngineError {}
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct SessionManager {
-    sessions: BTreeMap<SessionId, SessionInfo>,
+    sessions: BTreeMap<SessionId, SessionRecord>,
 }
 
 impl SessionManager {
     fn create_session(&mut self, id: SessionId, config: SessionConfig) -> SessionInfo {
-        let session = SessionInfo { id, config };
-        self.sessions.insert(id, session.clone());
+        let session = SessionInfo {
+            id,
+            config: config.clone(),
+        };
+        self.sessions.insert(
+            id,
+            SessionRecord {
+                info: session.clone(),
+                driver: Arc::new(Mutex::new(SessionDriver::new(&config))),
+            },
+        );
         session
     }
 
     fn list_sessions(&self) -> Vec<SessionInfo> {
-        self.sessions.values().cloned().collect()
+        self.sessions
+            .values()
+            .map(|record| record.info.clone())
+            .collect()
     }
+
+    fn session_driver(&self, id: SessionId) -> Option<Arc<Mutex<SessionDriver>>> {
+        self.sessions
+            .get(&id)
+            .map(|record| Arc::clone(&record.driver))
+    }
+}
+
+struct SessionRecord {
+    info: SessionInfo,
+    driver: Arc<Mutex<SessionDriver>>,
 }
 
 #[derive(Debug)]
@@ -357,5 +439,207 @@ mod skeleton {
                 message: "command `cancel_run` is not implemented yet".to_owned(),
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod chat {
+    use std::sync::Arc;
+
+    use agent_lib::{
+        client::LlmClient,
+        model::{
+            content::ContentBlock,
+            message::{Message, Role},
+            usage::Usage,
+        },
+    };
+    use mag_protocol::{Command, Event, RoutingMode, SessionConfig, UsageInfo};
+    use tokio::time::{Duration, timeout};
+    use tokio_stream::StreamExt;
+
+    use crate::{
+        EventStream,
+        llm::test_support::{FakeLlmClient, text_stream_with_usage},
+    };
+
+    use super::{CommandOutput, Engine};
+
+    fn config(model: &str) -> SessionConfig {
+        SessionConfig {
+            provider: "fake".to_owned(),
+            model: model.to_owned(),
+            tool_profile: None,
+            routing: RoutingMode::ModelRouted,
+        }
+    }
+
+    fn usage(input: u32, output: u32) -> Usage {
+        Usage {
+            input,
+            output,
+            total: Some(input + output),
+            ..Usage::default()
+        }
+    }
+
+    fn engine_with_fake(fake: Arc<FakeLlmClient>) -> Engine {
+        let client: Arc<dyn LlmClient> = fake;
+        Engine::with_llm_client(client)
+    }
+
+    async fn next_event(events: &mut EventStream) -> Event {
+        timeout(Duration::from_secs(1), events.next())
+            .await
+            .expect("event timed out")
+            .expect("event stream closed")
+    }
+
+    async fn create_session(engine: &Engine, events: &mut EventStream) -> super::SessionInfo {
+        let created = engine
+            .handle_command(Command::CreateSession {
+                config: config("fake-chat"),
+            })
+            .await
+            .expect("create session");
+        let CommandOutput::SessionCreated(session) = created else {
+            panic!("unexpected create output: {created:?}");
+        };
+        assert_eq!(
+            next_event(events).await,
+            Event::SessionCreated {
+                id: session.id,
+                config: session.config.clone(),
+            }
+        );
+        session
+    }
+
+    fn text(message: &Message) -> String {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn send_message_streams_ordered_run_events() {
+        let fake =
+            FakeLlmClient::scripted(vec![text_stream_with_usage(&["hel", "lo"], usage(7, 2))]);
+        let engine = engine_with_fake(fake.clone());
+        let mut events = engine.subscribe();
+        let session = create_session(&engine, &mut events).await;
+
+        let output = engine
+            .handle_command(Command::SendMessage {
+                session_id: session.id,
+                text: "hi".to_owned(),
+                attachments: Vec::new(),
+            })
+            .await
+            .expect("send message");
+        assert_eq!(output, CommandOutput::None);
+
+        let Event::RunStarted { id, run_id } = next_event(&mut events).await else {
+            panic!("expected run_started");
+        };
+        assert_eq!(id, session.id);
+        assert_ne!(run_id.into_uuid(), uuid::Uuid::nil());
+
+        assert_eq!(
+            next_event(&mut events).await,
+            Event::TextDelta {
+                id: session.id,
+                text: "hel".to_owned(),
+            }
+        );
+        assert_eq!(
+            next_event(&mut events).await,
+            Event::TextDelta {
+                id: session.id,
+                text: "lo".to_owned(),
+            }
+        );
+
+        let Event::RunFinished { id, output } = next_event(&mut events).await else {
+            panic!("expected run_finished");
+        };
+        assert_eq!(id, session.id);
+        assert_eq!(output.text, "hello");
+        assert_eq!(
+            output.usage,
+            Some(UsageInfo {
+                input_tokens: 7,
+                output_tokens: 2,
+                total_tokens: 9,
+            })
+        );
+
+        let requests = fake.stream_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].model, "fake-chat");
+        assert!(requests[0].stream);
+        assert_eq!(requests[0].messages.len(), 1);
+        assert_eq!(requests[0].messages[0].role, Role::User);
+        assert_eq!(text(&requests[0].messages[0]), "hi");
+    }
+
+    #[tokio::test]
+    async fn send_message_accumulates_history_in_one_session() {
+        let fake = FakeLlmClient::scripted(vec![
+            text_stream_with_usage(&["first"], usage(3, 1)),
+            text_stream_with_usage(&["second"], usage(5, 2)),
+        ]);
+        let engine = engine_with_fake(fake.clone());
+        let mut events = engine.subscribe();
+        let session = create_session(&engine, &mut events).await;
+
+        engine
+            .handle_command(Command::SendMessage {
+                session_id: session.id,
+                text: "hi".to_owned(),
+                attachments: Vec::new(),
+            })
+            .await
+            .expect("first send");
+        for _ in 0..3 {
+            let _ = next_event(&mut events).await;
+        }
+
+        engine
+            .handle_command(Command::SendMessage {
+                session_id: session.id,
+                text: "again".to_owned(),
+                attachments: Vec::new(),
+            })
+            .await
+            .expect("second send");
+        for _ in 0..3 {
+            let _ = next_event(&mut events).await;
+        }
+
+        let requests = fake.stream_requests();
+        assert_eq!(requests.len(), 2);
+        let second_messages = &requests[1].messages;
+        assert!(
+            second_messages
+                .iter()
+                .any(|message| message.role == Role::User && text(message) == "hi"),
+            "second request should include first user message: {second_messages:?}",
+        );
+        assert!(
+            second_messages
+                .iter()
+                .any(|message| message.role == Role::Assistant && text(message) == "first"),
+            "second request should include first assistant reply: {second_messages:?}",
+        );
+        let last = second_messages.last().expect("second request has messages");
+        assert_eq!(last.role, Role::User);
+        assert_eq!(text(last), "again");
     }
 }
