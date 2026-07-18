@@ -77,3 +77,41 @@ M1-1 / M1-2 均已 `[DONE]` 且提交，工作区干净。
 - 验证序列 1–5 全绿（fmt / focused / clippy -D warnings / workspace / doc）。
 - PLAN.md 契约清单已补 cwd；TODO.md M1-3 标题改 [DONE] + 完成记录。
 - 下一个未完成任务：M1-4（`session/new` handler → create_session，依赖 M1-3，已就绪）。
+
+---
+
+# 更新（本次调用）：实现 M1-4 `session/new` handler → `create_session`
+
+首个未完成任务 = **M1-4**（TODO.md:305）。依赖 M1-3 已 `[DONE]`（`SessionConfig.cwd` 就绪）。
+
+## 已核实锚点
+- `acp::NewSessionRequest{ cwd: PathBuf（必填绝对路径）, additional_directories, mcp_servers, meta }`
+  （schema v1 `agent.rs:1011`）；`NewSessionResponse::new(session_id: impl Into<SessionId>)`（`agent.rs:1115`）。
+- `mag_service::SessionConfig{ provider, model, tool_profile:Option, cwd:Option<PathBuf>, routing }`。
+- `ServiceError: std::error::Error` → `acp::Error::into_internal_error(err)` 可转协议错误。
+- `map::mag_session_id_to_acp` / `acp_session_id_to_mag` 已存在（M1-1）。
+- builder 按请求类型分发 handler；新增第三个 `on_receive_request`（`NewSessionRequest`）。service 经
+  async 闭包 move 捕获 + 每次 `Arc::clone` 供多次调用。
+- 默认 provider/model：`"openai"` / `"gpt-5-codex"`（与 service.rs 测试 fixture 一致）；tool_profile=None、
+  routing=RoutingMode::default()。cwd = Some(req.cwd.clone())（ACP 绝对路径，直接承载，不丢弃）。
+
+## 落地步骤
+1. `map.rs`：`pub fn new_session_request_to_config(req: &NewSessionRequest) -> SessionConfig`
+   + `DEFAULT_PROVIDER`/`DEFAULT_MODEL` 常量 + rustdoc + 单测（默认值 + cwd 承载）。
+2. `handlers.rs`：`session_new(service, request, responder, connection)`：`create_session(cfg)`→map id→
+   `NewSessionResponse`；错误 `into_internal_error`。
+3. `lib.rs`：注册 `session/new` handler，闭包捕获 `service`；移除 `let _ = &service;`。
+4. `tests/e2e.rs`：录制型 fake（Arc<Mutex<Option<SessionConfig>>>）记录 config；扩展夹具跑
+   `initialize → session/new`，断言 `config.cwd == Some(req.cwd)` 且回的 ACP SessionId 经
+   `acp_session_id_to_mag` 解回同一 mag SessionId。
+5. 验证序列 1–5：fmt / `cargo test -p mag-acp session_new` / clippy -D warnings / workspace / doc。
+6. TODO.md M1-4 标 [DONE] + 完成记录（注明 cwd 经 SessionConfig.cwd 承载）。提交并停止。
+
+## 完成状态：M1-4 已 [DONE]（本次）
+- map: `new_session_request_to_config` + DEFAULT_PROVIDER/MODEL 常量 + 单测。
+- handler: `session_new`（create_session → 映射 SessionId → NewSessionResponse；错误 into_internal_error）。
+- lib: 注册 session/new handler，闭包捕获 service。
+- e2e: 录制型 FakeService + `session_new_round_trips_over_in_memory_pipe`（cwd 承载 + id 往返）。
+- 验证序列 1–5 全绿（fmt / mag-acp 6 tests / clippy -D warnings / workspace / doc）。
+- TODO.md M1-4 标 [DONE] + 完成记录。PLAN.md 无需改（契约清单 M1-3 已含 cwd；里程碑表已含 session/new）。
+- 下一个未完成任务：M1-R（M1 review）。

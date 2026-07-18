@@ -302,7 +302,7 @@
 - **PLAN.md 同步**：§`mag-service` 契约清单（line 105）`SessionConfig` 补 `cwd:Option<PathBuf>`（契约字段订正，
   非阶段计划改写）。M1-4 现可无损把 ACP `cwd` 映射进 `SessionConfig.cwd`。
 
-### [TODO] M1-4 `session/new` handler → `create_session`（cwd → `SessionConfig.cwd`）
+### [DONE] M1-4 `session/new` handler → `create_session`（cwd → `SessionConfig.cwd`）
 
 **依赖**：M1-3（`SessionConfig.cwd` 字段）。M1-3 未 `[DONE]` 前不得开始本任务。
 
@@ -331,6 +331,37 @@
 - 聚焦测试：`cargo test -p mag-acp session_new`（纯函数 + handler 级 + 内存管道往返）1 分钟内绿。
 - 完整验证序列 1–5；clippy / doc 无警告。
 - 本任务显式依赖 M1-3，并在完成记录注明 cwd 经 `SessionConfig.cwd` 承载。
+
+**完成记录（M1-4）**：
+
+- **`map`（`crates/mag-acp/src/map.rs`）**：新增纯函数
+  `pub fn new_session_request_to_config(req: &acp::NewSessionRequest) -> SessionConfig`，
+  把 ACP 绝对 `cwd` 直接承载为 `SessionConfig.cwd = Some(req.cwd.clone())`（**不丢弃**，M1-3 字段落位）；
+  `provider`/`model` 取新增常量 `DEFAULT_PROVIDER="openai"` / `DEFAULT_MODEL="gpt-5-codex"`（ACP 不传 LLM
+  选择，与 `mag-service` 既有 fixture 一致）、`tool_profile=None`、`routing=RoutingMode::default()`；
+  `additional_directories`/`mcp_servers` 第一版忽略（`docs/ACP.md` §3.2）。带 rustdoc。新增
+  `use mag_service::{RoutingMode, SessionConfig}`。
+- **handler（`crates/mag-acp/src/handlers.rs`）**：新增
+  `pub(crate) async fn session_new(service, request, responder, connection)`：经
+  `map::new_session_request_to_config` 组 `SessionConfig` → `service.create_session(cfg).await` →
+  成功用 `map::mag_session_id_to_acp` 映射回 ACP `SessionId` 并回 `NewSessionResponse::new(id)`；
+  `ServiceError` 经 `agent_client_protocol::Error::into_internal_error` 转内部 JSON-RPC 错误。新增
+  `use std::sync::Arc` + `mag_service::MagService`。
+- **装配（`crates/mag-acp/src/lib.rs`）**：`serve` 在 builder 上注册第三个 `on_receive_request`
+  （`NewSessionRequest`），async 闭包 move 捕获 `service` 并每次 `Arc::clone` 供多次调用；移除原
+  `let _ = &service;` 占位。模块级 rustdoc 更新为 M1-4（`initialize` / `session/new` / `authenticate`）。
+- **测试**：
+  - 纯函数单测 `new_session_request_carries_cwd_and_defaults`（`map.rs`）：`cwd` 承载 + 默认 provider/model/
+    tool_profile/routing。
+  - e2e（`tests/e2e.rs`）：`FakeService` 扩展为录制型（`recorded_config: Arc<Mutex<Option<SessionConfig>>>`，
+    `create_session` 记录 config 并回固定 `SESSION_UUID`）；新增
+    `session_new_round_trips_over_in_memory_pipe`：经 acp client 走 `initialize → session/new`，断言 fake 记录的
+    `config.cwd == Some(req.cwd)`，且回的 ACP `SessionId` 经 `acp_session_id_to_mag` 解回同一 mag `SessionId`。
+- **验证（全绿）**：1) `cargo fmt --all -- --check` OK；2) `cargo test -p mag-acp`（map 4 passed + e2e 2 passed，
+  含 `session_new_round_trips_over_in_memory_pipe`，均 <0.01s）；3) `cargo clippy --all-targets -- -D warnings`
+  无警告；4) `cargo test --workspace` 全通过（0 failed）；5) `cargo doc --no-deps --workspace` 无警告。
+- **依赖边界**：只改 mag-acp（依赖 `mag-service` + `agent-client-protocol`）；未依赖 mag-core/agent-lib。
+  显式依赖 M1-3（`SessionConfig.cwd`，已 `[DONE]`）；ACP `cwd` 经 `SessionConfig.cwd` 承载，未在 mag-acp 侧丢弃。
 
 ### [TODO] M1-R Review：M1 crate 骨架 + `initialize` + `session/new`
 

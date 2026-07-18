@@ -8,6 +8,21 @@
 use std::fmt;
 
 use agent_client_protocol::schema::v1 as acp;
+use mag_service::{RoutingMode, SessionConfig};
+
+/// Default AI provider used for ACP-created sessions.
+///
+/// ACP's `session/new` does not carry an LLM selection (`docs/ACP.md` §3.2), so
+/// the first version falls back to a fixed provider. This mirrors the provider
+/// used by the frozen `mag-service` contract's own fixtures.
+pub const DEFAULT_PROVIDER: &str = "openai";
+
+/// Default model identifier used for ACP-created sessions.
+///
+/// Like [`DEFAULT_PROVIDER`], this is a placeholder default applied because ACP
+/// does not select a model (`docs/ACP.md` §3.2). A later interface/config source
+/// can override it without changing this mapping.
+pub const DEFAULT_MODEL: &str = "gpt-5-codex";
 
 /// Converts a mag [`SessionId`](mag_service::SessionId) into an ACP
 /// [`SessionId`](acp::SessionId).
@@ -65,6 +80,30 @@ pub fn acp_session_id_to_mag(
     })
 }
 
+/// Builds a mag [`SessionConfig`] from an ACP
+/// [`NewSessionRequest`](acp::NewSessionRequest) (`docs/ACP.md` §3.2).
+///
+/// The request's absolute `cwd` becomes the session working root and is carried
+/// through unchanged as [`SessionConfig::cwd`] (`Some(req.cwd)`), so mag-core can
+/// place it as the facade agent's worktree (M1-3). It is never dropped on the
+/// mag-acp side.
+///
+/// ACP does not carry an LLM selection, so `provider`/`model` fall back to the
+/// fixed [`DEFAULT_PROVIDER`] / [`DEFAULT_MODEL`] constants; `tool_profile` is
+/// left unset and `routing` uses [`RoutingMode::default`]. The first version
+/// ignores `additional_directories` and `mcp_servers` (later source integration
+/// points, out of scope here per `docs/ACP.md` §3.2).
+#[must_use]
+pub fn new_session_request_to_config(req: &acp::NewSessionRequest) -> SessionConfig {
+    SessionConfig {
+        provider: DEFAULT_PROVIDER.to_owned(),
+        model: DEFAULT_MODEL.to_owned(),
+        tool_profile: None,
+        cwd: Some(req.cwd.clone()),
+        routing: RoutingMode::default(),
+    }
+}
+
 /// Builds the [`AgentCapabilities`](acp::AgentCapabilities) mag advertises during
 /// `initialize`.
 ///
@@ -116,6 +155,23 @@ mod tests {
         assert_eq!(err.value, "not-a-uuid");
         // Display should mention the offending value for diagnostics.
         assert!(err.to_string().contains("not-a-uuid"));
+    }
+
+    #[test]
+    fn new_session_request_carries_cwd_and_defaults() {
+        let cwd = std::path::PathBuf::from("/abs/work/root");
+        let req = acp::NewSessionRequest::new(cwd.clone());
+
+        let config = new_session_request_to_config(&req);
+
+        // The absolute cwd is carried through unchanged (never dropped).
+        assert_eq!(config.cwd, Some(cwd));
+        // Provider/model fall back to the fixed defaults (ACP carries no LLM
+        // selection).
+        assert_eq!(config.provider, DEFAULT_PROVIDER);
+        assert_eq!(config.model, DEFAULT_MODEL);
+        assert_eq!(config.tool_profile, None);
+        assert_eq!(config.routing, mag_service::RoutingMode::default());
     }
 
     #[test]

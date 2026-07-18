@@ -10,10 +10,11 @@
 //! The design of record is [`docs/ACP.md`](../docs/ACP.md); the phase plan lives
 //! in [`PLAN.md`](../PLAN.md) and the task list in [`TODO.md`](../TODO.md).
 //!
-//! This milestone (M1-2) adds the [`serve`] entry point: it assembles the ACP
-//! `Agent` builder, registers the `initialize` (and placeholder `authenticate`)
-//! request handlers, and runs the connection over a caller-supplied transport.
-//! The single point that wires a concrete `mag-core::Engine` into `serve` is the
+//! This milestone (M1-4) adds the `session/new` request handler on top of the
+//! M1-2 [`serve`] entry point: it assembles the ACP `Agent` builder, registers
+//! the `initialize`, `session/new`, and placeholder `authenticate` request
+//! handlers, and runs the connection over a caller-supplied transport. The
+//! single point that wires a concrete `mag-core::Engine` into `serve` is the
 //! top-level `mag` binary, which keeps this library's dependency boundary intact.
 
 use std::sync::Arc;
@@ -48,17 +49,22 @@ pub async fn serve<T>(
 where
     T: ConnectTo<Agent> + 'static,
 {
-    // `service` is not consumed by the `initialize`/`authenticate` handlers, but
-    // it is the handle later handlers (`session/new`, `session/prompt`, …) will
-    // capture; keeping it in the signature fixes the assembly shape now.
-    let _ = &service;
-
+    // `service` is captured by the `session/new` handler closure (and later
+    // handlers as more ACP methods are implemented). The async closure moves the
+    // handle in and re-`Arc::clone`s it per invocation so the handler can be
+    // called for every inbound request.
     Agent
         .builder()
         .name("mag-acp")
         .on_receive_request(
             async move |request, responder, connection| {
                 handlers::initialize(request, responder, connection).await
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request, responder, connection| {
+                handlers::session_new(Arc::clone(&service), request, responder, connection).await
             },
             on_receive_request!(),
         )
