@@ -583,7 +583,7 @@ cancel/load（M4）。M1-3→M1-4 依赖已在各自完成记录标注。
   M3 将接管），无臆造 ACP 语义。
 - 下一个未完成任务：M2-R（Review：M2 泵 + 类型映射）。
 
-### [TODO] M2-R Review：M2 泵 + 类型映射
+### [DONE] M2-R Review：M2 泵 + 类型映射
 
 **上下文**：核对 M2 对 `docs/ACP.md` §3.4/§4 的完整性；真实任务，不得跳过。
 
@@ -595,6 +595,63 @@ cancel/load（M4）。M1-3→M1-4 依赖已在各自完成记录标注。
 4. 确认无未调度失败测试；跑完整验证序列 1–5。
 
 **验证条件**：完整验证序列 1–5 全绿；review 结论 + 对照表 + 缺口汇总写入完成记录。
+
+**完成记录**（本次调用）：
+
+- **结论**：M2 实现（`crates/mag-acp/src/{map.rs,handlers.rs,lib.rs}` + `tests/prompt.rs`）与
+  `docs/ACP.md` §3.4/§4 一致。无需改代码——review 逐条核实源码 vs 规范 vs `mag-service` 真相定义
+  （`crates/mag-service/src/{service.rs,lib.rs}`），未发现未调度失败测试、workaround 或臆造 ACP 语义。
+
+- **§3.4 泵伪码对照**（`handlers.rs::session_prompt`）：
+  | 伪码要点 | 实现 | 结论 |
+  |---|---|---|
+  | 先 `subscribe(Some(sid))` 再 `send_message`（防竞态） | line 123 subscribe 早于 line 124 send_message | ✓ |
+  | `content_blocks_to_user_input(req.prompt)` | line 119 | ✓ |
+  | `TextDelta/Tool*/Delegation*` → `session/update` | 经 `service_event_to_session_update` + `send_notification`（line 150-153） | ✓ |
+  | `InteractionRequested` → 桥接权限 | 占位 `continue` + `TODO(M3)`（line 143-146），**已由 M3-1/M3-2 调度** | ✓（已调度） |
+  | `RunFinished`→`EndTurn`、`RunError`→`Refusal` | `run_terminal_to_stop_reason` 跳出（line 137-139） | ✓ |
+  | 流结束 `None`→`EndTurn` | line 130-134 | ✓ |
+  | `responder.respond(PromptResponse::new(stop))` | line 156 | ✓ |
+  - 错误处理**优于**伪码裸 `?`：无效 session id / `send_message` 失败经
+    `respond_with_error(Error::into_internal_error(..))` 正确回客户端（line 112-127），而非不回响应即失败。
+
+- **§4 映射表对照**（`map.rs`；ServiceEvent 实际 13 变体，`service.rs:186-279`，全覆盖）：
+  | `ServiceEvent` | 映射 | 核实 |
+  |---|---|---|
+  | `TextDelta` | `AgentMessageChunk` | ✓ |
+  | `ToolStarted` | `ToolCall`（call_id/name/status/raw_input） | ✓ |
+  | `ToolFinished` | `ToolCallUpdate`（终态+raw_output+message→content） | ✓ |
+  | `DelegationStarted` | `ToolCall(InProgress)`，id=`delegate:{name}`（与 UUID call_id 不冲突） | ✓ |
+  | `DelegationFinished` | `ToolCallUpdate(Completed)`（output→content） | ✓ |
+  | `DelegationFailed` | `ToolCallUpdate(Failed)`（message→content） | ✓ |
+  | `DelegationMessage` | `AgentMessageChunk`（降级文本，不臆造 Plan，PLAN.md R-4） | ✓ |
+  | `InteractionRequested`/`RunFinished`/`RunError`/`SessionCreated`/`RunStarted`/`LocalAgentsProbed` | `None` | ✓ |
+  | 未来变体 `_`（`#[non_exhaustive]`） | `None`（保守忽略，不臆造） | ✓ |
+  - §4 表中的 `DelegationProgress` 在真实 `ServiceEvent` 中**不存在**（仅规范表的假设变体），无需映射——非缺口。
+  - 字段访问全部与源定义一致：`ToolTrace{call_id,name,input,output,status,message}`、
+    `DelegationTrace{delegate,task,output,message}`、`DelegationMessageWire{text}`（`lib.rs:351-418`）。
+  - `ToolStatusWire` 5 变体全覆盖：`Started→InProgress`、`Finished→Completed`、
+    `Denied/Cancelled/Failed→Failed`、未来变体 `_→InProgress`（最不武断的非终态，不伪造终态）。
+  - `content_blocks_to_user_input`：仅 `Text` 换行拼接，`Image/Audio/ResourceLink/Resource` + 未来变体忽略
+    （能力未宣告，按协商不会到来）；空切片→空 `UserInput`。
+  - `run_terminal_to_stop_reason`：仅 `RunFinished→EndTurn`、`RunError→Refusal`，其余 `None`；
+    `MaxTokens`/`MaxTurnRequests` 需 service 侧区分，规范内保守留白（PLAN.md R-5）。
+
+- **并发多会话互不干扰**：handler 传 `subscribe(Some(session_id))` 按会话过滤（`handlers.rs:123`），
+  假设成立（依赖 mag-service 契约）；每个 prompt 泵各自订阅、各自靠本轮终态跳出，break 后 `events` 流被 drop。
+
+- **缺口汇总**（均**已调度**，无未调度项）：
+  1. `InteractionRequested` 仅占位 `continue`：真实 service 下会使本轮在 gate 暂停、泵在 `events.next()` 等待，
+     直到 M3 `bridge_permission` 接管——已由 **M3-1/M3-2** 显式调度（line 606/641）。M2 测试无该事件故不卡住。
+  2. `MaxTokens`/`MaxTurnRequests` 未产出——需 service 侧新增区分信号，PLAN.md R-5 已记为后续。
+
+- **验证序列 1–5 全绿**：`cargo fmt --all -- --check` 干净；`cargo test -p mag-acp map::` 16 passed +
+  `cargo test -p mag-acp prompt` 3 passed；`cargo clippy --all-targets -- -D warnings` 无警告；
+  `cargo test --workspace` 全绿（合计 112：mag-acp 16+2+3=21、mag-core 48+2=50、mag-service 12、
+  mag-sources 10、mag-tools 6+13=19，0 fail）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无警告。
+
+- 本任务纯 review，无代码改动；仅本文件 + `memory/claude_plan.md` 更新。PLAN.md 不改（无阶段计划变更）。
+- 下一个未完成任务：M3-1（`map`：`InteractionKindWire → RequestPermissionRequest` + outcome）。
 
 ---
 

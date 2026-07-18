@@ -251,3 +251,53 @@ M2-1 已提供全部纯函数映射（`service_event_to_session_update` / `conte
 - TODO.md M2-2 标 [DONE] + 完成记录。PLAN.md 无需改（无阶段计划变更；§3.4 泵结构与 R-4/R-5 已预置）。
 - InteractionRequested 仅显式占位（TODO(M3)），无臆造 ACP 语义；无 workaround、无前置任务。
 - 下一个未完成任务：M2-R（Review）。
+
+---
+
+# 更新（本次调用）：M2-R Review — M2 泵 + 类型映射
+
+## 定位
+`TODO.md` 首个未完成任务 = **M2-R**（line 586，`[TODO]`）。M2-1 / M2-2 均 `[DONE]` 且已提交，工作区干净。
+这是 review 任务（真实任务，不得跳过）：核对 M2 对 `docs/ACP.md` §3.4/§4 的完整性。
+
+## Review 方法（就地核实源码 vs 规范）
+被审文件：`crates/mag-acp/src/{map.rs,handlers.rs,lib.rs}` + `tests/prompt.rs`。
+源码真相：`crates/mag-service/src/{service.rs,lib.rs}` 的 `ServiceEvent`/`ToolTrace`/`DelegationTrace`/
+`DelegationMessageWire`/`ToolStatusWire` 定义。
+
+### 1) §3.4 泵伪码对照（handlers.rs::session_prompt）
+- subscribe 先于 send_message ✓（line 123 先 subscribe，line 124 才 send_message；防竞态）。
+- 逐事件处理 ✓：terminal → run_terminal_to_stop_reason 跳出；InteractionRequested → 占位 continue（M3）；
+  其余 → service_event_to_session_update → send_notification。
+- stop reason 跳出 ✓：RunFinished→EndTurn、RunError→Refusal、流尽 None→EndTurn。
+- 错误处理**优于**伪码：send_message/session-id 失败经 respond_with_error(into_internal_error) 正确回客户端，
+  而非伪码的裸 `?`（后者会不回响应直接失败）。非缺口。
+
+### 2) §4 映射表对照（map.rs::service_event_to_session_update）
+- ServiceEvent 实际 13 变体（service.rs:186-279），map 全覆盖：
+  TextDelta→AgentMessageChunk、ToolStarted→ToolCall、ToolFinished→ToolCallUpdate、
+  Delegation{Started→ToolCall(InProgress), Finished→Completed, Failed→Failed, Message→AgentMessageChunk}、
+  InteractionRequested/RunFinished/RunError/SessionCreated/RunStarted/LocalAgentsProbed→None；`_`→None（non_exhaustive）。
+- §4 表里的 `DelegationProgress` 在真实 `ServiceEvent` 中**不存在**（仅规范表的假设变体）；无需映射。非缺口。
+- 字段访问全部与源定义一致：ToolTrace{call_id,name,input,output,status,message}、
+  DelegationTrace{delegate,task,output,message}、DelegationMessageWire{text}。
+- ToolStatusWire 5 变体全覆盖 + non_exhaustive `_`→InProgress（最不武断的非终态）。无臆造 ACP 语义。
+- content_blocks_to_user_input：仅 Text 换行拼接，非文本忽略（能力未宣告）；stop reason 仅 RunFinished/RunError。
+
+### 3) 并发多会话泵互不干扰
+- handler 传 `subscribe(Some(session_id))` 按会话过滤（handlers.rs:123）；假设成立（依赖 mag-service 契约）。
+
+### 4) 已知且**已调度**缺口（非未调度失败）
+- InteractionRequested 在 M2 仅占位 continue：真实 service 下会使本轮暂停、泵在 events.next() 上等待，
+  直到 M3 的 bridge_permission 接管。**已由 M3-1/M3-2 显式调度**（TODO.md line 606/641），非未调度缺口。
+  M2 测试无该事件，故不会卡住。
+- MaxTokens/MaxTurnRequests 未产出：需 service 侧区分（PLAN.md R-5），已在规范内保守留白。
+
+## 结论
+M2 实现与 §3.4/§4 一致，无未调度失败测试、无 workaround、无臆造 ACP 语义。无需改代码；
+仅跑完整验证序列 1–5 并把 review 结论/对照表/缺口汇总写入 M2-R 完成记录、标 `[DONE]`、提交。
+
+## 动作
+1. 跑验证序列 1–5（fmt / `cargo test -p mag-acp` / clippy / `cargo test --workspace` / doc）。
+2. TODO.md：M2-R 标 `[DONE]` + 完成记录（结论 + 对照表 + 缺口汇总）。
+3. 提交并停止。PLAN.md 不改（无阶段计划变更）。
