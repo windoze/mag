@@ -301,3 +301,48 @@ M2 实现与 §3.4/§4 一致，无未调度失败测试、无 workaround、无�
 1. 跑验证序列 1–5（fmt / `cargo test -p mag-acp` / clippy / `cargo test --workspace` / doc）。
 2. TODO.md：M2-R 标 `[DONE]` + 完成记录（结论 + 对照表 + 缺口汇总）。
 3. 提交并停止。PLAN.md 不改（无阶段计划变更）。
+
+---
+
+# M3-1 `map`：`InteractionKindWire → RequestPermissionRequest` + outcome → `InteractionResponseWire`（进行中）
+
+## 目标
+纯函数映射（`docs/ACP.md` §5「映射细节」），无 IO。两个新公开函数 + 稳定 option id 常量，全部单测。
+
+## 真相核对（已读源码）
+- `InteractionKindWire`（mag-service lib.rs:424）：`Approval{call_id, requirement}`、`Question{prompt}`、
+  `Choice{prompt,options}`、`Permission{action_id,actor,category,risk,summary,subject,reason}`。
+  Approval **只有** call_id+requirement（无 tool_name/input）——ACP.md §5 提的 tool_name/input 尚未在冻结
+  wire 类型里；不臆造，只用现有字段。
+- `InteractionResponseWire`（lib.rs:468）：`Approval{step_id,call_id,decision,message}`、`Answer{text}`、
+  `Choice{index}`、`Permission{action_id,decision}`。
+- `ApprovalDecisionWire{Approve,Deny,Timeout,Cancel}`；`PermissionDecisionWire{Approve,Deny{reason},Cancel}`。
+- mag-core `interaction_response_from_wire`（approval.rs:296）：按 (kind,response) **家族必须匹配**，否则
+  Err("family does not match")；Approval 用 decision/message，step_id/call_id **被忽略**（由存储的 interaction
+  重建）；Permission 用 decision，action_id 被忽略；Question 需 Answer；Choice 需 Choice。
+- Question/Choice 在 mag-core 注释为 **mag-unused**（approval.rs:243）——facade 不产出，故不会到达 bridge。
+- `RequestPermissionOutcome`（acp schema v1 client.rs:835）：`Cancelled`、`Selected(SelectedPermissionOutcome{option_id})`。
+- `PermissionOptionKind{AllowOnce,AllowAlways,RejectOnce,RejectAlways}`；`PermissionOption::new(id,name,kind)`；
+  `PermissionOptionId: From<&'static str>`。
+
+## 设计决策
+- **options**：只给 `AllowOnce`(approve)+`RejectOnce`(deny)。mag wire 无「始终允许」持久语义，加 AllowAlways/
+  RejectAlways 会臆造 mag 不支持的语义 → 如实只给一次性两项。
+- **稳定 option id 常量**（pub，避免魔法字符串漂移）：`PERMISSION_OPTION_ALLOW="mag:allow"`、
+  `PERMISSION_OPTION_REJECT="mag:reject"`。分类：仅精确等于 allow id → Approve；其余（含 reject / 未知 id）→ Deny
+  （fail-safe，未知 id 绝不批准，§6）。
+- **tool_call 富化**：Approval → id=call_id、status=Pending、title=通用「Tool call requires approval」、
+  reason(若有)入 content；Permission → id=action_id、status=Pending、kind=category→ToolKind、title=summary、
+  raw_input=subject、reason(若有)入 content。
+- **step_id 占位**：mag 忽略之。无 uuid 依赖，用 `StepIdWire::new(*call_id.as_uuid())` 复用 call_id 的 UUID 作
+  惰性占位（全类型化 API，无魔法串、无 panic）。call_id 则回显 kind 里的真实 call_id。
+- **outcome→response**：先归约 Decision{Approve,Deny,Cancel}（Selected(allow)→Approve、Selected(其它)→Deny、
+  Cancelled/未来变体→Cancel）；再按 kind 组家族匹配的 response：Approval→Approval、Permission→Permission、
+  Question→Answer("")、Choice→Choice(0)（惰性，mag-unused）、未来 `_`→Answer("")（最惰性，家族不符时 driver
+  会干净 Err，非挂起）。
+
+## 动作
+1. map.rs：加 imports + 常量 + 私有 helper + 两个 pub 函数（带 rustdoc）+ 单测（Approval/Permission 组装 +
+   Selected(approve/deny)/Cancelled 回译，覆盖两 kind）。
+2. 验证序列：fmt → 聚焦 `cargo test -p mag-acp map::` / `permission` → clippy → `cargo test --workspace` → doc。
+3. TODO.md：M3-1 标 `[DONE]` + 完成记录。提交并停止。PLAN.md 不改（无阶段计划变更）。

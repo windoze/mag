@@ -660,7 +660,7 @@ cancel/load（M4）。M1-3→M1-4 依赖已在各自完成记录标注。
 目标：把 mag 的审批往返（interface 无关的 `InteractionRequested` / `respond_interaction`）映射到 ACP 的
 `session/request_permission`，复用同一 gate，审批逻辑（mag-core）一行不改。对应 `docs/ACP.md` §5。
 
-### [TODO] M3-1 `map`：`InteractionKindWire → RequestPermissionRequest` + outcome → `InteractionResponseWire`
+### [DONE] M3-1 `map`：`InteractionKindWire → RequestPermissionRequest` + outcome → `InteractionResponseWire`
 
 **上下文**：
 
@@ -694,6 +694,45 @@ cancel/load（M4）。M1-3→M1-4 依赖已在各自完成记录标注。
 - 聚焦测试：`cargo test -p mag-acp permission_map`（或 `map::` 过滤），覆盖 Approval/Permission 两 kind 的
   request 组装、Selected(approve/deny)/Cancelled 三种 outcome 回译。
 - 完整验证序列 1–5；clippy / doc 无警告。
+
+**完成记录**（本次调用）：
+
+- **实现**（纯函数，`crates/mag-acp/src/map.rs`，均带 rustdoc，`#![warn(missing_docs)]` 无警告）：
+  - `pub fn interaction_to_permission_request(sid: &acp::SessionId, kind: &InteractionKindWire) ->
+    acp::RequestPermissionRequest`：组 `tool_call` + 固定 options。
+  - `pub fn outcome_to_interaction_response(kind: &InteractionKindWire, outcome:
+    acp::RequestPermissionOutcome) -> InteractionResponseWire`：Selected/Cancelled 回译。
+  - 稳定 option id 常量（避免魔法串漂移）：`pub const PERMISSION_OPTION_ALLOW="mag:allow"` /
+    `PERMISSION_OPTION_REJECT="mag:reject"`；私有 helper：`permission_options`、`option_id_to_choice`、
+    `permission_category_to_tool_kind`、`approval_tool_call`、`permission_tool_call`、`interaction_tool_call`、
+    `outcome_to_decision`、`decision_to_approval`、`decision_to_permission`、`placeholder_step_id`。
+- **options**：只给一次性 `AllowOnce`(approve)+`RejectOnce`(deny)。mag wire 无「始终允许」持久语义，
+  故不宣告 `AllowAlways`/`RejectAlways`（如实宣告，`docs/ACP.md` §7）；每 option 带稳定 `PermissionOptionId`。
+- **tool_call 富化**（`RequestPermissionRequest.tool_call: ToolCallUpdate`）：
+  - `Approval{call_id, requirement}` → id=call_id（对齐已流式的 `ToolCall`）、status=Pending、通用 title、
+    `requirement` 的 reason(若有)入 content。冻结 `Approval` 变体**只有** call_id+requirement（无 tool_name/input），
+    只用现有字段，不臆造（§5 提到的 tool_name/input 尚未进 wire 类型）。
+  - `Permission{action_id,category,summary,subject,reason,..}` → id=action_id、status=Pending、
+    kind=category→ToolKind（Shell→Execute 等，未知/未来→Other）、title=summary、raw_input=subject、reason 入 content。
+  - `Approval`/`Permission` 走**同一** `session/request_permission` 通道，仅富化来源不同。
+- **outcome→response**：先归约 `Decision{Approve,Deny,Cancel}`（Selected(allow)→Approve、Selected(其它/未知 id)→
+  Deny（fail-safe，未知 id 绝不批准，§6）、Cancelled/未来 outcome→Cancel），再按 kind 组**家族匹配**的 response
+  （mag-core `interaction_response_from_wire` 要求家族一致，否则 Err）：Approval→`InteractionResponseWire::Approval`
+  （Cancel 带 model-visible message；step_id/call_id 是占位——mag 从存储 interaction 重建，回显真实 call_id、
+  step_id 用 `StepIdWire::new(*call_id.as_uuid())` 复用 UUID 作惰性占位，避免引入 `uuid` 依赖破坏边界）、
+  Permission→`InteractionResponseWire::Permission`（keyed by action_id）。
+- **mag-unused 家族**：`Question`/`Choice` 在 mag-core 注释为 facade 不产出（`engine/approval.rs:243`），
+  故 request 用通用 pending box 保 total、response 用惰性默认（`Answer("")`/`Choice{index:0}`，镜像 mag-core 自身
+  取消处理），未来 `_` kind → 惰性 `Answer("")`。非缺口、非未调度失败：这些路径运行时不触达。
+- **依赖边界**：`serde_json` 由 dev-dep 提升为 dep（边界明确允许 serde/serde_json）；仍只依赖
+  `mag-service` + `agent-client-protocol`(+serde_json/futures)，未碰 mag-core/agent-lib/tauri/axum。冻结 `MagService`
+  契约一字未改。
+- **验证序列 1–5 全绿**：`cargo fmt --all -- --check` 干净；`cargo test -p mag-acp map::` 22 passed（16 旧+6 新：
+  options 稳定性、Approval/Permission request 组装、Approval/Permission 的 Selected(approve/deny)/Cancelled 回译、
+  未知 option id fail-safe deny）；`cargo clippy --all-targets -- -D warnings` 无警告；`cargo test --workspace`
+  全绿（118：mag-acp 22+2+3=27、mag-core 48+2、mag-service 12、mag-sources 10、mag-tools 6+13，0 fail）；
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无警告。
+- PLAN.md 不改（无阶段计划变更）。下一个未完成任务：M3-2（`bridge_permission` 接入泵）。
 
 ### [TODO] M3-2 `bridge_permission` 接入泵
 

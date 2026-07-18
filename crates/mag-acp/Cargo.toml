@@ -7,8 +7,8 @@ edition.workspace = true
 mag-service = { path = "../mag-service" }
 agent-client-protocol = "1"
 futures = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
-serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

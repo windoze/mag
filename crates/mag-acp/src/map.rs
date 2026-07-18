@@ -8,7 +8,11 @@
 use std::fmt;
 
 use agent_client_protocol::schema::v1 as acp;
-use mag_service::{RoutingMode, ServiceEvent, SessionConfig, ToolStatusWire, ToolTrace, UserInput};
+use mag_service::{
+    ApprovalDecisionWire, ApprovalRequirementWire, InteractionKindWire, InteractionResponseWire,
+    PermissionCategoryWire, PermissionDecisionWire, RoutingMode, ServiceEvent, SessionConfig,
+    StepIdWire, ToolCallIdWire, ToolStatusWire, ToolTrace, UserInput,
+};
 
 /// Default AI provider used for ACP-created sessions.
 ///
@@ -338,6 +342,333 @@ pub fn run_terminal_to_stop_reason(event: &ServiceEvent) -> Option<acp::StopReas
         ServiceEvent::RunFinished { .. } => Some(acp::StopReason::EndTurn),
         ServiceEvent::RunError { .. } => Some(acp::StopReason::Refusal),
         _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Approval bridge (`docs/ACP.md` §5): `InteractionRequested` ↔
+// `session/request_permission`.
+// ---------------------------------------------------------------------------
+
+/// Stable ACP [`PermissionOptionId`](acp::PermissionOptionId) string for the
+/// "allow this action" option (`docs/ACP.md` §5).
+///
+/// This is the single option id that maps back to an *approve* decision. It is a
+/// stable, namespaced constant (rather than an inline literal) so the id used to
+/// build the [`PermissionOption`](acp::PermissionOption) and the id matched when
+/// the client echoes it back in a
+/// [`Selected`](acp::RequestPermissionOutcome::Selected) outcome can never drift
+/// apart.
+pub const PERMISSION_OPTION_ALLOW: &str = "mag:allow";
+
+/// Stable ACP [`PermissionOptionId`](acp::PermissionOptionId) string for the
+/// "reject this action" option (`docs/ACP.md` §5).
+///
+/// Selecting this option (like selecting any non-[`PERMISSION_OPTION_ALLOW`] id)
+/// maps back to a *deny* decision. See [`PERMISSION_OPTION_ALLOW`] for why the id
+/// is a shared constant.
+pub const PERMISSION_OPTION_REJECT: &str = "mag:reject";
+
+/// The approve/deny meaning mag attaches to a selected ACP permission option.
+///
+/// mag's approval gate is a degenerate yes/no decision, so the fixed option set
+/// collapses to exactly these two meanings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PermissionChoice {
+    /// The user allowed the action (selected [`PERMISSION_OPTION_ALLOW`]).
+    Approve,
+    /// The user rejected the action (selected [`PERMISSION_OPTION_REJECT`], an
+    /// unrecognized option id, or cancelled).
+    Deny,
+}
+
+/// The three terminal decisions mag can carry back to its approval gate.
+///
+/// This normalizes an ACP [`RequestPermissionOutcome`](acp::RequestPermissionOutcome)
+/// before it is re-encoded per interaction family, so the family-specific
+/// encoders stay tiny.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Decision {
+    /// The action was approved.
+    Approve,
+    /// The action was denied.
+    Deny,
+    /// The pending action should be cancelled (e.g. the turn was cancelled).
+    Cancel,
+}
+
+/// Builds the fixed set of [`PermissionOption`](acp::PermissionOption)s mag offers
+/// for every approval (`docs/ACP.md` §5).
+///
+/// mag's wire contract models only a one-shot approve/deny decision — it has no
+/// notion of *remembering* a choice — so only the once-scoped
+/// [`AllowOnce`](acp::PermissionOptionKind::AllowOnce) /
+/// [`RejectOnce`](acp::PermissionOptionKind::RejectOnce) options are offered. The
+/// `AllowAlways` / `RejectAlways` kinds are deliberately *not* advertised: doing
+/// so would imply a persistence semantics mag does not support (honest capability
+/// declaration, `docs/ACP.md` §7). Each option carries a stable
+/// [`PermissionOptionId`](acp::PermissionOptionId) ([`PERMISSION_OPTION_ALLOW`] /
+/// [`PERMISSION_OPTION_REJECT`]).
+fn permission_options() -> Vec<acp::PermissionOption> {
+    vec![
+        acp::PermissionOption::new(
+            PERMISSION_OPTION_ALLOW,
+            "Allow",
+            acp::PermissionOptionKind::AllowOnce,
+        ),
+        acp::PermissionOption::new(
+            PERMISSION_OPTION_REJECT,
+            "Reject",
+            acp::PermissionOptionKind::RejectOnce,
+        ),
+    ]
+}
+
+/// Classifies a selected [`PermissionOptionId`](acp::PermissionOptionId) as
+/// approve or deny.
+///
+/// Only the exact [`PERMISSION_OPTION_ALLOW`] id is treated as approval; every
+/// other id — including [`PERMISSION_OPTION_REJECT`] and any id a misbehaving
+/// client might invent — conservatively denies. Never approving on an
+/// unrecognized id is the fail-safe default a security gate requires
+/// (`docs/ACP.md` §6).
+fn option_id_to_choice(option_id: &acp::PermissionOptionId) -> PermissionChoice {
+    if option_id.0.as_ref() == PERMISSION_OPTION_ALLOW {
+        PermissionChoice::Approve
+    } else {
+        PermissionChoice::Deny
+    }
+}
+
+/// Projects a mag [`PermissionCategoryWire`] onto the closest ACP
+/// [`ToolKind`](acp::ToolKind) so the client can pick a meaningful icon.
+///
+/// The mapping is a faithful, conservative projection (e.g. `Shell` → `Execute`,
+/// `FileRead` → `Read`). Categories without a natural ACP counterpart
+/// (`SpawnAgent` / `Mcp` / `Other`) and any future
+/// (`#[non_exhaustive]`) category fall back to [`Other`](acp::ToolKind::Other)
+/// rather than guessing.
+fn permission_category_to_tool_kind(category: PermissionCategoryWire) -> acp::ToolKind {
+    match category {
+        PermissionCategoryWire::Shell => acp::ToolKind::Execute,
+        PermissionCategoryWire::FileRead => acp::ToolKind::Read,
+        PermissionCategoryWire::FileWrite => acp::ToolKind::Edit,
+        PermissionCategoryWire::Network => acp::ToolKind::Fetch,
+        _ => acp::ToolKind::Other,
+    }
+}
+
+/// Builds the permission-box [`ToolCallUpdate`](acp::ToolCallUpdate) for a tool
+/// [`Approval`](InteractionKindWire::Approval) (`docs/ACP.md` §5).
+///
+/// The awaiting framework tool call id ([`ToolCallIdWire`]) becomes the ACP
+/// [`ToolCallId`](acp::ToolCallId) so the permission box addresses the same call
+/// the client already saw streamed as a [`ToolCall`](acp::SessionUpdate::ToolCall).
+/// The status is [`Pending`](acp::ToolCallStatus::Pending) ("awaiting approval").
+/// The frozen [`Approval`](InteractionKindWire::Approval) variant only carries the
+/// approval [`requirement`](ApprovalRequirementWire) (no tool name or input), so
+/// its optional reason is surfaced as a text content block and no fields are
+/// fabricated.
+fn approval_tool_call(
+    call_id: &ToolCallIdWire,
+    requirement: &ApprovalRequirementWire,
+) -> acp::ToolCallUpdate {
+    let reason = match requirement {
+        ApprovalRequirementWire::RequireApproval { reason } => reason.clone(),
+        _ => None,
+    };
+    let mut fields = acp::ToolCallUpdateFields::new()
+        .status(acp::ToolCallStatus::Pending)
+        .title("Tool call requires approval".to_owned());
+    if let Some(reason) = reason {
+        fields = fields.content(vec![acp::ToolCallContent::from(reason)]);
+    }
+    acp::ToolCallUpdate::new(call_id.to_string(), fields)
+}
+
+/// Builds the permission-box [`ToolCallUpdate`](acp::ToolCallUpdate) for a
+/// privileged-action [`Permission`](InteractionKindWire::Permission)
+/// (`docs/ACP.md` §5).
+///
+/// The stable `action_id` becomes the ACP [`ToolCallId`](acp::ToolCallId); the
+/// [`category`](PermissionCategoryWire) picks the [`ToolKind`](acp::ToolKind)
+/// icon; the human-readable `summary` becomes the title; the structured `subject`
+/// is carried through as [`raw_input`](acp::ToolCallUpdateFields::raw_input); and
+/// an optional `reason` is surfaced as a text content block — so the client can
+/// render a meaningful permission box.
+fn permission_tool_call(
+    action_id: &str,
+    category: PermissionCategoryWire,
+    summary: &str,
+    subject: &serde_json::Value,
+    reason: Option<&str>,
+) -> acp::ToolCallUpdate {
+    let mut fields = acp::ToolCallUpdateFields::new()
+        .status(acp::ToolCallStatus::Pending)
+        .kind(permission_category_to_tool_kind(category))
+        .title(summary.to_owned())
+        .raw_input(subject.clone());
+    if let Some(reason) = reason {
+        fields = fields.content(vec![acp::ToolCallContent::from(reason.to_owned())]);
+    }
+    acp::ToolCallUpdate::new(action_id.to_owned(), fields)
+}
+
+/// Builds the permission-box [`ToolCallUpdate`](acp::ToolCallUpdate) for a mag
+/// [`InteractionKindWire`].
+///
+/// The two families that actually flow through mag's approval gate — tool
+/// [`Approval`](InteractionKindWire::Approval) and privileged-action
+/// [`Permission`](InteractionKindWire::Permission) — are enriched by
+/// [`approval_tool_call`] / [`permission_tool_call`]. The `Question` / `Choice`
+/// families are documented as *mag-unused* (mag-core's facade never emits them),
+/// and any future (`#[non_exhaustive]`) variant is likewise not a permission, so
+/// these produce a minimal generic pending box purely to keep this projection
+/// total; they are never expected at runtime.
+fn interaction_tool_call(kind: &InteractionKindWire) -> acp::ToolCallUpdate {
+    match kind {
+        InteractionKindWire::Approval {
+            call_id,
+            requirement,
+        } => approval_tool_call(call_id, requirement),
+        InteractionKindWire::Permission {
+            action_id,
+            category,
+            summary,
+            subject,
+            reason,
+            ..
+        } => permission_tool_call(action_id, *category, summary, subject, reason.as_deref()),
+        _ => acp::ToolCallUpdate::new(
+            "mag:interaction",
+            acp::ToolCallUpdateFields::new()
+                .status(acp::ToolCallStatus::Pending)
+                .title("Interaction requires a decision".to_owned()),
+        ),
+    }
+}
+
+/// Maps a mag [`InteractionKindWire`] into an ACP
+/// [`RequestPermissionRequest`](acp::RequestPermissionRequest) addressed to
+/// `sid` (`docs/ACP.md` §5).
+///
+/// The request combines a permission-box [`ToolCallUpdate`](acp::ToolCallUpdate)
+/// built from the interaction with the fixed approve/deny options. Tool
+/// [`Approval`](InteractionKindWire::Approval) and privileged-action
+/// [`Permission`](InteractionKindWire::Permission) — the two families mag's gate
+/// actually emits — both flow through the *same* `session/request_permission`
+/// channel; only the tool-call enrichment differs.
+#[must_use]
+pub fn interaction_to_permission_request(
+    sid: &acp::SessionId,
+    kind: &InteractionKindWire,
+) -> acp::RequestPermissionRequest {
+    acp::RequestPermissionRequest::new(
+        sid.clone(),
+        interaction_tool_call(kind),
+        permission_options(),
+    )
+}
+
+/// Normalizes an ACP [`RequestPermissionOutcome`](acp::RequestPermissionOutcome)
+/// into a mag [`Decision`].
+///
+/// A [`Selected`](acp::RequestPermissionOutcome::Selected) outcome is classified
+/// by its option id ([`option_id_to_choice`]); a
+/// [`Cancelled`](acp::RequestPermissionOutcome::Cancelled) outcome — and, fail
+/// safe, any future (`#[non_exhaustive]`) outcome — becomes
+/// [`Cancel`](Decision::Cancel) so the paused driver can wind down (`docs/ACP.md`
+/// §5).
+fn outcome_to_decision(outcome: &acp::RequestPermissionOutcome) -> Decision {
+    match outcome {
+        acp::RequestPermissionOutcome::Selected(selected) => {
+            match option_id_to_choice(&selected.option_id) {
+                PermissionChoice::Approve => Decision::Approve,
+                PermissionChoice::Deny => Decision::Deny,
+            }
+        }
+        _ => Decision::Cancel,
+    }
+}
+
+/// Encodes a [`Decision`] as an [`ApprovalDecisionWire`].
+fn decision_to_approval(decision: Decision) -> ApprovalDecisionWire {
+    match decision {
+        Decision::Approve => ApprovalDecisionWire::Approve,
+        Decision::Deny => ApprovalDecisionWire::Deny,
+        Decision::Cancel => ApprovalDecisionWire::Cancel,
+    }
+}
+
+/// Encodes a [`Decision`] as a [`PermissionDecisionWire`].
+fn decision_to_permission(decision: Decision) -> PermissionDecisionWire {
+    match decision {
+        Decision::Approve => PermissionDecisionWire::Approve,
+        Decision::Deny => PermissionDecisionWire::Deny { reason: None },
+        Decision::Cancel => PermissionDecisionWire::Cancel,
+    }
+}
+
+/// Builds the placeholder [`StepIdWire`] carried on an approval response.
+///
+/// mag reconstructs the real `step_id` (and `call_id`) from the interaction it
+/// stored under the `request_id` — see mag-core's `interaction_response_from_wire`
+/// — so the value carried on the wire is ignored. mag-acp cannot mint a fresh
+/// UUID without taking a `uuid` dependency (which its dependency boundary
+/// forbids), so it reuses the awaiting tool call's UUID as an inert, valid
+/// placeholder.
+fn placeholder_step_id(call_id: &ToolCallIdWire) -> StepIdWire {
+    StepIdWire::new(*call_id.as_uuid())
+}
+
+/// Translates an ACP [`RequestPermissionOutcome`](acp::RequestPermissionOutcome)
+/// back into the mag [`InteractionResponseWire`] that resolves `kind`
+/// (`docs/ACP.md` §5).
+///
+/// The outcome is first normalized to an approve / deny / cancel decision and
+/// then re-encoded in the response family that matches `kind` — mag-core rejects
+/// a family mismatch:
+///
+/// - [`Approval`](InteractionKindWire::Approval) →
+///   [`Approval`](InteractionResponseWire::Approval). The `step_id` / `call_id`
+///   are placeholders (mag reconstructs them from the stored interaction); a
+///   cancellation carries a short model-visible message.
+/// - [`Permission`](InteractionKindWire::Permission) →
+///   [`Permission`](InteractionResponseWire::Permission) keyed by `action_id`.
+///
+/// The mag-unused `Question` / `Choice` families resolve to their inert defaults
+/// ([`Answer`](InteractionResponseWire::Answer)`("")` /
+/// [`Choice`](InteractionResponseWire::Choice)`{ index: 0 }`), mirroring
+/// mag-core's own conservative cancellation handling, and any future
+/// (`#[non_exhaustive]`) kind falls back to an inert answer. These paths are not
+/// expected at runtime.
+#[must_use]
+pub fn outcome_to_interaction_response(
+    kind: &InteractionKindWire,
+    outcome: acp::RequestPermissionOutcome,
+) -> InteractionResponseWire {
+    let decision = outcome_to_decision(&outcome);
+    match kind {
+        InteractionKindWire::Approval { call_id, .. } => {
+            let message = match decision {
+                Decision::Cancel => Some("permission request cancelled".to_owned()),
+                Decision::Approve | Decision::Deny => None,
+            };
+            InteractionResponseWire::Approval {
+                step_id: placeholder_step_id(call_id),
+                call_id: *call_id,
+                decision: decision_to_approval(decision),
+                message,
+            }
+        }
+        InteractionKindWire::Permission { action_id, .. } => InteractionResponseWire::Permission {
+            action_id: action_id.clone(),
+            decision: decision_to_permission(decision),
+        },
+        InteractionKindWire::Choice { .. } => InteractionResponseWire::Choice { index: 0 },
+        _ => InteractionResponseWire::Answer {
+            text: String::new(),
+        },
     }
 }
 
@@ -682,5 +1013,213 @@ mod tests {
             text: "chunk".to_owned(),
         };
         assert_eq!(run_terminal_to_stop_reason(&streaming), None);
+    }
+
+    use mag_service::{AgentIdWire, PermissionRiskWire};
+
+    // A distinct valid UUID for the actor of a permission interaction.
+    const ACTOR_UUID: &str = "99999999-8888-7777-6666-555555555555";
+
+    fn acp_sid() -> acp::SessionId {
+        acp::SessionId::new(SAMPLE_UUID)
+    }
+
+    fn approval_kind() -> InteractionKindWire {
+        InteractionKindWire::Approval {
+            call_id: tool_call_id(),
+            requirement: ApprovalRequirementWire::RequireApproval {
+                reason: Some("writes to disk".to_owned()),
+            },
+        }
+    }
+
+    fn permission_kind() -> InteractionKindWire {
+        InteractionKindWire::Permission {
+            action_id: "act-123".to_owned(),
+            actor: AgentIdWire::parse_str(ACTOR_UUID).expect("valid uuid"),
+            category: PermissionCategoryWire::Shell,
+            risk: PermissionRiskWire::High,
+            summary: "Run `rm -rf build`".to_owned(),
+            subject: serde_json::json!({ "command": "rm -rf build" }),
+            reason: Some("clean the build directory".to_owned()),
+        }
+    }
+
+    fn selected(option_id: &str) -> acp::RequestPermissionOutcome {
+        acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
+            option_id.to_owned(),
+        ))
+    }
+
+    #[test]
+    fn permission_options_offer_stable_once_scoped_allow_and_reject() {
+        let options = permission_options();
+        assert_eq!(options.len(), 2, "exactly allow + reject are offered");
+
+        assert_eq!(options[0].option_id.0.as_ref(), PERMISSION_OPTION_ALLOW);
+        assert_eq!(options[0].kind, acp::PermissionOptionKind::AllowOnce);
+        assert_eq!(options[1].option_id.0.as_ref(), PERMISSION_OPTION_REJECT);
+        assert_eq!(options[1].kind, acp::PermissionOptionKind::RejectOnce);
+
+        // No persistent ("always") options are advertised: mag has no such wire
+        // semantics.
+        for option in &options {
+            assert_ne!(option.kind, acp::PermissionOptionKind::AllowAlways);
+            assert_ne!(option.kind, acp::PermissionOptionKind::RejectAlways);
+        }
+    }
+
+    #[test]
+    fn approval_request_addresses_tool_call_and_carries_reason() {
+        let request = interaction_to_permission_request(&acp_sid(), &approval_kind());
+
+        assert_eq!(request.session_id.0.as_ref(), SAMPLE_UUID);
+        // The permission box addresses the same tool call the client saw.
+        assert_eq!(request.tool_call.tool_call_id.0.as_ref(), TOOL_CALL_UUID);
+        assert_eq!(
+            request.tool_call.fields.status,
+            Some(acp::ToolCallStatus::Pending)
+        );
+        // The approval reason is surfaced as content (no tool name/input exists on
+        // the frozen `Approval` variant to invent).
+        let content = request
+            .tool_call
+            .fields
+            .content
+            .expect("reason becomes content");
+        match content.as_slice() {
+            [acp::ToolCallContent::Content(block)] => match &block.content {
+                acp::ContentBlock::Text(text) => assert_eq!(text.text, "writes to disk"),
+                other => panic!("expected text content, got {other:?}"),
+            },
+            other => panic!("expected a single content block, got {other:?}"),
+        }
+
+        // Options are the stable allow/reject pair.
+        let ids: Vec<&str> = request
+            .options
+            .iter()
+            .map(|option| option.option_id.0.as_ref())
+            .collect();
+        assert_eq!(ids, vec![PERMISSION_OPTION_ALLOW, PERMISSION_OPTION_REJECT]);
+    }
+
+    #[test]
+    fn permission_request_enriches_tool_call_from_action() {
+        let request = interaction_to_permission_request(&acp_sid(), &permission_kind());
+
+        assert_eq!(request.tool_call.tool_call_id.0.as_ref(), "act-123");
+        assert_eq!(
+            request.tool_call.fields.status,
+            Some(acp::ToolCallStatus::Pending)
+        );
+        // Shell category → Execute icon.
+        assert_eq!(request.tool_call.fields.kind, Some(acp::ToolKind::Execute));
+        assert_eq!(
+            request.tool_call.fields.title.as_deref(),
+            Some("Run `rm -rf build`")
+        );
+        // The structured subject rides along as raw input.
+        assert_eq!(
+            request.tool_call.fields.raw_input,
+            Some(serde_json::json!({ "command": "rm -rf build" }))
+        );
+        // Same fixed option set as tool approvals (one shared channel).
+        let ids: Vec<&str> = request
+            .options
+            .iter()
+            .map(|option| option.option_id.0.as_ref())
+            .collect();
+        assert_eq!(ids, vec![PERMISSION_OPTION_ALLOW, PERMISSION_OPTION_REJECT]);
+    }
+
+    #[test]
+    fn approval_outcomes_map_to_matching_decisions() {
+        // Selected(allow) → Approve, echoing the awaiting call id.
+        match outcome_to_interaction_response(&approval_kind(), selected(PERMISSION_OPTION_ALLOW)) {
+            InteractionResponseWire::Approval {
+                call_id,
+                decision,
+                message,
+                ..
+            } => {
+                assert_eq!(call_id, tool_call_id());
+                assert_eq!(decision, ApprovalDecisionWire::Approve);
+                assert_eq!(message, None);
+            }
+            other => panic!("expected approval response, got {other:?}"),
+        }
+
+        // Selected(reject) → Deny.
+        match outcome_to_interaction_response(&approval_kind(), selected(PERMISSION_OPTION_REJECT))
+        {
+            InteractionResponseWire::Approval { decision, .. } => {
+                assert_eq!(decision, ApprovalDecisionWire::Deny);
+            }
+            other => panic!("expected approval response, got {other:?}"),
+        }
+
+        // Cancelled → Cancel, carrying a model-visible message.
+        match outcome_to_interaction_response(
+            &approval_kind(),
+            acp::RequestPermissionOutcome::Cancelled,
+        ) {
+            InteractionResponseWire::Approval {
+                decision, message, ..
+            } => {
+                assert_eq!(decision, ApprovalDecisionWire::Cancel);
+                assert!(message.is_some());
+            }
+            other => panic!("expected approval response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_option_id_denies_fail_safe() {
+        match outcome_to_interaction_response(&approval_kind(), selected("bogus-option")) {
+            InteractionResponseWire::Approval { decision, .. } => {
+                assert_eq!(
+                    decision,
+                    ApprovalDecisionWire::Deny,
+                    "an unrecognized option id must never approve"
+                );
+            }
+            other => panic!("expected approval response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn permission_outcomes_map_to_matching_decisions() {
+        match outcome_to_interaction_response(&permission_kind(), selected(PERMISSION_OPTION_ALLOW))
+        {
+            InteractionResponseWire::Permission {
+                action_id,
+                decision,
+            } => {
+                assert_eq!(action_id, "act-123");
+                assert_eq!(decision, PermissionDecisionWire::Approve);
+            }
+            other => panic!("expected permission response, got {other:?}"),
+        }
+
+        match outcome_to_interaction_response(
+            &permission_kind(),
+            selected(PERMISSION_OPTION_REJECT),
+        ) {
+            InteractionResponseWire::Permission { decision, .. } => {
+                assert_eq!(decision, PermissionDecisionWire::Deny { reason: None });
+            }
+            other => panic!("expected permission response, got {other:?}"),
+        }
+
+        match outcome_to_interaction_response(
+            &permission_kind(),
+            acp::RequestPermissionOutcome::Cancelled,
+        ) {
+            InteractionResponseWire::Permission { decision, .. } => {
+                assert_eq!(decision, PermissionDecisionWire::Cancel);
+            }
+            other => panic!("expected permission response, got {other:?}"),
+        }
     }
 }
