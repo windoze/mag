@@ -288,3 +288,50 @@ run 失败/取消后会话状态一致；汇总缺口；跑完整验证序列 1�
 ### 进度
 - 已核对 session.rs / driver.rs / engine.rs / event_bus.rs / test_support.rs 与 DESIGN §3.1；结论如上。
 - 已将 TODO.md C2-R 标 [DONE] 并补完成记录（含 review 对照与缺口汇总）。下一步：git 提交后停止。
+
+---
+
+## 当前任务：C3-1 mag-tools：ToolPlugin registry + 最小工具集（TODO.md 699 行）
+
+### 目标
+在 `mag-tools` crate 落地插件式工具体系（DESIGN §7）：
+- `ToolPlugin` trait（declaration→agent-lib `Tool`；`invoke(ctx,args)->ToolResult`；`permission()->Option<PermissionSpec>`）。
+- mag 侧 `ToolRegistry` 收集 plugin；产出 `declarations()` / `ToolSetRef`；`bind(ToolContextParts)` 得一个实现
+  agent-lib `agent::ToolRegistry`（declarations/execute 按 name dispatch）的 `PluginToolRegistry`。
+- 四内置工具：read_file / list_dir / grep（只读，permission=None/auto，路径受 worktree 约束）+
+  shell（permission=Shell，cwd=worktree，cancel 可中断，risk 按命令）。
+
+### 设计要点
+- `ToolContext`（facade）带 worktree/cancel/tool_call_id；registry 持 `ToolContextParts` 逐调用建 ctx。
+- `invoke` 返回 facade `ToolResult`（text/error/status）；execute 用公开 getter 转 `ToolResponse`
+  （`into_response` 私有）。未知工具 → `ToolRuntimeError::UnknownTool`。
+- 路径安全：`safe_join` 词法归一，禁止 `..` 逃逸 worktree / 绝对路径。
+- grep：字面子串搜索（不引 regex），`spawn_blocking` 递归遍历（不跟 symlink），限量。
+- shell：`sh -c`，piped stdout/stderr 并发 drain，`timeout(20ms)` 轮询 cancel（token 为 poll-based）→
+  `start_kill` 中断。
+- `PermissionSpec { category: ToolCategory, risk: ToolRisk }`，全 serde，risk 有序（Low<Medium<High）。
+  静态 `permission()` 给基线；新增默认 `permission_for(args)` 供 shell 按命令细化 risk（honor “risk 按命令”）。
+
+### 模块拆分
+- `plugin.rs`：ToolPlugin / PermissionSpec / ToolCategory / ToolRisk。
+- `registry.rs`：ToolRegistry（收集器）+ PluginToolRegistry（impl agent::ToolRegistry）。
+- `path.rs`：safe_join + 错误。
+- `tools/{read_file,list_dir,grep,shell}.rs`：四内置。
+- `lib.rs`：re-export + crate 文档。
+
+### 验证
+1. `cargo fmt --all -- --check`
+2. `cargo test -p mag-tools`（read/list/grep 结果、shell stdout、shell cancel 中断、declarations 四工具、
+   execute 未知→UnknownTool、safe_join 逃逸拒绝、risk 分级）
+3. `cargo clippy --all-targets -- -D warnings`
+4. `cargo test --workspace`
+5. `cargo doc --no-deps --workspace`
+
+### 进度
+- [x] Cargo.toml 依赖（tokio process/fs/io-util/time/rt/sync；dev: tempfile/uuid/tokio）
+- [x] plugin.rs / path.rs / registry.rs / tools/{read_file,list_dir,grep,shell,mod}
+- [x] lib.rs 接线（re-export ToolRegistry/PluginToolRegistry/ToolPlugin/PermissionSpec/工具/safe_join）
+- [x] 单测（6 单测 + 13 集成测）全绿
+- [x] 完整验证 1–5 全绿（fmt/clippy 0 警告、workspace 46 测、doc 无警告）
+- [x] TODO.md 标 [DONE] + 完成记录
+- [ ] git 提交后停止

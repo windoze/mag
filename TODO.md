@@ -696,7 +696,7 @@ Command/Event 归属 mag-service 且仍是 `ServiceEvent` 的投影。汇总缺�
 目标：插件式工具 registry + 最小集，`IpcApproval` 异步暂停，`InteractionRequested`/`RespondInteraction`
 往返。**这是 mag-core 最关键、最需充分测试的部分（`docs/DESIGN.md` §3.3、§9.1）。**
 
-### [TODO] C3-1 `mag-tools`：`ToolPlugin` registry + 最小工具集
+### [DONE] C3-1 `mag-tools`：`ToolPlugin` registry + 最小工具集
 
 **上下文**：
 
@@ -722,6 +722,34 @@ Command/Event 归属 mag-service 且仍是 `ServiceEvent` 的投影。汇总缺�
 - 单元测试：registry `declarations()` 含四工具；`execute` 未知工具报 `UnknownTool`。
 - 聚焦：`cargo test -p mag-tools`。
 - 完整验证序列 1–5。
+
+**完成记录（2026-07-18）**：
+
+- **`ToolPlugin` trait（`plugin.rs`）**：`name()` / `declaration() -> model::tool::Tool`（name/desc/JSON
+  schema，与 facade `Tool::function_with_schema` 同形）/ `async invoke(ctx, args) -> ToolResult` /
+  `permission() -> Option<PermissionSpec>`。另加默认 `permission_for(args)`（默认回 `permission()`）作为
+  「risk 按命令」的留位钩子——read/list/grep 用默认，shell 覆写按命令细化 risk（DESIGN §7）。
+  `PermissionSpec { category: ToolCategory, risk: ToolRisk }` 全 serde，`ToolRisk` 有序（Low<Medium<High）
+  供 §8.1 未来 AI-permission。
+- **mag 侧 `ToolRegistry`（`registry.rs`）**：传输无关收集器，持 `Vec<Arc<dyn ToolPlugin>>`；产
+  `declarations()` 与 `tool_set(id) -> ToolSetRef`（供 C3-2 注入 `AgentSpec`）、`permission(name)`。
+  `bind(ToolContextParts) -> PluginToolRegistry`，后者 `impl agent::ToolRegistry`：`declarations()` 汇总声明、
+  `execute(call_id, call)` 按 name dispatch 建 `ToolContext`（worktree/cancel/tool_call_id 逐调用戳入）→
+  plugin `invoke` → 用公开 getter 转 `ToolResponse`（`into_response` 私有）；未知工具 → `UnknownTool`。
+- **四内置工具（`tools/*.rs`）**：`read_file` / `list_dir` / `grep`（只读，permission=None/auto，路径经
+  `safe_join` 词法归一约束在 worktree 内、禁 `..` 逃逸与绝对路径；grep 为字面子串搜索、`spawn_blocking`
+  递归遍历不跟 symlink、限 1000 命中）+ `shell`（permission=Shell/baseline Medium，`sh -c`、cwd=worktree、
+  piped stdout/stderr 并发 drain、20ms 轮询 poll-based `cancel` token → `start_kill` 中断；非零退出→Error）。
+- **验证（完整验证序列 1–5 全绿）**：`cargo fmt --all -- --check` ✓；`cargo test -p mag-tools`
+  （6 单测 + 13 集成测：read/list/grep 结果、worktree 逃逸拒绝、shell stdout/worktree/非零退出、
+  **shell cancel 预取消 sleep 30 <5s 中断**、declarations 四工具、execute 未知→`UnknownTool`、
+  permission gate 元数据、tool_set 声明、risk 分级、safe_join）全绿 ✓；
+  `cargo clippy --all-targets -- -D warnings`（0 警告）✓；`cargo test --workspace`
+  （mag-core 16 / mag-service 10 / mag-sources 1 / mag-tools 6+13，doctests 0）✓；
+  `cargo doc --no-deps --workspace`（无警告）✓。
+- **前向留位（非阻塞）**：C3-3 将各 plugin `declaration()` 经 `Tool::function_with_schema` 接进 facade
+  `Agent::builder().tool(..)`，并按 `permission()` 配 `ApprovalPolicy` 的 auto/ask gate；本任务只交付
+  registry/plugin/工具与 `agent::ToolRegistry` 投影，未接 driver（符合 C3-1 边界）。
 
 ### [TODO] C3-2 `IpcApproval`：跨传输异步审批暂停点
 
