@@ -1062,12 +1062,53 @@ worktree/cancel 约束生效；`PermissionDecider` 钩子留位正确（§8.1）
   mag-service 10 / mag-sources 10 / mag-tools 6 + builtin_tools 13，全绿）；`cargo doc --no-deps --workspace`
   + 额外 `-p mag-sources --features os-keyring`（均带 `-D warnings`）通过。README crate 列表补充说明。
 
-### [TODO] C4-R Review：持久化与凭据安全
+### [DONE] C4-R Review：持久化与凭据安全
 
 **做什么**：核对 snapshot 无 secret（§9.5）、只在 committed 点取；恢复重装配正确、id 续号无冲突；凭据只在
 store、恢复重注入。汇总缺口。
 
 **验证条件**：完整验证序列 1–5 全绿；snapshot-no-secret 断言存在。
+
+**完成记录（2026-07-19）**：
+
+- **审计范围**：`crates/mag-core/src/{persistence.rs,driver.rs,session.rs,engine.rs}` 持久化/恢复链路 +
+  `crates/mag-sources/src/{secret.rs,credentials.rs,registry.rs}` 凭据链路。逐条对照 `docs/DESIGN.md`
+  §3.5/§3.6/§9.5 与 C4-1/C4-2 完成记录。**未发现需新建前置任务的缺口**（review-only，无源码改动）。
+
+- **snapshot 无 secret（§9.5）——断言存在且充分**：两处独立断言。`persistence.rs`
+  `stored_snapshot_json_contains_no_credentials` 断言 serde JSON 既不含字面 secret（`sk-…`），也不含
+  `api_key/apikey/secret/credential/password` 任一凭据式键名；`engine::persist::snapshot_written_by_a_run_contains_no_credentials`
+  对「actor 落库后 `load_snapshot` 读回」的耐久 blob 做同样断言。根因确证：`AgentSnapshot` 为 data-only；client/
+  provider 凭据/工具闭包/审批句柄从不进 serde 路径（`persistence.rs` 只序列化 `AgentSnapshot`），且 mag-sources
+  `Secret` **不实现** `Serialize`/`Deserialize`/`Display`（`secret.rs`），从类型层堵死凭据落 snapshot。
+
+- **只在 committed 一致点取快照**：`driver.rs::run_turn` 仅当 `TurnOutcome::Completed` 且 `final_output=Some`
+  时于 `drop(stream)` 之后、发 `RunFinished` **之前**调 `persist_committed_snapshot`（facade
+  `Agent::snapshot()` 仅在 committed 点成功）；`Failed`/`Cancelled` 两路不取快照（facade 丢弃在飞 turn，旧
+  committed 快照仍是最新）。「发 RunFinished 前落库」保证观察到终止事件的一方必已见耐久快照，避开半写竞态。
+
+- **恢复重装配正确**：`driver.rs::restore` 经 `Agent::restore().snapshot(..).client(..).interaction_handler(Arc<IpcApproval>)`
+  + 逐工具 `.tool(..)` + `.approval(policy)` 重注入所有运行时句柄（snapshot 只带 `AgentState`：会话历史/model/
+  loop 策略）。`session.rs::session_thread` 依 `restore` 分支走 `restore`/`new`；`gated` 工具策略由同一 registry
+  重新派生。测试 `resumed_approval_session_still_pauses_through_ipc_approval` 证明跨「重启」后 gated 工具仍发
+  `InteractionRequested`（即 `IpcApproval` 已重注入，而非回落同步 `FacadeApproval`）。
+
+- **id 续号无冲突**：`engine.rs::EngineInner::new` 用 `store.max_session_id_value()` 把 `SessionIdSource` 续种到
+  `max+1`（`starting_at`，`saturating_add` 防溢出）；mag 会话 id 恒为 `Uuid::from_u128(u64 计数器)`，故存储 id 的
+  `as_u128` 必落在 u64 内。测试 `resume_after_restart_continues_conversation_with_prior_context` 断言重启后新建
+  会话 id ≠ 且 > 已存最大 id。
+
+- **凭据只在 store、恢复重注入**：mag-core 持久层不碰凭据；provider 凭据经 mag-sources
+  `SourceRegistry::provider_config(source_id, creds)` 从 `Credentials`（`CredentialStore` 读出）现场注入
+  `ProviderConfig`（非机密 base_url/version 来自 `LlmSource`）。`Secret` redacted Debug + 无 serde/Display；
+  `CredentialError`/`SourceError` 消息不含 secret（测试 `provider_config_builds_from_credentials_without_leaking_secret`
+  断言 `ProviderConfig` Debug 不泄密）。
+
+- **完整验证序列 1–5**（无源码改动，全绿）：`cargo fmt --all -- --check` 干净；聚焦
+  `cargo test -p mag-core persist` 10/10 + `cargo test -p mag-sources` 10/10；`cargo clippy --all-targets -D
+  warnings` 默认 + `-p mag-sources --features os-keyring` 均零告警；`cargo test --workspace` 全绿（mag-core 46 /
+  mag-service 10 / mag-sources 10 / mag-tools 6 + builtin_tools 13）；`cargo doc --no-deps --workspace` +
+  `-p mag-sources --features os-keyring` 通过。无未调度失败测试；C4（持久化 + 凭据安全）review 通过。
 
 ---
 

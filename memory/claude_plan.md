@@ -1,48 +1,29 @@
-# Claude 执行计划 — C4-2 凭据存储（mag-sources）
+# Claude 执行计划 — C4-R Review：持久化与凭据安全（已完成）
 
-## 当前任务
-`TODO.md` 首个未完成任务：**[TODO] C4-2 凭据存储（`mag-sources`）**（行 1018）。
-下一个是 C4-R（review），本次只做 C4-2。
+## 结论
+review-only，无源码改动。审计 persistence/driver/session/engine + mag-sources
+secret/credentials/registry，逐条对照 DESIGN §3.5/§3.6/§9.5：
+- snapshot 无 secret：两处断言（persistence + engine::persist），且 Secret 无 serde/Display 从类型堵死。
+- 只在 committed 点取：run_turn 仅 Completed+output 时于 RunFinished 前落库；失败/取消不取。
+- 恢复重装配：Agent::restore 重注入 client/tools/policy/IpcApproval；测试证明跨重启审批仍走 IpcApproval。
+- id 续号：max_session_id_value 续种 max+1；测试断言新 id > 已存 max。
+- 凭据只在 store：provider_config 现场注入；Secret redacted。
+**未发现需新建前置任务的缺口。**
 
-## 规格（DESIGN §3.5 / PLAN R-C / TODO C4-2）
-- `CredentialStore` trait + 内存实现（测试用）+ keyring 实现（生产，feature 隔离，测试不依赖真 keyring）。
-- 凭据绝不进 snapshot；恢复时从 store 重注入 `ProviderConfig`。
-- `mag-sources` 提供 `provider_config(source_id, creds) -> agent-lib ProviderConfig`。
-- source registry：`register_llm(..)` + 预留 `register_local_agent(..)` 占位（返回未实现/留 trait 槽）。
-
-## 关键事实
-- agent-lib `ProviderConfig` 在 `agent_lib::facade::{ProviderConfig, FacadeError}`；builder
-  `ProviderConfig::anthropic()/openai()` → `.base_url().api_key().api_version().build()`。
-- `ProviderId`（`agent_lib::model::extras`，`#[non_exhaustive]`，Anthropic / OpenAiResp）。
-- ProviderConfig 的 Debug 已 redacted、无 Serialize（凭据不落 snapshot）。
-- keyring v3.6 需平台 backend feature；Entry::new/get_password/set_password/delete_credential，
-  `keyring::Error::NoEntry` 表未找到。→ 把 keyring 设为 optional dep，feature `os-keyring`（非默认），
-  默认 test/clippy/doc 不编译 keyring，彻底满足「测试不依赖真 keyring」。
-
-## 设计（新模块）
-- Cargo.toml：keyring optional=true；`[features] default=[]; os-keyring=["dep:keyring"]`。
-- src/secret.rs：`Secret`（redacted Debug、无 serde/Display、expose()）。
-- src/credentials.rs：`Credentials{api_key}`、`CredentialError`、`CredentialStore` trait、
-  `MemoryCredentialStore`、`KeyringCredentialStore`（cfg os-keyring）。
-- src/registry.rs：`SourceRegistry`、`LlmSource`、`LocalAgentSlot`/`LocalAgentKind`、
-  `LocalAgentBackend`（预留 trait 槽）、`SourceError`、`provider_config`、
-  `register_llm`/`register_local_agent`/`connect_local_agent`(→ LocalAgentUnsupported)。
-- src/lib.rs：模块声明 + 公开再导出 + crate 文档。
-- README：mag-sources 描述补一句。
-
-## 验证
-1. cargo fmt --all -- --check
-2. cargo test -p mag-sources（聚焦）
-3. cargo clippy --all-targets -- -D warnings（+ 额外 `-p mag-sources --features os-keyring`）
-4. cargo test --workspace
-5. cargo doc --no-deps --workspace（+ 额外 features os-keyring 检查）
+## 验证序列 1–5（全绿）
+1. fmt --check 干净
+2. test -p mag-core persist 10/10 + test -p mag-sources 10/10
+3. clippy --all-targets -D warnings（默认 + mag-sources os-keyring）零告警
+4. test --workspace：mag-core 46 / mag-service 10 / mag-sources 10 / mag-tools 6 + builtin_tools 13
+5. doc --no-deps --workspace（+ os-keyring）通过
 
 ## 进度
-- [x] 写模块（secret/credentials/registry + Cargo feature os-keyring）
-- [x] 聚焦测试 `cargo test -p mag-sources` 10/10 绿
-- [x] 完整序列：fmt 干净；clippy 默认 + os-keyring 零告警；test --workspace 全绿；doc(默认+os-keyring, -D warnings) 通过
-- [x] TODO.md C4-2 标 [DONE] + 完成记录；README mag-sources 描述更新
-- [ ] 提交并停（不进 C4-R）
+- [x] 审计 persistence.rs / driver.rs / session.rs / engine.rs
+- [x] 审计 mag-sources secret/credentials/registry
+- [x] 跑验证序列 1–5（全绿）
+- [x] 汇总缺口（无）
+- [x] TODO.md C4-R 标 [DONE] + 完成记录
+- [x] 提交并停
 
-## 处置原则
-无 workaround；spec mismatch 则修或插最小前置任务。完成后标 [DONE]+补记录+提交+停。
+## 下一个任务
+C5-1 端到端离线主干集成测试（本次不做）。
