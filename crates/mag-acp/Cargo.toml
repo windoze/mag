@@ -1,0 +1,8 @@
+[package]
+name = "mag-acp"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mag-service = { path = "../mag-service" }
+agent-client-protocol = "1"

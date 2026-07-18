@@ -78,7 +78,7 @@
 组 acp `Agent.builder()` 注册 `initialize` / `session/new` handler、`connect_to` 跑起来，并用内存管道 e2e
 证明 stdio 路径的握手与建会话往返。对应 `docs/ACP.md` §1 / §2 / §3.1 / §3.2。
 
-### [TODO] M1-1 新建 `mag-acp` crate + `map` 纯函数（SessionId 映射 + 能力宣告）
+### [DONE] M1-1 新建 `mag-acp` crate + `map` 纯函数（SessionId 映射 + 能力宣告）
 
 **上下文**：
 
@@ -116,6 +116,31 @@
 - 完整验证序列 1–5（见「通用执行规则」）；`cargo clippy --all-targets -- -D warnings` 无警告；`cargo doc`
   无缺 doc 警告。
 - 依赖边界自检：`crates/mag-acp/Cargo.toml` 不含 `mag-core` / `agent-lib`。
+
+**完成记录（M1-1）**：
+
+- 新建 `crates/mag-acp`：`Cargo.toml` 仅依赖 `mag-service = { path = "../mag-service" }` 与
+  `agent-client-protocol = "1"`（无 `mag-core` / `agent-lib` / tauri / axum，依赖边界满足）；`version`/`edition`
+  用 `.workspace`；已加入根 `Cargo.toml` 的 `[workspace] members`。
+- `src/lib.rs`：`#![warn(missing_docs)]` + crate 级 rustdoc（定位 mag-acp 为 ACP agent 端翻译器 + 指向
+  `docs/ACP.md`/`PLAN.md`/`TODO.md`），`pub mod map;`。
+- `src/map.rs`（无 IO 纯函数，均带 rustdoc）：
+  - `mag_session_id_to_acp(id) -> acp::SessionId`：用 `id.to_string()` 作 ACP `SessionId`（省双向表）。
+  - `acp_session_id_to_mag(&acp::SessionId) -> Result<mag_service::SessionId, InvalidSessionId>`：
+    `parse_str(id.0.as_ref())`，非法字符串（非 UUID）返回本地错误 `InvalidSessionId{value}`（带 Display+Error）。
+    刻意不外泄 `uuid::Error`，从而 `Cargo.toml` 无需引入 `uuid`，保持依赖边界最小。
+  - `agent_capabilities() -> acp::AgentCapabilities`：保守宣告——`load_session=false`、`prompt_capabilities`
+    的 `image`/`audio`/`embedded_context` 全 `false`；`mcp_capabilities`/`session_capabilities`/`auth` 取默认
+    （未宣告）、无 `auth_methods`。
+- 锚点核对（就地对 cargo 缓存 `agent-client-protocol` v1.2.0 / schema v1.4.0）：
+  路径 `agent_client_protocol::schema::v1::{SessionId, AgentCapabilities, PromptCapabilities}` 属实；
+  `SessionId(pub Arc<str>)` + `SessionId::new(impl Into<Arc<str>>)`；`AgentCapabilities`/`PromptCapabilities`
+  均 `#[derive(Default)]`+`#[non_exhaustive]`，`new()==default()`（保守位全 `false`），builder
+  `.load_session/.prompt_capabilities/.image/.audio/.embedded_context` 存在。与 `docs/ACP.md` §1/§3.1 一致，
+  **无需修正锚点**（default features 空，schema::v1 类型无需任何 unstable feature）。
+- 验证（全绿）：1) `cargo fmt --all -- --check` OK；2) `cargo test -p mag-acp map::` 3 passed（round-trip
+  相等 / 非法 SessionId → Err / 保守能力位断言）；3) `cargo clippy --all-targets -- -D warnings` 无警告；
+  4) `cargo test --workspace` 全通过；5) `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无缺 doc 警告。
 
 ### [TODO] M1-2 bin 装配 + `initialize` handler + 内存管道 e2e 骨架
 
