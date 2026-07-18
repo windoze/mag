@@ -124,15 +124,25 @@ impl Engine {
             self.emit_run_error(session_id, "no LLM client configured");
             return;
         };
-        let Some(driver) = self.session_driver(session_id).await else {
+        let Some((driver, config)) = self.session_entry(session_id).await else {
             self.emit_run_error(session_id, "session not found");
             return;
         };
 
+        let mut guard = driver.lock().await;
+        if guard.is_none() {
+            match SessionDriver::new(&config, client) {
+                Ok(driver) => *guard = Some(driver),
+                Err(error) => {
+                    self.emit_run_error(session_id, error.to_string());
+                    return;
+                }
+            }
+        }
+        let driver = guard.as_mut().expect("session driver is built");
+
         let result = driver
-            .lock()
-            .await
-            .send_message(session_id, text, client, self.inner.event_bus.clone())
+            .send_message(session_id, text, self.inner.event_bus.clone())
             .await;
 
         if let Err(error) = result {
@@ -140,8 +150,11 @@ impl Engine {
         }
     }
 
-    async fn session_driver(&self, session_id: SessionId) -> Option<Arc<Mutex<SessionDriver>>> {
-        self.inner.sessions.lock().await.session_driver(session_id)
+    async fn session_entry(
+        &self,
+        session_id: SessionId,
+    ) -> Option<(Arc<Mutex<Option<SessionDriver>>>, SessionConfig)> {
+        self.inner.sessions.lock().await.session_entry(session_id)
     }
 
     fn emit_run_error(&self, id: SessionId, message: impl Into<String>) {
@@ -250,7 +263,7 @@ impl SessionManager {
             id,
             SessionRecord {
                 info: session.clone(),
-                driver: Arc::new(Mutex::new(SessionDriver::new(&config))),
+                driver: Arc::new(Mutex::new(None)),
             },
         );
         session
@@ -263,16 +276,19 @@ impl SessionManager {
             .collect()
     }
 
-    fn session_driver(&self, id: SessionId) -> Option<Arc<Mutex<SessionDriver>>> {
+    fn session_entry(
+        &self,
+        id: SessionId,
+    ) -> Option<(Arc<Mutex<Option<SessionDriver>>>, SessionConfig)> {
         self.sessions
             .get(&id)
-            .map(|record| Arc::clone(&record.driver))
+            .map(|record| (Arc::clone(&record.driver), record.info.config.clone()))
     }
 }
 
 struct SessionRecord {
     info: SessionInfo,
-    driver: Arc<Mutex<SessionDriver>>,
+    driver: Arc<Mutex<Option<SessionDriver>>>,
 }
 
 #[derive(Debug)]
@@ -460,7 +476,7 @@ mod chat {
 
     use crate::{
         EventStream,
-        llm::test_support::{FakeLlmClient, text_stream_with_usage},
+        test_support::{FakeLlmClient, text_stream_with_usage},
     };
 
     use super::{CommandOutput, Engine};

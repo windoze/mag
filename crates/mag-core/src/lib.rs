@@ -5,10 +5,9 @@
 mod driver;
 mod engine;
 mod event_bus;
-mod ids;
-mod llm;
+
+#[cfg(test)]
+mod test_support;
 
 pub use engine::{CommandOutput, Engine, EngineError, SessionInfo};
 pub use event_bus::{EventBus, EventStream};
-pub use ids::MagIds;
-pub use llm::StreamingTapHandler;

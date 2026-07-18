@@ -1,177 +1,250 @@
-//! Single-turn driver wiring mag sessions to the agent-lib machine.
+//! Single-turn driver wiring mag sessions to the facade [`Agent`].
+//!
+//! Since agent-lib Milestone 7 exposed the host injection surface, mag no longer
+//! assembles its own [`HandlerScope`](agent_lib::agent::HandlerScope) /
+//! [`drain`](agent_lib::agent::drain) loop. A session owns one facade
+//! [`Agent`], and each turn is driven by consuming
+//! [`Agent::stream`](agent_lib::facade::Agent::stream): every incremental
+//! [`RunEvent`](agent_lib::facade::RunEvent) is projected through the official
+//! [`RunEvent::to_wire`](agent_lib::facade::RunEvent::to_wire) bridge and mapped
+//! into a mag [`Event`].
 
-use std::{num::NonZeroU32, sync::Arc};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use agent_lib::{
-    agent::{
-        AgentError, AgentInput, AgentSpec, AgentState, BudgetLimits, DefaultAgentMachine,
-        HandlerScope, LlmHandler, LlmStepMode, LoopCursor, LoopPolicy, ModelRef, RunContext,
-        ToolFailurePolicy, ToolSetRef, WorktreeRef, drain,
-    },
     client::LlmClient,
-    conversation::{Conversation, ConversationConfig},
-    model::{
-        content::ContentBlock,
-        message::{Message, Role},
-        usage::Usage,
-    },
+    facade::{Agent, FacadeError, UsageSummary, WireRunEvent, WireRunOutput},
 };
 use mag_protocol::{Event, RunId as WireRunId, RunOutput, SessionConfig, SessionId, UsageInfo};
+use uuid::Uuid;
 
-use crate::{EventBus, MagIds, StreamingTapHandler};
+use crate::EventBus;
 
 const DEFAULT_MAX_TOKENS: u32 = 512;
 const DEFAULT_MAX_STEPS: u32 = 8;
-const DEFAULT_MAX_PARALLEL_TOOLS: u32 = 1;
 
-/// One session's stateful agent-lib machine and identity source.
+/// One session's stateful facade [`Agent`] plus a run-id source.
+///
+/// The facade [`Agent`] holds the session's conversation, so reusing one driver
+/// across turns accumulates history without mag reassembling any state.
 #[derive(Debug)]
 pub(crate) struct SessionDriver {
-    ids: Arc<MagIds>,
-    machine: DefaultAgentMachine,
+    agent: Agent,
+    run_counter: AtomicU64,
 }
 
 impl SessionDriver {
-    /// Builds a fresh agent machine for the supplied session configuration.
-    pub(crate) fn new(config: &SessionConfig) -> Self {
-        let ids = Arc::new(MagIds::new());
-        let spec = AgentSpec::new(
-            ids.agent_id(),
-            WorktreeRef::new("."),
-            None,
-            ToolSetRef::new(ids.tool_set_id(), Vec::new()),
-            ModelRef::new(
-                config.model.clone(),
-                non_zero(DEFAULT_MAX_TOKENS),
-                None,
-                None,
-            ),
-            LoopPolicy::new(
-                non_zero(DEFAULT_MAX_STEPS),
-                non_zero(DEFAULT_MAX_PARALLEL_TOOLS),
-                ToolFailurePolicy::ReturnErrorToModel,
-            ),
-        );
-        let state = AgentState::new(
-            spec,
-            Conversation::new(ids.conversation_id(), ConversationConfig::new(None)),
-        );
-        let machine = DefaultAgentMachine::new(state, LlmStepMode::Streaming, ids.clone())
-            .with_tool_execution_ids(ids.clone());
+    /// Builds a fresh facade [`Agent`] for the supplied session configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns any [`FacadeError`] raised while assembling the agent (for
+    /// example an invalid model/provider configuration).
+    pub(crate) fn new(
+        config: &SessionConfig,
+        client: Arc<dyn LlmClient>,
+    ) -> Result<Self, FacadeError> {
+        let agent = Agent::builder()
+            .client(client)
+            .model(config.model.clone())
+            .max_tokens(DEFAULT_MAX_TOKENS)
+            .max_steps(DEFAULT_MAX_STEPS)
+            .build()?;
 
-        Self { ids, machine }
+        Ok(Self {
+            agent,
+            run_counter: AtomicU64::new(1),
+        })
     }
 
-    /// Drives one user message through agent-lib and emits run lifecycle events.
+    /// Drives one user message through the facade [`Agent`] and emits run
+    /// lifecycle events.
+    ///
+    /// The turn is streamed: a [`RunStarted`](Event::RunStarted) is emitted
+    /// before the drive, each streamed text delta becomes an
+    /// [`Event::TextDelta`], and the terminal `Done` event is folded into a
+    /// [`RunFinished`](Event::RunFinished).
+    ///
+    /// # Errors
+    ///
+    /// Returns any [`FacadeError`] surfaced while opening or draining the facade
+    /// stream, or [`FacadeError::InvalidState`] if the stream ends without a
+    /// terminal `Done` event.
     pub(crate) async fn send_message(
         &mut self,
         session_id: SessionId,
         text: String,
-        client: Arc<dyn LlmClient>,
         events: EventBus,
-    ) -> Result<RunOutput, AgentError> {
-        let run_id = self.ids.run_id();
-        let wire_run_id = WireRunId::new(run_id.into_uuid());
-        let ctx = RunContext::new_root(run_id, BudgetLimits::unbounded(), self.ids.trace_root());
-        let input = AgentInput::user_message(
-            self.ids.turn_id(),
-            self.ids.message_id(),
-            user_text_message(text),
-            self.ids.message_id(),
-            self.ids.step_id(),
-        )?;
-        let scope = MagScope::new(client, events.clone(), session_id);
-
+    ) -> Result<RunOutput, FacadeError> {
+        let run_id = self.next_run_id();
         let _ = events.emit(Event::RunStarted {
             id: session_id,
-            run_id: wire_run_id,
+            run_id,
         });
 
-        let done = drain(&mut self.machine, input, &scope, None, &ctx).await?;
-        if let LoopCursor::Error(error) = done.cursor() {
-            return Err(AgentError::Other(error.message().to_owned()));
+        let mut final_output: Option<RunOutput> = None;
+        {
+            let mut stream = self.agent.stream(text).await?;
+            while let Some(item) = stream.next().await {
+                let event = item?;
+                if let Some(mag_event) =
+                    map_wire_event(session_id, event.to_wire(), &mut final_output)
+                {
+                    let _ = events.emit(mag_event);
+                }
+            }
         }
 
-        let output = run_output(self.machine.state().conversation());
+        let output = final_output.ok_or_else(|| {
+            FacadeError::InvalidState(
+                "agent stream ended without a terminal `Done` event".to_owned(),
+            )
+        })?;
         let _ = events.emit(Event::RunFinished {
             id: session_id,
             output: output.clone(),
         });
         Ok(output)
     }
-}
 
-/// Minimal handler scope for C1: only LLM effects are fulfilled.
-struct MagScope {
-    llm: StreamingTapHandler,
-}
-
-impl MagScope {
-    fn new(client: Arc<dyn LlmClient>, events: EventBus, session_id: SessionId) -> Self {
-        Self {
-            llm: StreamingTapHandler::new(client, events, session_id),
-        }
+    /// Mints the next envelope run identity for this session.
+    ///
+    /// The facade owns the drive's internal ids and does not surface a run id on
+    /// the event stream, so mag mints its own monotonic id purely to tag the
+    /// [`RunStarted`](Event::RunStarted) / cancellation envelope.
+    fn next_run_id(&self) -> WireRunId {
+        let value = self.run_counter.fetch_add(1, Ordering::Relaxed);
+        WireRunId::new(Uuid::from_u128(u128::from(value)))
     }
 }
 
-impl HandlerScope for MagScope {
-    fn llm(&self) -> Option<&dyn LlmHandler> {
-        Some(&self.llm)
-    }
-}
-
-fn non_zero(value: u32) -> NonZeroU32 {
-    NonZeroU32::new(value).expect("driver constants are non-zero")
-}
-
-fn user_text_message(text: String) -> Message {
-    Message {
-        role: Role::User,
-        content: vec![ContentBlock::Text {
+/// Maps one projected [`WireRunEvent`] into a mag [`Event`].
+///
+/// A terminal [`WireRunEvent::Done`] is folded into `final_output` and produces
+/// no streamed event (the caller emits [`RunFinished`](Event::RunFinished) once
+/// the stream drains). Tool, approval, delegation, and raw variants are produced
+/// only by later milestones (C3+); the pure-conversation path never yields them,
+/// so they are ignored here.
+fn map_wire_event(
+    session_id: SessionId,
+    event: WireRunEvent,
+    final_output: &mut Option<RunOutput>,
+) -> Option<Event> {
+    match event {
+        WireRunEvent::TextDelta(text) => Some(Event::TextDelta {
+            id: session_id,
             text,
-            extra: Default::default(),
-        }],
+        }),
+        WireRunEvent::Done(output) => {
+            *final_output = Some(run_output_from_wire(&output));
+            None
+        }
+        _ => None,
     }
 }
 
-fn run_output(conversation: &Conversation) -> RunOutput {
-    let Some(turn) = conversation.turns().last() else {
-        return RunOutput {
-            text: String::new(),
-            usage: None,
-        };
-    };
-
+/// Projects the facade's terminal [`WireRunOutput`] into a mag [`RunOutput`].
+fn run_output_from_wire(output: &WireRunOutput) -> RunOutput {
     RunOutput {
-        text: last_assistant_text(conversation),
-        usage: Some(usage_info(turn.meta().usage())),
+        text: output.reply.text().to_owned(),
+        usage: Some(usage_from_summary(&output.usage)),
     }
 }
 
-fn last_assistant_text(conversation: &Conversation) -> String {
-    let Some(turn) = conversation.turns().last() else {
-        return String::new();
-    };
-    let Some(message) = turn.messages().last() else {
-        return String::new();
-    };
-
-    message
-        .payload()
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text, .. } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn usage_info(usage: &Usage) -> UsageInfo {
+/// Flattens a facade [`UsageSummary`] into the provider-neutral [`UsageInfo`].
+fn usage_from_summary(summary: &UsageSummary) -> UsageInfo {
+    let usage = summary.total();
     UsageInfo {
         input_tokens: u64::from(usage.input),
         output_tokens: u64::from(usage.output),
         total_tokens: u64::from(usage.total.unwrap_or_else(|| usage.total_computed())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use agent_lib::{
+        client::Response,
+        facade::{RunEvent, RunOutput as FacadeRunOutput, WireRunEvent},
+        model::{
+            content::ContentBlock,
+            message::{Message, Role},
+            normalized::{Normalized, StopReason},
+            usage::Usage,
+        },
+    };
+    use mag_protocol::{Event, SessionId, UsageInfo};
+    use serde_json::Map;
+    use uuid::Uuid;
+
+    use super::map_wire_event;
+
+    fn session_id() -> SessionId {
+        SessionId::new(Uuid::from_u128(1))
+    }
+
+    fn round_trip(wire: &WireRunEvent) {
+        let json = serde_json::to_string(wire).expect("serialize wire event");
+        let back: WireRunEvent = serde_json::from_str(&json).expect("deserialize wire event");
+        assert_eq!(&back, wire);
+    }
+
+    #[test]
+    fn text_delta_maps_and_round_trips() {
+        let wire = RunEvent::TextDelta("hel".to_owned()).to_wire();
+        round_trip(&wire);
+
+        let mut final_output = None;
+        let mapped = map_wire_event(session_id(), wire, &mut final_output);
+
+        assert_eq!(
+            mapped,
+            Some(Event::TextDelta {
+                id: session_id(),
+                text: "hel".to_owned(),
+            })
+        );
+        assert!(final_output.is_none());
+    }
+
+    #[test]
+    fn done_folds_into_run_output_and_round_trips() {
+        let response = Response {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "hello".to_owned(),
+                    extra: Map::new(),
+                }],
+            },
+            usage: Usage {
+                input: 7,
+                output: 2,
+                total: Some(9),
+                ..Usage::default()
+            },
+            stop_reason: Normalized::from_mapped(StopReason::EndTurn, "end_turn"),
+            extra: Map::new(),
+        };
+        let wire = RunEvent::Done(Box::new(FacadeRunOutput::from(response))).to_wire();
+        round_trip(&wire);
+
+        let mut final_output = None;
+        let mapped = map_wire_event(session_id(), wire, &mut final_output);
+
+        assert!(mapped.is_none());
+        let output = final_output.expect("terminal output folded");
+        assert_eq!(output.text, "hello");
+        assert_eq!(
+            output.usage,
+            Some(UsageInfo {
+                input_tokens: 7,
+                output_tokens: 2,
+                total_tokens: 9,
+            })
+        );
     }
 }

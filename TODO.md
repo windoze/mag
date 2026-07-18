@@ -314,7 +314,7 @@
   `cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`（1800 秒上限包装，20 个单元测试 +
   doctest 全绿）、`cargo doc --no-deps --workspace`。
 
-### [TODO] C1-3 切换到 facade `Agent` 注入路径（替换 C1-1/C1-2 的自组 scope）
+### [DONE] C1-3 切换到 facade `Agent` 注入路径（替换 C1-1/C1-2 的自组 scope）
 
 **上下文**：
 
@@ -349,6 +349,31 @@
   在 mag-core 断言）。
 - 聚焦：`cargo test -p mag-core engine::chat`。
 - 完整验证序列 1–5。删除的自组 scope 代码不留死代码（clippy 干净）。
+
+**完成记录（2026-07-18）**：
+
+- 重写 `mag-core` `driver.rs`：`SessionDriver` 现持有 facade `Agent`（`Agent::builder().client(..)
+  .model(..).max_tokens(..).max_steps(..).build()`），`send_message` 改为消费 `agent.stream(text)` 产出的
+  `RunEvent`，逐个经官方 `RunEvent::to_wire() -> WireRunEvent` 投影后映射进 mag `Event`
+  （`TextDelta` → `Event::TextDelta`；终态 `Done(WireRunOutput)` 折叠成 mag `RunOutput` 后 emit
+  `RunFinished`）。会话内 `Agent` 跨轮复用，历史由 facade `Conversation` 自然累积。
+- 删除自建 `StreamingTapHandler`（C1-1）——facade `Agent::stream` 内部已产 `TextDelta`；同时删除
+  `MagScope`+`DefaultAgentMachine`+`drain` 自组装配（C1-2）。`FakeLlmClient` 夹具保留，迁到独立
+  `#[cfg(test)] mod test_support`，经 `AgentBuilder::client(..)` 注入。
+- `MagIds`（C0-3）去留决定：**删除** `ids.rs` 与 `pub use ids::MagIds`。facade 内建 `FacadeIds` 接管全部身份
+  铸造，`MagIds` 的 `RequirementIds`/`ToolExecutionIds` 实现已成自组 scope 残留死代码；mag 仅为
+  `RunStarted` 信封保留一个 per-session run-id 计数器（facade 不外露 run id）。若 C4 恢复需要确定性
+  high-water 续号，再按 facade snapshot/restore 语义单独引入。
+- `Engine`/`SessionManager`：driver 改为延迟构建（首个 `SendMessage` 时按注入的 client 构建并缓存于
+  `Arc<Mutex<Option<SessionDriver>>>`），保持 `Engine::new()`（无 client）仍能创建/列出会话；`with_llm_client`
+  注入点保留，向 facade `Agent` 提供 client。
+- 测试：C1-2 两个既有单元测试（有序 `RunStarted`→`TextDelta*`→`RunFinished`、多轮历史累积、fake client
+  收到 `stream=true` 且第二轮含首轮上下文）在 facade 路径下继续通过；新增 `driver::tests` 覆盖
+  `RunEvent::to_wire()` 对 `TextDelta` / `Done` 的映射与 `WireRunEvent` serde round-trip；`test_support`
+  自测覆盖 fake client 的 tool-use 脚本响应。
+- 验证通过：`cargo fmt --all -- --check`、`cargo test -p mag-core engine::chat`（含 driver 聚焦）、
+  `cargo clippy --all-targets -- -D warnings`（无死代码/警告）、`cargo test --workspace`（1800 秒上限包装，
+  mag-core 9 + mag-protocol 5 + mag-sources 1 + mag-tools 1，doctest 全绿）、`cargo doc --no-deps --workspace`。
 
 ### [TODO] C1-R Review：纯对话流式贯通（facade 路径）
 
