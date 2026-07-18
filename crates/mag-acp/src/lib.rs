@@ -28,10 +28,11 @@ pub mod map;
 /// Serves the ACP agent interface for `service` over `transport`.
 ///
 /// This assembles the `agent-client-protocol` [`Agent`] builder, registers the
-/// request handlers (currently `initialize` and a placeholder `authenticate`;
-/// `docs/ACP.md` §3.1), and drives the connection run loop until `transport`
-/// closes. The `service` handle is threaded to the handlers that need it as more
-/// ACP methods are implemented in later milestones.
+/// request handlers (currently `initialize` and `session/new`, plus a
+/// placeholder `authenticate`; `docs/ACP.md` §3.1/§3.2), and drives the
+/// connection run loop until `transport` closes. The `service` handle is threaded
+/// to the handlers that need it as more ACP methods are implemented in later
+/// milestones.
 ///
 /// The `transport` is any `agent-client-protocol` transport that connects to an
 /// [`Agent`]: [`Stdio`](agent_client_protocol::Stdio) in production (see the

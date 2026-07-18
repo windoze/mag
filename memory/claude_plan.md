@@ -115,3 +115,33 @@ M1-1 / M1-2 均已 `[DONE]` 且提交，工作区干净。
 - 验证序列 1–5 全绿（fmt / mag-acp 6 tests / clippy -D warnings / workspace / doc）。
 - TODO.md M1-4 标 [DONE] + 完成记录。PLAN.md 无需改（契约清单 M1-3 已含 cwd；里程碑表已含 session/new）。
 - 下一个未完成任务：M1-R（M1 review）。
+
+---
+
+# 更新（本次调用）：执行 M1-R Review（M1 crate 骨架 + initialize + session/new）
+
+首个未完成任务 = **M1-R**（TODO.md:366，review 任务，真实任务不得跳过）。
+
+## 核对结论（对照 docs/ACP.md §1/§2/§3.1/§3.2）
+- §1 方法↔类型 + handler 注册：initialize / session/new / authenticate 均经
+  `Agent.builder().on_receive_request(closure, on_receive_request!())` 如实注册；
+  `connect_to(transport)` 常驻 run loop。✔
+- 依赖边界：mag-acp Cargo.toml 仅 mag-service + agent-client-protocol，无 mag-core/agent-lib；
+  唯一装配点 mag bin（Engine::new → Arc<dyn MagService>）。✔
+- 能力宣告保守（load_session/image/audio/embedded_context 全 false，auth_methods 空）。✔
+- M1-3 契约缺口：SessionConfig.cwd（serde 向后兼容）→ new_session_request_to_config →
+  SessionDriver::new .worktree(WorktreeRef)；e2e 端到端证明 cwd 未丢弃 + id 往返。✔
+
+## 本次代码改动
+- 仅一处 doc 微修：`crates/mag-acp/src/lib.rs` `serve` rustdoc 原漏列 session/new，已补正
+  （M1-4 加了 handler 但函数级注释未同步）。无逻辑改动。
+
+## 验证结果（完整序列 1–5 全绿）
+1. fmt --check 干净；2. `cargo test -p mag-acp` 6 passed；3. clippy -D warnings 无警告；
+4. `cargo test --workspace` 97 passed / 0 failed / 0 ignored；5. cargo doc -D warnings 无缺 doc。
+
+## 状态：M1-R 已 [DONE]
+- TODO.md 标题改 [DONE] + 写入完成记录（对照表 + 缺口汇总 + 验证结果）。
+- 缺口汇总：无阻塞缺口，未插前置任务；后续项（M2 泵/映射、M3 审批、M4 cancel/load、M4-2 能力收口）已调度。
+- PLAN.md 无需改（无阶段计划变更）。
+- 下一个未完成任务：M2-1（map: ServiceEvent → SessionUpdate + ContentBlock → UserInput + stop reason）。

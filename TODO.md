@@ -363,7 +363,7 @@
 - **依赖边界**：只改 mag-acp（依赖 `mag-service` + `agent-client-protocol`）；未依赖 mag-core/agent-lib。
   显式依赖 M1-3（`SessionConfig.cwd`，已 `[DONE]`）；ACP `cwd` 经 `SessionConfig.cwd` 承载，未在 mag-acp 侧丢弃。
 
-### [TODO] M1-R Review：M1 crate 骨架 + `initialize` + `session/new`
+### [DONE] M1-R Review：M1 crate 骨架 + `initialize` + `session/new`
 
 **上下文**：核对 M1 对 `docs/ACP.md` §1/§2/§3.1/§3.2 的实现完整性与正确性；这是真实任务，不得跳过。
 
@@ -382,6 +382,61 @@
 
 - 完整验证序列 1–5 全绿；无未调度失败测试。
 - review 结论写入本任务完成记录（对照表 + 缺口汇总 + 验证结果）。
+
+**完成记录（M1-R）**：
+
+对照 `docs/ACP.md` §1/§2/§3.1/§3.2 逐条核对 M1 成果，结论：M1 实现如实、完整、依赖边界正确。
+
+1. **§1 方法↔类型表 & handler 注册**（`crates/mag-acp/src/lib.rs` `serve` + `src/handlers.rs`）：
+   - `initialize`：`InitializeRequest → InitializeResponse`，经
+     `Agent.builder().on_receive_request(closure, on_receive_request!())` 注册；回传
+     `InitializeResponse::new(request.protocol_version)`（如实版本协商，§7）+
+     `agent_capabilities(map::agent_capabilities())`。✔
+   - `session/new`：`NewSessionRequest → NewSessionResponse`，同宏注册；handler 经
+     `map::new_session_request_to_config` → `create_session` → `map::mag_session_id_to_acp` →
+     `NewSessionResponse::new(acp_session_id)`；`ServiceError` 经 `Error::into_internal_error`
+     转协议错误。✔
+   - `authenticate`：`AuthenticateRequest → AuthenticateResponse`，注册为占位返回空成功响应
+     （§3.1：mag 本地单用户、凭据由 `CredentialStore` 管，`auth_methods` 留空；handler 仅为鲁棒性
+     兜底探测型 client）。✔
+   - run loop：`.connect_to(transport).await`（server-only 常驻 run loop，无手写 spawn/loop）；
+     bin 用 `Stdio::new()`，测试用 `Channel::duplex()` 内存管道。✔
+2. **依赖边界**（`crates/mag-acp/Cargo.toml`）：仅依赖 `mag-service` + `agent-client-protocol`；
+   dev-deps 为 `async-trait`/`futures`/`tokio`。**无** `mag-core` / `agent-lib` / tauri / axum。
+   唯一装配点是 `mag` bin（`crates/mag/src/main.rs`，同时依赖 `mag-core` + `mag-acp`，构造
+   `Arc<dyn MagService> = Arc::new(Engine::new())` 注入 `serve`）。✔
+3. **能力宣告保守性**（§3.1/§7，`map::agent_capabilities`）：`load_session=false`（M4-2 收口）、
+   `prompt_capabilities.image/audio/embedded_context` 全 `false`、`auth_methods` 留空、
+   `mcp/session/auth` 取保守默认（未打开未实现位）。单测
+   `agent_capabilities_are_conservative` + e2e `initialize_round_trips_over_in_memory_pipe`
+   断言 client 观测到的能力与纯函数一致。✔
+4. **M1-3 契约缺口修复核对**（cwd 未被丢弃）：
+   - `mag_service::SessionConfig.cwd: Option<PathBuf>`（`#[serde(default, skip_serializing_if]`
+     向后兼容；`crates/mag-service/src/lib.rs:293`），serde 测试证明旧快照无 `cwd` 键反序列化为
+     `None` 且不回写 null 键。✔
+   - `map::new_session_request_to_config` 以 `cwd: Some(req.cwd.clone())` 承载 ACP 绝对 cwd。✔
+   - `mag_core::SessionDriver::new` 在 `config.cwd = Some(p)` 时
+     `.worktree(WorktreeRef::new(p))`，`None` 保 facade 默认 `"."`（`driver.rs:94`）；
+     driver 测试经快照 `agent_state.spec.worktree` 断言路径落位。✔
+   - e2e `session_new_round_trips_over_in_memory_pipe` 端到端证明：fake service 记录的
+     `config.cwd == 请求 cwd`，且回传 ACP `SessionId` 经 `acp_session_id_to_mag` 解回同一 mag id。✔
+   - 依赖链：M1-3（trunk 加字段）→ M1-4（handler 承载 cwd）均 `[DONE]`，顺序正确。
+5. **本次微修**：`serve` 的 rustdoc 原漏列 `session/new`（M1-4 加了 handler 但函数级 doc 未同步），
+   已更正为「`initialize` 和 `session/new`，外加占位 `authenticate`」，消除 doc 与实现的不一致。
+   仅注释改动，不影响编译产物。
+6. **验证结果**（完整序列 1–5 全绿，无未调度失败测试）：
+   1. `cargo fmt --all -- --check` → 干净。
+   2. 聚焦 `cargo test -p mag-acp` → 4 unit + 2 e2e = 6 passed，0 failed，0 ignored。
+   3. `cargo clippy --all-targets -- -D warnings` → 无警告。
+   4. `cargo test --workspace` → 97 passed（mag 0 / mag-acp 4+2 / mag-core 48+2 / mag-service 12 /
+      mag-sources 10 / mag-tools 6+13），0 failed，0 ignored。
+   5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` → 无缺 doc 警告。
+
+**M1 遗留缺口汇总**：无阻塞性缺口。M1 范围（crate 骨架 + `initialize` + `session/new` + stdio 跑通）
+已完整落地；acp crate 无缺 API（`Channel::duplex` 内存传输、`on_receive_request!()` 宏、
+`InitializeResponse`/`NewSessionResponse` 构造子均可用），未插入任何前置任务。已按设计延后但已显式
+调度的项：`load_session` 能力宣告收口（M4-2）、`session/prompt` 泵与类型映射（M2）、审批桥接（M3）、
+cancel/load（M4）。M1-3→M1-4 依赖已在各自完成记录标注。
 
 ---
 
