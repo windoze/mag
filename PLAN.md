@@ -1,165 +1,187 @@
-# 实施计划：mag service（`mag-service` 接口 + `mag-core` 实现）
+# 实施计划：mag-acp（mag 作为 ACP server，第一个落地 interface）
 
-> 唯一设计输入：[`docs/DESIGN.md`](docs/DESIGN.md)（尤其 §1 全局架构、§3 mag-service 接口与 mag-core 实现、
-> §4 Command/Event 编码、§9 接入 agent-lib 约束）。
-> 底层库 [`agent-lib`](../agent-lib) 的接入面见其 [`README.md`](../agent-lib/README.md) 与
-> [`docs/DESIGN.md`](../agent-lib/DESIGN.md)；facade 缺口与后续注入口见 agent-lib 的
-> [`PLAN.md`](../agent-lib/PLAN.md) Milestone 7。
+> **唯一设计输入**：[`docs/ACP.md`](docs/ACP.md)（mag-acp 的实现级设计）。参照 [`docs/DESIGN.md`](docs/DESIGN.md)
+> §5（ACP 概览）、§3.0（`MagService` trait，mag-acp 面对的接口）。
 >
-> **本计划覆盖 service 主干：`mag-service`（抽象接口）+ `mag-core`（实现 `MagService` 的引擎）+ 直接依赖的
-> mag-tools / mag-sources 核心。** 各 interface（mag-acp / mag-server / mag-tauri / app 前端）**不在本计划
-> 范围**——它们必须等 service 充分测试通过、`MagService` 契约稳定后，再按 `docs/DESIGN.md` §10 的 I1（ACP 优先）
-> 起单独规划。逐任务清单见 [`TODO.md`](TODO.md)。
+> service 主干（`mag-service` 接口 + `mag-core` 实现 + `mag-tools`/`mag-sources` 核心）已全部 `[DONE]`、
+> `MagService` 契约已冻结，其已完成计划归档在
+> [`docs/archive/2026-07-19-mag-service/`](docs/archive/2026-07-19-mag-service/)。**本计划只覆盖第一个
+> interface：`mag-acp` crate。** 逐任务清单见 [`TODO.md`](TODO.md)。
 
 ## 目标
 
-落地 `docs/DESIGN.md` §3 描述的 service：一个 **interface 无关**的 service——抽象为 `mag-service::MagService`
-trait（trait + 中立 serde 类型，含 Command/Event 编码），由 `mag-core::Engine` 实现。它能装配并驱动
-agent-lib、管理多会话、把跨 interface 的审批往返做成异步暂停点、持久化会话——**但不绑定任何具体
-interface**（ACP/web/Tauri 都在上层）。具体：
+落地 `docs/ACP.md` 描述的 **mag-acp**：把已冻结的 `mag-service::MagService`（`docs/DESIGN.md` §3.0）通过
+**ACP（Agent Client Protocol）agent 端**暴露，被 Zed 等 ACP client 反向驱动（stdio 上的 JSON-RPC）。mag-acp 是
+一层**纯协议翻译器**——把 ACP 入站请求翻译成 `MagService` 方法调用，把 `MagService` 的事件流（`subscribe`）与
+审批往返翻译成 ACP 出站通知/请求，**不含任何 agent 逻辑**（那在 mag-core）。具体交付：
 
-- **interface 无关的 service 接口**：`MagService` 是 object-safe 的 async trait（命令方法 + `subscribe`
-  事件流 + `respond_interaction`/`cancel`，`docs/DESIGN.md` §3.0）；`Engine` 是唯一实现。测试直接调 trait 方法、
-  断言 `subscribe` 事件流序列。Command/Event（§4）是它面向 tauri/web 的 wire 编码，随接口一起定义在
-  `mag-service`。
-- **facade `Agent` + 注入 `IpcApproval`**（`docs/DESIGN.md` §3.2、§9.1）：用 facade `Agent::builder()` +
-  `Agent::stream`，经 `AgentBuilder::interaction_handler(Arc<IpcApproval>)`（agent-lib M7-1）注入异步审批
-  handler。**不再下沉自组 scope**（M7 已把注入口透出到 facade）。
-- **跨传输审批 gate**（§3.3）：`IpcApproval` 实现 async `InteractionHandler`，`fulfill` 里发
-  `InteractionRequested`、await oneshot、收 `RespondInteraction` 后折回。machine 真正停在 `.await`。
-  审批 gate 由 `ApprovalPolicy`（`ask_tool`/`auto_allow`）控制，`IpcApproval` 是被暂停交互的应答方。
-- **流式**：facade `Agent::stream` 直接产出 `RunEvent::TextDelta`；用官方 `RunEvent::to_wire()
-  -> WireRunEvent`（agent-lib M7-2）序列化后映射进 mag `Event`。**不再自建 tap handler**。
-- **会话生命周期**：per-session driver actor（§3.1），run 在独立 task 推进，`CancelRun`/
-  `RespondInteraction` 走不碰 agent `&mut` 的旁路。
-- **持久化**：committed 一致点取 `AgentState` snapshot 写 SQLite；`ResumeSession` 重装配（§3.6）。
-- **插件式工具**（§7）：`ToolPlugin` registry，第一版最小集（read_file/list_dir/grep 只读 + shell 审批）。
-- **充分测试**：mag-core 的每条关键路径都有**离线**测试（fake `LlmClient` + 脚本化工具/审批），
-  这是本计划的重点交付物，不是附带。
+- **acp crate v1.2.0 的 agent 端接线**（`docs/ACP.md` §1）：用 role-marker + builder + typed-handler 模型
+  （`agent_client_protocol::Agent::builder()` → `on_receive_request` / `on_receive_notification` 注册 handler →
+  `connect_to(Stdio)` 跑 run loop）暴露 `initialize` / `session/new` / `session/load` / `session/prompt` /
+  `session/cancel`。
+- **`session/prompt` 请求 ↔ 事件流的泵**（`docs/ACP.md` §3.4）：handler 内先 `subscribe(Some(sid))` 再
+  `send_message`，把 `ServiceEvent` 流泵成 `session/update` 通知，直到本轮终态返回 `PromptResponse { stop_reason }`。
+- **审批桥接**（`docs/ACP.md` §5）：`ServiceEvent::InteractionRequested` ↔ ACP `session/request_permission`，
+  outcome 回灌 `MagService::respond_interaction` 唤醒被暂停的 driver。复用**同一** gate，审批逻辑（mag-core）
+  一行不改。
+- **类型映射纯函数**（`docs/ACP.md` §4）：`ServiceEvent ↔ SessionUpdate`、`ContentBlock ↔ UserInput`、
+  interaction ↔ permission、stop reason——集中在一个无 IO 的 `map` 模块，便于离线单测。
+- **能力如实宣告**（`docs/ACP.md` §3.1/§7）：`initialize` 只打开 mag 真正支持的 `AgentCapabilities` 位
+  （第一版文本优先；`load_session` 取决于 mag-core 恢复能力实际就绪度）。
+- **充分的离线测试**（`docs/ACP.md` §9）：映射纯函数单测 + handler 级用 scripted `Arc<dyn MagService>` +
+  协议级 e2e 用 acp crate 自身 client 经内存管道驱动 mag-acp（fake LLM），真实 Zed 联调 `#[ignore]`。
 
 ## 非目标（本计划）
 
-- 不做任何具体 interface（ACP stdio、web WebSocket、Tauri invoke/emit）——那是上层，等 service 稳定、
-  `MagService` 契约冻结后再做（第一个是 ACP，`docs/DESIGN.md` §10 I1）。**但 `MagService` trait 本计划就要按
-  近全集一次成型**（含多会话管理、审批、委派、source 探测），使后续 interface 无需改接口。
-- 不做前端（React/app）。
-- 不做本地 agent 来源的 live 接入（打开 external features、用 `default_external_session_handler`）——
-  service 主干先跑通 **LLM API 来源 + 本地工具**；本地 agent 来源作为 `docs/DESIGN.md` §10 的 I2 单列。但
-  source registry / 委派数据结构要为它**预留位置**，不写死。
-- 不实现 AI-based permission / AI-based routing 的**决策逻辑**（§8）——只把接缝（`PermissionDecider`
-  钩子位置、routing 配置字段）留在结构里。
+- **不改已冻结的 `MagService` 契约**（`docs/DESIGN.md` §3.0）：mag-acp 只消费现有 trait 方法与 `ServiceEvent`
+  变体；若确需新增，须回到 service 主干按向后兼容方式加（只加方法/变体/字段），并在 `TODO.md` 显式插前置任务。
+- **不碰 mag-core 实现细节 / agent-lib**：mag-acp **只依赖 `mag-service` + acp crate**，面对
+  `Arc<dyn MagService>`。装配 `mag-core::Engine` 注入的是上层 bin，不在 mag-acp 库内。
+- **不做其它 interface**（web WebSocket、Tauri invoke/emit、React/app 前端）——那是后续 interface。
+- **不做 ACP client 方向**（把外部 ACP agent 当来源消费，`docs/DESIGN.md` §6）：那是 mag-core / mag-sources
+  的事（agent-lib `external-acp`），与 mag-acp（agent 方向）无关（`docs/ACP.md` §8）。
+- **不实现 proxy / conductor 角色**（`docs/ACP.md` §0）；不启 `unstable_protocol_v2` feature（`docs/ACP.md` §7）。
+- **不经 Command/Event**：Command/Event 是 tauri/web 的平行 wire 编码（`docs/DESIGN.md` §4）；ACP 直接映射到
+  `MagService`（`docs/ACP.md` §0）。
+- **多模态输入第一版不做**：`prompt_capabilities` 的 `image`/`audio`/`embedded_context` 保持 `false`，输入取
+  `ContentBlock::Text`（`docs/ACP.md` §3.1/§4）。
 
-## 现有代码锚点（mag-core 的精确接入面，全部已核对 agent-lib 源码）
+## 现有代码锚点（实现时无需再翻库）
 
-> **接入面已随 agent-lib Milestone 7（已 `[DONE]`）更新**：mag-core 走 facade 注入路径，不再下沉自组
-> scope。下列锚点以 facade M7 API 为准。
+### acp crate（`agent-client-protocol` v1.2.0；schema `agent-client-protocol-schema` v1.4.0，经 `agent_client_protocol::schema::v1::*`）
 
-- **facade Agent 构造 + 审批注入**：`facade::Agent::builder().provider(..).model(..).tool(..)
-  .approval(policy).interaction_handler(Arc<dyn InteractionHandler>).build()`
-  （`AgentBuilder::interaction_handler` = `../agent-lib/src/facade/agent.rs:1015`；同步/流式两路都生效）。
-  `Agent::stream(input) -> AgentRunStream`（逐 `RunEvent`）。
-- **审批 handler trait**：`agent::InteractionHandler`（`../agent-lib/src/agent/drive.rs:154`，`#[async_trait]
-  async fn fulfill(&self, req: &Interaction, ctx: &RunContext) -> RequirementResult`；**不在 prelude，需从
-  `agent_lib::agent` import**）。`IpcApproval` 实现它，在 `fulfill` 里 emit + await oneshot。
-  `Interaction`/`InteractionKind`/`InteractionResponse` 均 serde 友好（`src/agent/interaction.rs`）。
-- **事件序列化**：`RunEvent::to_wire() -> WireRunEvent`（`../agent-lib/src/facade/run.rs:329`）；
-  `WireRunEvent`（`run.rs:392`，`serde(tag="type",content="data")`）与 `WireRunOutput` 在 prelude。
-  `RawStream`/`RawNotification` 折叠为 `WireRunEvent::Raw(RawEventKind)`。
-- **富化审批请求**：`facade::ApprovalRequest`（`run.rs:464`，prelude）带
-  `tool_name`/`call_id`/`reason`/`input`（脱敏摘要）。
-- **工具**：`facade::Tool::function_with_schema(name, desc, json_schema, handler)`（`src/facade/tool.rs`，
-  无需 feature），async 闭包 `|ctx: ToolContext, args| async {..}`；`AgentBuilder::tool(..)` 注册。
-  `ToolContext` 带 `worktree`/`cancel`/`tool_call_id`。审批 gate 用 `ApprovalPolicy::ask_tool`/`auto_allow`。
-- **权限模型**：`agent::permission::{PermissionRequest, PermissionCategory, PermissionRisk,
-  PermissionDecision, PermissionResponse}`（全 serde；risk 有序）；AI-permission 落点在 `IpcApproval` 的
-  Permission 分支（`docs/DESIGN.md` §8.1）。
-- **持久化**：`Agent::snapshot() -> AgentSnapshot`（committed 一致点，data-only）/ `Agent::restore()`
-  builder 重注入 provider/工具/approval，审批经 `AgentRestoreBuilder::interaction_handler(..)`（agent-lib
-  M7-F1，与 `AgentBuilder` 对齐）重注入 `IpcApproval`（见 R-B，缺口已消解）。
-- **纯对话备选（C0/C1 早期脚手架）**：facade `Chat`/`ChatSession`（`src/facade/chat.rs`，无工具）。
-- **id source**：facade 内建 `FacadeIds`；mag 若需确定性可选 `AgentBuilder::ids(..)`。自组 scope 时代的
-  `MagIds`（已在 C0-3 实现）在 facade 路径下降级为可选/仅测试用，切换时评估去留。
+来源见 `docs/ACP.md` §1。agent 端形状：
+
+- **构造**：零大小角色标记 `agent_client_protocol::Agent` → `.builder()` 得 `Builder<Agent, ..>`；
+  `.on_receive_request(closure, on_receive_request!())` / `.on_receive_notification(closure,
+  on_receive_notification!())` 注册 handler（第二个宏参数必填，绕过 return-type-notation）；
+  `.connect_to(Stdio::new()).await` 本身就是 server-only run loop（永久处理入站消息）。
+- **request handler 闭包签名**（`Host = Agent`，`Counterpart = Client`）：
+  `async move |req: XxxRequest, responder: Responder<XxxResponse>, cx: ConnectionTo<Client>| -> Result<_, acp::Error>`；
+  用 `responder.respond(resp)` / `responder.respond_with_error(err)` 回复。
+- **出站句柄 `cx: ConnectionTo<Client>`（`Clone`）**：
+  - `cx.send_notification(SessionNotification::new(session_id, SessionUpdate::..))` —— 发 `session/update`（无返回）。
+  - `cx.send_request(RequestPermissionRequest::new(..)).block_task().await?` —— 发 `session/request_permission`
+    并 await `RequestPermissionResponse`。
+- **方法 ↔ 类型**（schema v1）：`initialize`(`InitializeRequest`/`InitializeResponse`)、
+  `authenticate`(`AuthenticateRequest`/`AuthenticateResponse`)、`session/new`(`NewSessionRequest`/
+  `NewSessionResponse`)、`session/load`(`LoadSessionRequest`/`LoadSessionResponse`，仅当宣告 `load_session`)、
+  `session/prompt`(`PromptRequest`/`PromptResponse`)、`session/cancel`(`CancelNotification`，notification →
+  `on_receive_notification`)。
+- **关键 schema 类型**：`InitializeResponse::new(version).agent_capabilities(caps)`；
+  `AgentCapabilities { load_session, prompt_capabilities, mcp_capabilities, session_capabilities, auth }`；
+  `NewSessionRequest { cwd, additional_directories, mcp_servers }` / `NewSessionResponse::new(acp_session_id)`；
+  `PromptRequest { session_id, prompt: Vec<ContentBlock> }` / `PromptResponse::new(stop_reason)`；
+  `StopReason::{EndTurn, Cancelled, Refusal, MaxTokens, MaxTurnRequests}`；
+  `SessionUpdate::{AgentMessageChunk(ContentChunk), AgentThoughtChunk, ToolCall(ToolCall),
+  ToolCallUpdate(ToolCallUpdate), Plan}`；`ContentBlock::{Text, Image, Audio, ResourceLink, Resource}`；
+  `RequestPermissionRequest::new(session_id, tool_call: ToolCallUpdate, options: Vec<PermissionOption>)` /
+  `RequestPermissionResponse { outcome }`；`PermissionOption { id: PermissionOptionId, name, kind:
+  PermissionOptionKind }`、`PermissionOptionKind::{AllowOnce, AllowAlways, RejectOnce, RejectAlways}`；
+  `RequestPermissionOutcome::{Selected { option_id }, Cancelled }`；`SessionId`(`Arc<str>`)；
+  `LoadSessionRequest { session_id }`；`CancelNotification { session_id }`。
+
+> 上述类型名/构造子/方法名以 `docs/ACP.md` §1/§3/§4/§5 为准；schema 具体字段/变体拼写在 M1-1 实现时对
+> `agent_client_protocol::schema::v1` 就地核对（crate 是真实依赖）。若发现 acp crate 缺口（缺 API、类型不匹配、
+> 无内存传输构造子），按「关键设计约束」的缺口处理约定在 `TODO.md` 插最小前置任务，不 papering over。
+
+### `mag-service`（已冻结契约，来源 `crates/mag-service/src/{service.rs,lib.rs}`）
+
+- **trait `MagService`**（object-safe，`Arc<dyn MagService>`）：
+  `create_session(SessionConfig) -> SessionId`、`list_sessions() -> Vec<SessionInfo>`、
+  `resume_session(SessionId)`、`delete_session(SessionId)`、`send_message(SessionId, UserInput) -> RunId`、
+  `cancel(SessionId)`、`respond_interaction(SessionId, RequestId, InteractionResponseWire)`、
+  `subscribe(Option<SessionId>) -> BoxStream<'static, ServiceEvent>`、`list_sources() -> Vec<SourceInfo>`、
+  `probe_local_agents() -> Vec<SourceInfo>`。所有 async 方法返回 `Result<_, ServiceError>`。
+- **`ServiceEvent`**（`#[non_exhaustive]`，`#[serde(tag="type", rename_all="snake_case")]`）变体：
+  `SessionCreated{id,config}`、`RunStarted{id,run_id}`、`RunFinished{id,output:RunOutput}`、
+  `RunError{id,message}`、`TextDelta{id,text}`、`ToolStarted{id,trace:ToolTrace}`、
+  `ToolFinished{id,trace:ToolTrace}`、`InteractionRequested{id,request_id:RequestId,kind:InteractionKindWire}`、
+  `DelegationStarted/Finished/Failed{id,trace:DelegationTrace}`、`DelegationMessage{id,message:DelegationMessageWire}`、
+  `LocalAgentsProbed{available:Vec<SourceInfo>}`。`ServiceEvent::session_id() -> Option<SessionId>`。
+- **wire 类型**（`lib.rs`）：`SessionId`/`RunId`/`RequestId`（`#[serde(transparent)]` 包 `Uuid`；
+  `new(Uuid)`/`parse_str(&str)`/`as_uuid()`/`Display`/`FromStr`）；`UserInput{text:String,
+  attachments:Vec<MessageAttachment>}`（`UserInput::text(impl Into<String>)`）；
+  `SessionConfig{provider:String, model:String, tool_profile:Option<String>, routing:RoutingMode}`；
+  `RunOutput{text,usage:Option<UsageInfo>}`；`ToolTrace{run_id,call_id:ToolCallIdWire,name,input,output,
+  status:ToolStatusWire,message}`、`ToolStatusWire::{Started,Finished,Denied,Cancelled,Failed}`；
+  `InteractionKindWire{Approval{call_id:ToolCallIdWire,requirement:ApprovalRequirementWire},
+  Question{prompt}, Choice{prompt,options}, Permission{action_id,actor,category:PermissionCategoryWire,
+  risk:PermissionRiskWire,summary,subject,reason}}`（`#[serde(tag="kind")]`）；
+  `InteractionResponseWire{Approval{step_id:StepIdWire,call_id:ToolCallIdWire,decision:ApprovalDecisionWire,
+  message}, Answer{text}, Choice{index}, Permission{action_id,decision:PermissionDecisionWire}}`；
+  `ApprovalDecisionWire::{Approve,Deny,Timeout,Cancel}`；`PermissionDecisionWire::{Approve,Deny{reason},Cancel}`；
+  `SourceInfo{id,name,kind:SourceKindWire,available,version,path,capabilities}`；`ServiceError`。
 
 ## 里程碑
 
-逐层增加概念、每层可独立**离线**验证。C0–C1 是引擎主干起步，**CS 抽取 `mag-service` 接口**，C2 会话
-生命周期，C3 工具+审批，C4 持久化，C5 收官验收。
-
-> **执行顺序**：C0 → C1（含 C1-3 切 facade、C1-R）→ **CS**（抽 `mag-service`、`Engine impl MagService`）→
-> C2 → C3 → C4 → C5。CS 插在 C1 之后、C2 之前，因为此时 Engine 表面积最小、抽接口最便宜；C2 起的会话/
-> 工具/审批都直接对着 `MagService` trait 写。
+逐层增加概念、每层可独立**离线**验证。顺序照 `docs/ACP.md` 的结构。
 
 | 里程碑 | 主题 | 主要产出 | 默认测试形态 |
 |---|---|---|---|
-| C0 | 骨架 + 协议 | workspace、`mag-protocol`（`Command`/`Event` + payload，全 serde）、`Engine` 空壳 + 内存事件总线、id source。**[DONE]（mag-protocol 后由 CS 并入 mag-service）** | 单元（协议 round-trip、Engine 起停） |
-| C1 | 纯对话流式 | facade `Agent::stream` 驱动一次 LLM turn、经 `WireRunEvent` 映射 emit `TextDelta`、`SendMessage`→`RunFinished`（早期按自组 scope 实现，随 agent-lib M7 落地切到 facade，见 `TODO.md` C1-3） | 单元（fake `LlmClient` 脚本化 delta，离线） |
-| **CS** | **抽取 `mag-service` 接口** | 新建 `mag-service` crate、`Command`/`Event` 等从 `mag-protocol` 迁入、删 `mag-protocol`；定义 `MagService` trait（近全集，object-safe）+ `ServiceEvent`；`Engine impl MagService`；mag-core 依赖 mag-service | 单元（trait 方法调用 + `subscribe` 事件流断言；既有 C1 测试改经 trait 后仍绿） |
-| C2 | 会话生命周期 | per-session driver actor、`create_session`/`list_sessions`/`cancel`（`MagService` 方法）、多会话隔离、cancel 旁路 | 单元（并发会话、run 中途 cancel，离线） |
-| C3 | 工具 + 交互审批 | `mag-tools` registry + 最小集、`IpcApproval` 异步暂停、`InteractionRequested`/`respond_interaction` 往返、`ToolStarted`/`ToolFinished` | 单元（脚本化工具 + 审批 channel，验证 machine 真停到 resolve） |
-| C4 | 持久化 | SQLite、committed 点 snapshot、`resume_session` 重装配、凭据 store（不进 snapshot） | 单元（snapshot round-trip、跨"重启"恢复历史，离线临时库） |
-| C5 | 收官验收 | 端到端离线主干（建会话→多轮带工具+审批→cancel→持久化→恢复）、`MagService` 契约冻结 review | 集成（离线全链路，经 `MagService` trait）+ review |
+| M1 | crate 骨架 + `initialize` + `session/new` + stdio 跑通 | 新建 `mag-acp` crate（依赖 mag-service + acp crate）、`map` 纯函数（SessionId 映射 + 能力宣告）、bin 装配（builder + `connect_to`）、`initialize` / `session/new` handler、内存管道 e2e 骨架 | 纯函数单测 + handler 级 + 内存管道 e2e（`initialize`/`session/new` 往返） |
+| M2 | `session/prompt` 泵 + 类型映射 | `map`：`ServiceEvent → SessionUpdate` / `ContentBlock → UserInput` / stop reason；`session/prompt` handler 的泵（`subscribe`→`send_message`→loop→`PromptResponse`） | 纯函数单测 + handler 级（scripted `MagService`，断言 update 序列 + stop reason） |
+| M3 | 审批桥接 | `map`：`InteractionKindWire → RequestPermissionRequest`（tool_call + options）、outcome → `InteractionResponseWire`；`bridge_permission` 接入泵 | 纯函数单测 + handler 级（`InteractionRequested` 触发 `send_request`、outcome 回灌 `respond_interaction`） |
+| M4 | cancel + `session/load` + 能力宣告收口 | `session/cancel` notification → `cancel`（泵以 `Cancelled` 收尾、挂起权限请求 cancel 收尾）；`session/load` → `resume_session`；`load_session`/`prompt` 能力宣告按实际就绪度收口 | handler 级（cancel 三路径、load 往返、能力位断言） |
+| M5 | 协议级 e2e + 收官验收 | 全回合内存管道 e2e（`initialize → session/new → session/prompt`（流式+权限）`→ session/cancel`，fake LLM）；真实 Zed 联调 `#[ignore]`；收官 review | 集成（离线全链路，经 acp client ↔ mag-acp）+ review |
 
-每个里程碑末尾隐含一次自检：全部离线测试绿、无网络/凭据/CLI 依赖、契约变更向后兼容（只加 enum 变体/
-`#[non_exhaustive]` 加字段）。**C5 通过（`MagService` 契约冻结）后方可推进 `docs/DESIGN.md` §10 的 I1（ACP
-interface，第一个），再到 I2/I3/I4。**
+每个里程碑末尾有独立 review 任务 `M<n>-R`（对照 `docs/ACP.md` 对应节，确认无遗漏映射 / 未调度失败测试）。
 
 ## 关键设计约束（落地时必须守）
 
-- **service interface 无关**：`mag-core` 不依赖 tauri / axum / ACP crate；只依赖 mag-service、agent-lib、
-  mag-tools、mag-sources。任何"发事件"都写内存事件总线，由 `subscribe` 暴露、（未来的）interface 订阅。
-- **接口与实现分离**：`mag-service` 是纯抽象（`MagService` trait + 中立 serde 类型，含 Command/Event），
-  **不依赖 agent-lib、不含实现**；`mag-core::Engine` 是唯一实现。需要的底层类型（`InteractionResponse`
-  等）在 mag-service 侧薄封装/重定义为 wire 类型，不把 agent-lib 内部类型泄漏进接口。
-- **`MagService` 一次按近全集成型**：CS 里就带上 GUI 视角需要的方法（多会话管理、委派、source 探测），
-  即使 I1（ACP）只用子集——避免 ACP 视角把签名带窄，后续 interface 免改接口（`docs/DESIGN.md` §11 风险 6）。
-- **审批是异步暂停点，不是通知**：`IpcApproval::fulfill` 必须真正 await；决不能像 facade 那样"先 emit
-  再同步决策"。测试必须断言 machine 在 resolve 前不前进。
-- **run 与控制命令解耦**：actor 里 run 占用 agent `&mut`；`cancel`/`respond_interaction` 只碰 cancel
-  token / pending oneshot map，永不阻塞在 run 上。
-- **snapshot 无 secret**：agent-lib snapshot 本就 data-only；mag 的持久层同样不存凭据/闭包/handle。
-  凭据只在 `CredentialStore`，恢复时重注入。
-- **扩展点留位不写死**：`PermissionDecider` 钩子（§8.1）、routing 配置字段（§8.2）、source registry 对
-  本地 agent 的位置——结构里留好，第一版给保守默认（问前端 / model-routed / 无本地 agent）。
-- **不绕过 agent-lib 不变量**：会话推进必须走 `Conversation`/`DefaultAgentMachine`/`Requirement`，
-  不自己拼 message Vec、不重写状态机。
+- **mag-acp 依赖边界**：`Cargo.toml` 只依赖 `mag-service` + `agent-client-protocol`（+ 其 schema、tokio、
+  futures、serde/serde_json、async 运行时）；**不得**依赖 `mag-core` / `agent-lib`。装配 `Engine` 注入
+  `Arc<dyn MagService>` 的是上层 bin（依赖 mag-core + mag-acp），mag-acp 库对 service 只见 `dyn MagService`。
+- **不改已冻结契约**：只消费现有 `MagService` 方法与 `ServiceEvent` 变体。缺映射/缺字段先在 `TODO.md` 插前置
+  任务回主干补，**禁止**在 mag-acp 侧臆造 ACP 语义或 papering over。
+- **审批是异步暂停点**：`bridge_permission` 必须真正 `await` client 的 `RequestPermissionResponse`，再
+  `respond_interaction` 唤醒 driver；决不能"发了就当批准"。测试断言 driver 在 outcome 回灌前不前进
+  （`docs/ACP.md` §5）。
+- **先 `subscribe` 再 `send_message`**：泵在触发运行前订阅，防竞态丢事件；`subscribe(Some(sid))` 按会话过滤，
+  多个并发 prompt 各自泵各自的流（`docs/ACP.md` §3.4）。
+- **能力如实宣告**：`initialize` 只打开实现确已支持的位；未实现的一律不宣告（`docs/ACP.md` §3.1/§7）。
+  `load_session` 仅当 mag-core 恢复能力就绪才置 `true`。
+- **shell 等特权工具审批不可省**：即便 client 可信，特权动作也经 `session/request_permission` 让用户确认，
+  这是最后防线（`docs/ACP.md` §6）。
+- **映射对 `#[non_exhaustive]` 保守**：只产出 mag 确有语义的 ACP 变体；未知/未支持的 mag 事件降级为一条文本
+  `AgentMessageChunk` 或忽略（记日志），不臆造语义（`docs/ACP.md` §4）。
+- **acp crate 缺口按前置任务处理**：遇缺 API / 类型不匹配 / 无内存传输，在 `TODO.md` 正确依赖位置插最小前置
+  任务并让被阻塞任务显式依赖它，然后提交并停，不绕过。
 
-## 测试策略（本计划的重点）
+## 测试策略（离线，`docs/ACP.md` §9）
 
-**mag-core 的测试充分性是推进上层的前置门槛。** 默认序列（cheap → expensive）：
+默认序列（cheap → expensive）：
 
 1. `cargo fmt --all -- --check`
-2. 聚焦测试：任务给出精确过滤名（如 `cargo test -p mag-core engine::approval`）
+2. 聚焦测试：任务给出精确过滤名（如 `cargo test -p mag-acp map::`）
 3. `cargo clippy --all-targets -- -D warnings`
 4. `cargo test --workspace`（完整套件）
 5. `cargo doc --no-deps --workspace`（公开 API 带 rustdoc）
 
 补充约束：
 
-- **所有 mag-core 测试必须离线**：用 fake `LlmClient`（脚本化 response / delta）、脚本化工具、内存/临时
-  SQLite、内存审批 channel。不依赖网络、真实凭据、CLI、本地登录态。每个测试 1 分钟内完成，卡住即 bug。
-- **审批往返必须被显式测试暂停语义**：脚本化 `InteractionHandler` await test channel，断言 machine 在
-  test 侧 resolve 前 future 不完成，approve/deny/cancel 三条路径都覆盖。
-- **并发会话隔离**：多个 session 并行 run，事件按 session_id 正确分流，一个会话的 cancel 不影响另一个。
-- **契约测试**：`Command`/`Event` 全变体 serde round-trip；若启用 `ts-rs`/`schemars`，校验 TS 类型不漂移。
-- 需要真实 LLM endpoint 的端到端验证一律 `#[ignore]`，缺环境干净跳过（绿），不输出 secret。
+- **全离线**：映射纯函数直接单测；handler 级注入 fake/scripted `Arc<dyn MagService>`（脚本化 `subscribe`
+  事件流 + 记录方法调用）；协议级 e2e 用 acp crate 自身 client（或 agent-lib 的 ACP client）经**内存管道**
+  （如 `tokio::io::duplex`）驱动 mag-acp，service 侧注入 fake LLM。不依赖网络 / 真实凭据 / 真实 Zed / 子进程。
+- **审批暂停语义必须显式测试**：脚本化断言 client 回 outcome 前 driver 不前进；approve / deny / cancel 三路径
+  都覆盖。
+- **每个测试 1 分钟内完成**，卡住即 bug，立即修。真实 Zed 联调一律 `#[ignore]`，缺环境干净跳过（绿）。
+- **契约保守**：只对 mag 确有语义的变体断言映射；stop reason / outcome / content block 的 round-trip 与边界
+  （未知/未支持变体的保守降级）都测。
 
 ## 风险与待确认
 
-- **R-A【已消解】流式 tap**：早期担心库 `LlmClientHandler` 内部聚合、需自建 `StreamingTapHandler`。
-  agent-lib M7 之后走 facade `Agent::stream`（已产 `TextDelta`）+ `WireRunEvent`，无需自建。C1 早期实现的
-  自建 tap 随 C1-3 切换移除。
-- **R-B【已消解】restore 审批注入口**：M7-1 透出 `AgentBuilder::interaction_handler(..)`（主路径），
-  **M7-F1（`29c4e2a`）已补齐对应的 `AgentRestoreBuilder::interaction_handler(Arc<dyn InteractionHandler>)`**，
-  签名 / 相对 `.approval(..)` 优先级 / 同步 + 流式两路生效均与 `AgentBuilder` 对齐。恢复出的会话重注入
-  `IpcApproval` 后即可跨进程审批，**C4 恢复对需审批会话已完全可用**，原「只对纯对话/只读工具会话可用」的限制
-  作废。snapshot 仍 data-only 不带该句柄，故恢复须重注入；未重注入才回落同步 `FacadeApproval`。C4-1 不再被
-  此缺口阻塞。
-- **R-C 本地 agent 来源推迟**：mag-core 主干先只做 LLM API + 本地工具。source registry 与委派结构必须
-  为本地 agent 预留位置（enum 变体 / trait 对象槽），但不实现 live 接入。I2（`docs/DESIGN.md` §10）用 M7-4 的
-  `default_external_session_handler` 直接接入，无需自己 wire。避免主干被 external feature 与 CLI 环境
-  依赖拖慢。
-- **R-D 持久化 schema 演进**：SQLite schema 首版可能变。取向：snapshot 存 JSON blob（agent-lib
-  `AgentSnapshot` 的 serde），schema 只存 id/config/时间戳等稳定列，降低迁移成本；预留 schema version 列。
-- **R-E id source**：facade 路径下会话 id 由内建 `FacadeIds` 管理，恢复经 `Agent::restore()` 的
-  `FacadeIds::continuing_after` 续号，mag 一般不需自管。C0-3 已实现的 `MagIds` 在 facade 路径下降级为
-  可选/仅测试；C1-3 切换时评估是否保留。
+- **R-1 acp crate v1.2.0 精确 API**：类型/构造子/字段拼写以 `docs/ACP.md` §1 为准，M1-1 就地对
+  `agent_client_protocol::schema::v1` 核对。若 builder / handler 宏 / `connect_to` 形状与文档有出入，按缺口
+  处理约定在 `TODO.md` 修正锚点并插前置任务，不改主干。
+- **R-2 内存传输**：协议级 e2e 需一个非 stdio 的内存管道把 acp client 与 mag-acp server 对接。若 acp crate 的
+  `connect_to` 只接受具体传输而无现成内存构造子，M1-2 需先搭一个基于 `tokio::io::duplex` 的传输适配（属实现
+  细节，非绕过）。这是 M5 全回合 e2e 的前置，M1-2 就要跑通最小 `initialize` 往返。
+- **R-3 `load_session` 就绪度**：需审批会话恢复依赖 agent-lib M7-F1（已 `[DONE]`）+ mag-core C4 恢复能力。
+  第一版 `load_session` 宣告策略以 mag-core 实际就绪度为准（未就绪则宣告 `false`，client 不会调用），见
+  `docs/ACP.md` §3.3/§7、`docs/DESIGN.md` §3.6。
+- **R-4 delegation 映射语义**：`DelegationStarted/...` 映射为 `ToolCall`/`ToolCallUpdate` 还是 `Plan` 由
+  `docs/ACP.md` §4 保守约定；第一版可先降级为文本或 `ToolCall`，M2-1 明确并单测，不臆造 `Plan` 语义。
+- **R-5 stop reason 精度**：`ServiceEvent` 目前用 `RunFinished`/`RunError` 收尾；`MaxTokens`/`MaxTurnRequests`
+  若无法从 `ServiceEvent` 区分，归 `EndTurn`/`Refusal`（`docs/ACP.md` §3.4）。若后续需精确区分，回主干加
+  `ServiceEvent` 字段（向后兼容），不在 mag-acp 侧猜。
