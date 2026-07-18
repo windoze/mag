@@ -2,17 +2,21 @@
 
 //! Transport-neutral service protocol types for mag.
 //!
-//! This crate is the home of the `mag-service` layer. It owns the wire contract
-//! between front doors and `mag-core`: the [`Command`]/[`Event`] protocol plus
-//! their payloads and identifier types. The types are pure serde data and
-//! deliberately do not depend on `agent-lib`, even when they mirror concepts
-//! from that crate. Later tasks add the `MagService` trait alongside these
-//! protocol types.
+//! This crate is the home of the `mag-service` layer. It owns the [`MagService`]
+//! service facade (an object-safe async trait) plus the neutral service protocol
+//! types: the [`Command`]/[`Event`] wire protocol, the [`ServiceEvent`] stream
+//! model, and their payloads and identifier types. The types are pure serde data
+//! and deliberately do not depend on `agent-lib`, even when they mirror concepts
+//! from that crate. `mag-core::Engine` is the implementation of [`MagService`].
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{fmt, str::FromStr};
 use uuid::Uuid;
+
+mod service;
+
+pub use service::{MagService, ServiceError, ServiceEvent, SessionInfo, UserInput};
 
 macro_rules! define_id {
     ($(#[$meta:meta])* $name:ident) => {

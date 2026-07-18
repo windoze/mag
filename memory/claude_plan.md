@@ -131,3 +131,35 @@ Review 任务：核对 mag-core 已切到 facade `Agent`+`Agent::stream`（C1-3�
 - 验证全绿：fmt --check、clippy -D warnings、cargo test --workspace（9+5+1+1）、cargo doc；
   cargo tree -p mag-service 无 agent-lib；Cargo.lock/代码无 mag-protocol 残留。
 - 已标 TODO.md CS-1 [DONE] 并补完成记录。下一步：git 提交后停止。
+
+---
+
+## 任务 CS-2：定义 `MagService` trait（近全集）+ `ServiceEvent`
+
+### 目标与边界
+- 只在 `mag-service` 定义抽象：`MagService` trait + `ServiceError`/`ServiceEvent`/`UserInput`/`SessionInfo` 配套类型。
+- 不做 `Engine impl`（属 CS-3）。`SourceInfo` 已存在，直接复用。
+- trait 必须 object-safe（供 `Arc<dyn MagService>`），用 `#[async_trait]`。
+- `mag-service` 仍不得依赖 agent-lib（`cargo tree -p mag-service` 无 agent-lib）。
+
+### 决策
+- 新增 `crates/mag-service/src/service.rs` 模块，lib.rs `mod service; pub use service::*;`，保持已迁移文件历史与 protocol 类型不动（modular）。
+- `Cargo.toml` 增加 `async-trait`、`futures`（workspace 版本；均不引入 agent-lib）。
+- `ServiceEvent` 为中立事件枚举，变体与 `Event` 对齐（近全集），`#[serde(tag="type", rename_all="snake_case")]` + `#[non_exhaustive]`；附 `session_id()` 便于 subscribe 过滤（CS-3 用）。
+- `ServiceError`：`#[non_exhaustive]` 枚举 + serde + `Display`/`Error`。
+- `UserInput { text, attachments }`；`SessionInfo { id, config }`（中立，serde）。
+- `subscribe(Option<SessionId>) -> BoxStream<'static, ServiceEvent>`（`futures::stream::BoxStream`）。
+
+### 验证
+1. `cargo fmt --all -- --check`
+2. 聚焦 `cargo test -p mag-service`
+3. `cargo clippy --all-targets -- -D warnings`
+4. `cargo test --workspace`
+5. `cargo doc --no-deps --workspace`
+- 额外：`cargo tree -p mag-service` 无 agent-lib。
+- object-safe 编译期断言 + `Arc<dyn MagService>` 构造测试；`ServiceEvent` serde round-trip 测试。
+
+### 进度
+- 已定位首个未完成任务 CS-2，读毕 DESIGN §3.0、mag-service/lib.rs、mag-core engine/driver/event_bus。下一步：改 Cargo.toml、写 service.rs、接线 lib.rs。
+- 已实现 CS-2：新增 service.rs（MagService trait + ServiceEvent/ServiceError/UserInput/SessionInfo），lib.rs 接线导出，Cargo.toml 加 async-trait/futures。
+- 完整验证序列全绿；cargo tree -p mag-service 无 agent-lib。已将 TODO.md CS-2 标记 [DONE] 并补完成记录。下一步提交并停止。

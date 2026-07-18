@@ -463,7 +463,7 @@ C2–C5 直接对着 `MagService` trait 写、测试经 trait 调用。** 设计
   `cargo doc --no-deps --workspace`；`cargo tree -p mag-service` 依赖仅 serde/serde_json/uuid（agent-lib
   计数 0）。
 
-### [TODO] CS-2 定义 `MagService` trait（近全集）+ `ServiceEvent`
+### [DONE] CS-2 定义 `MagService` trait（近全集）+ `ServiceEvent`
 
 **上下文**：
 
@@ -488,6 +488,31 @@ C2–C5 直接对着 `MagService` trait 写、测试经 trait 调用。** 设计
 - 编译期断言 `MagService` object-safe（`fn _assert(_: &dyn MagService) {}` 或 `Arc<dyn MagService>` 构造）。
 - `ServiceEvent` serde round-trip 单元测试。
 - 完整验证序列 1–5。
+
+**完成记录（2026-07-18）**：
+
+- 新增 `crates/mag-service/src/service.rs` 模块，`lib.rs` 加 `mod service;` 并 `pub use` 导出
+  `MagService`/`ServiceError`/`ServiceEvent`/`SessionInfo`/`UserInput`；crate 级 rustdoc 更新为「trait +
+  中立类型载体，`mag-core::Engine` 为实现」。保持既有 protocol 类型与已迁移文件历史不动（modular 拆分）。
+- 定义 `#[async_trait]` object-safe `trait MagService: Send + Sync`，签名照 `docs/DESIGN.md` §3.0：
+  `create_session`/`list_sessions`/`resume_session`/`delete_session`/`send_message`/`cancel`/
+  `respond_interaction`/`subscribe(Option<SessionId>) -> BoxStream<'static, ServiceEvent>`/`list_sources`/
+  `probe_local_agents`。全部命令方法返回 `Result<_, ServiceError>`。
+- 配套类型：`ServiceEvent`（中立事件枚举，变体与 `Event` 对齐的近全集，`#[serde(tag="type",
+  rename_all="snake_case")]` + `#[non_exhaustive]`，附 `session_id()` 便于 subscribe 过滤）；`ServiceError`
+  （`#[non_exhaustive]` 枚举 + serde + `Display`/`Error`，含 `SessionNotFound`/`InteractionNotFound`/
+  `InvalidInput`/`Unsupported`/`Backend`）；`UserInput { text, attachments }`（含 `UserInput::text`）；
+  `SessionInfo { id, config }`（中立 serde）；`SourceInfo` 复用既有类型。均补 rustdoc，保持
+  `#![warn(missing_docs)]` 干净。
+- 依赖：`mag-service/Cargo.toml` 增加 `async-trait`、`futures`（workspace 版本）；`cargo tree -p mag-service`
+  agent-lib 计数 0（仍不依赖 agent-lib）。
+- 测试：编译期 `const _: fn()` object-safe 断言 + `DummyService` 经 `Arc<dyn MagService>` 调用（用
+  `futures::executor::block_on`，不引入 tokio）；`ServiceEvent` 全 13 变体 round-trip + 稳定 tag；
+  `session_id()` 分流；`ServiceError` round-trip/Display。
+- 完整验证序列全绿：`cargo fmt --all -- --check`、`cargo test -p mag-service`（9 用例）、
+  `cargo clippy --all-targets -- -D warnings`（干净）、`cargo test --workspace`（mag-core 9 + mag-service 9 +
+  mag-sources 1 + mag-tools 1，doctest 全绿）、`cargo doc --no-deps --workspace`。
+- 说明：本任务仅定义抽象，`Engine impl MagService` 与既有路径改经 trait 属 CS-3，未在此实现。
 
 ### [TODO] CS-3 `Engine impl MagService` + 既有路径改经 trait
 
