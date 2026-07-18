@@ -33,5 +33,8 @@ cargo test --workspace
 
 ## Usage
 
-At this stage the crates are empty skeletons. Subsequent tasks will add the
-transport-neutral `Command`/`Event` protocol and the `mag-core::Engine` API.
+`mag-core::Engine` implements the transport-neutral `MagService` trait: create
+sessions, stream chat turns, gate tool calls behind asynchronous approval, and
+persist/resume sessions. Use `Engine::with_persistence(client, tools, path)` for a
+durable SQLite-backed store whose committed snapshots survive a restart, or the
+in-memory `Engine::with_llm_client(client)` for ephemeral use.

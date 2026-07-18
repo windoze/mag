@@ -25,7 +25,10 @@ use std::{
     thread,
 };
 
-use agent_lib::{client::LlmClient, facade::FacadeError};
+use agent_lib::{
+    client::LlmClient,
+    facade::{AgentSnapshot, FacadeError},
+};
 use mag_service::{
     Event, InteractionResponseWire, RequestId, RunId, ServiceError, SessionConfig, SessionId,
 };
@@ -40,6 +43,7 @@ use crate::{
     EventBus,
     driver::SessionDriver,
     engine::approval::{AskFrontendDecider, IpcApproval},
+    persistence::Persistence,
 };
 
 /// A cloneable, one-shot cancellation flag shared between a run task and the
@@ -136,6 +140,9 @@ struct SessionActor {
     /// Shared approval handler: injected into the driver's agent and used here to
     /// resolve `RespondInteraction` commands (`docs/DESIGN.md` §3.3).
     approval: Arc<IpcApproval>,
+    /// Durable store: each committed run writes its snapshot here (`docs/DESIGN.md`
+    /// §3.6).
+    store: Arc<Persistence>,
     /// Cancel handle for the active run, present only while a run is in flight.
     cancel: Option<CancelToken>,
     /// Commands received while a run was active, replayed once it finishes.
@@ -153,6 +160,7 @@ impl SessionActor {
         events: EventBus,
         driver: Result<SessionDriver, FacadeError>,
         approval: Arc<IpcApproval>,
+        store: Arc<Persistence>,
     ) -> Self {
         let (run_done_tx, run_done_rx) = mpsc::unbounded_channel();
         let state = match driver {
@@ -164,6 +172,7 @@ impl SessionActor {
             events,
             state,
             approval,
+            store,
             cancel: None,
             deferred: VecDeque::new(),
             run_done_tx,
@@ -265,10 +274,13 @@ impl SessionActor {
         // parked on a pending approval (`docs/DESIGN.md` §3.3).
         self.approval.arm_cancel(cancel.clone());
         let events = self.events.clone();
+        let store = self.store.clone();
         let run_done = self.run_done_tx.clone();
         let session_id = self.session_id;
         tokio::task::spawn_local(async move {
-            driver.run_turn(session_id, text, &events, &cancel).await;
+            driver
+                .run_turn(session_id, text, &events, &cancel, &store)
+                .await;
             // Hand the driver back so the session can start its next run.
             let _ = run_done.send(driver);
         });
@@ -277,12 +289,20 @@ impl SessionActor {
 
 /// Body of a session's dedicated thread: a `current_thread` runtime plus a
 /// [`LocalSet`] that drives the actor and its (non-`Send`) run tasks.
+///
+/// When `restore` is `Some`, the session's facade agent is rebuilt from the
+/// persisted [`AgentSnapshot`] (re-injecting the client, tools, and approval
+/// handler a snapshot deliberately omits); when `None`, a fresh agent is built
+/// from `config` (`docs/DESIGN.md` §3.6).
+#[allow(clippy::too_many_arguments)]
 fn session_thread(
     session_id: SessionId,
     config: SessionConfig,
     client: Arc<dyn LlmClient>,
     tools: Arc<ToolRegistry>,
     event_bus: EventBus,
+    store: Arc<Persistence>,
+    restore: Option<AgentSnapshot>,
     commands: mpsc::UnboundedReceiver<SessionCommand>,
 ) {
     let runtime = Builder::new_current_thread()
@@ -297,8 +317,11 @@ fn session_thread(
         event_bus.clone(),
         Arc::new(AskFrontendDecider),
     ));
-    let driver = SessionDriver::new(&config, client, &tools, approval.clone());
-    let actor = SessionActor::new(session_id, event_bus, driver, approval);
+    let driver = match restore {
+        Some(snapshot) => SessionDriver::restore(client, &tools, approval.clone(), snapshot),
+        None => SessionDriver::new(&config, client, &tools, approval.clone()),
+    };
+    let actor = SessionActor::new(session_id, event_bus, driver, approval, store);
     local.block_on(&runtime, actor.run(commands));
 }
 
@@ -318,22 +341,26 @@ pub(crate) struct SessionManager {
     client: Option<Arc<dyn LlmClient>>,
     tools: Arc<ToolRegistry>,
     event_bus: EventBus,
+    store: Arc<Persistence>,
     handles: Mutex<HashMap<SessionId, SessionHandle>>,
 }
 
 impl SessionManager {
     /// Creates a manager bound to `event_bus`, spawning actors only when a
     /// `client` is present. Each spawned session assembles its agent with the
-    /// shared `tools` registry (`docs/DESIGN.md` §3.2).
+    /// shared `tools` registry (`docs/DESIGN.md` §3.2) and persists its committed
+    /// snapshots to `store` (`docs/DESIGN.md` §3.6).
     pub(crate) fn new(
         client: Option<Arc<dyn LlmClient>>,
         tools: Arc<ToolRegistry>,
         event_bus: EventBus,
+        store: Arc<Persistence>,
     ) -> Self {
         Self {
             client,
             tools,
             event_bus,
+            store,
             handles: Mutex::new(HashMap::new()),
         }
     }
@@ -343,16 +370,61 @@ impl SessionManager {
     /// A no-op when the manager has no client. The command sender is registered
     /// synchronously, so a later `send_message` never races the actor thread.
     pub(crate) fn create_session(&self, session_id: SessionId, config: SessionConfig) {
+        self.spawn_session(session_id, config, None);
+    }
+
+    /// Spawns the actor thread for a persisted session, rebuilding its agent from
+    /// `snapshot` when one was captured (`docs/DESIGN.md` §3.6).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError::Backend`] when the manager has no client and so
+    /// cannot host a session actor.
+    pub(crate) fn resume_session(
+        &self,
+        session_id: SessionId,
+        config: SessionConfig,
+        snapshot: Option<AgentSnapshot>,
+    ) -> Result<(), ServiceError> {
+        if self.client.is_none() {
+            return Err(ServiceError::Backend {
+                message: "no LLM client configured".to_owned(),
+            });
+        }
+        self.spawn_session(session_id, config, snapshot);
+        Ok(())
+    }
+
+    /// Spawns and registers one session actor thread, fresh or restored.
+    ///
+    /// A no-op when the manager has no client, mirroring the engine's clientless
+    /// behaviour.
+    fn spawn_session(
+        &self,
+        session_id: SessionId,
+        config: SessionConfig,
+        restore: Option<AgentSnapshot>,
+    ) {
         let Some(client) = self.client.clone() else {
             return;
         };
         let tools = self.tools.clone();
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let event_bus = self.event_bus.clone();
+        let store = self.store.clone();
         let thread = thread::Builder::new()
             .name(format!("mag-session-{session_id}"))
             .spawn(move || {
-                session_thread(session_id, config, client, tools, event_bus, commands_rx)
+                session_thread(
+                    session_id,
+                    config,
+                    client,
+                    tools,
+                    event_bus,
+                    store,
+                    restore,
+                    commands_rx,
+                )
             })
             .expect("spawn mag session thread");
         self.handles.lock().expect("session handles lock").insert(

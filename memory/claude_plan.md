@@ -1,40 +1,47 @@
-# Claude 执行计划 — C3-R Review：工具 + 审批正确性（重点）
+# Claude 执行计划 — C4-1 持久化层 + snapshot/restore
 
 ## 当前任务
-`TODO.md` 首个未完成任务：**C3-R Review：工具 + 审批正确性（重点）**（行 880）。
+`TODO.md` 首个未完成任务：**[TODO] C4-1 持久化层 + snapshot/restore**（行 937）。
 
-### 任务要求
-**做什么**：重点核对审批暂停语义（machine 真停到 resolve，非 facade 式先 emit 再同步决策）；工具
-worktree/cancel 约束生效；`PermissionDecider` 钩子留位正确（§8.1）；auto/ask 策略与 plugin 元数据一致。汇总缺口。
+### 目标（DESIGN §3.6 / PLAN R-D / R-B）
+- SQLite 持久层：建表 + save_session/load_session/list_sessions/delete_session +
+  save_snapshot/load_snapshot。snapshot 存 facade Agent::snapshot() 的 JSON blob。
+- actor 每次 run 成功结束（committed 一致点）后取快照写库。
+- resume_session：读快照 → Agent::restore() 重注入 provider/工具/approval（IpcApproval 经
+  interaction_handler 重注入，R-B 已满足）→ 会话可继续。
 
-**验证条件**：完整验证序列 1–5 全绿；审批三路径（approve/deny/cancel）+ auto/ask 均有测试。
+## 设计
+- 新模块 crates/mag-core/src/persistence.rs：Persistence（Mutex<rusqlite::Connection>，Arc 共享）
+  + PersistenceError（公开）。schema：schema_meta(version)、sessions(id PK, config_json, created_at)、
+  snapshots(session_id PK, agent_snapshot_json, committed_at)（latest-only）。
+  依赖 rusqlite 0.32 features=["bundled"]。
+- driver.rs：抽 tool/policy helper；新 restore 构造器；run_turn 增 store 参数，committed 时先
+  snapshot 写库再 emit RunFinished（观测到 RunFinished ⟹ 快照已落库）。失败/取消不快照。
+- session.rs：actor/session_thread/manager 增 store；session_thread 增 Option<AgentSnapshot>；
+  manager::resume_session spawn 恢复线程。
+- engine.rs：EngineInner 增 store；新增公开 Engine::with_persistence(client, tools, path)；
+  create_session 持久化 config + 构造时按 DB 最大 session id 播种计数器；resume_session 读+restore+spawn；
+  delete_session 删库。
+- lib.rs：mod persistence + pub use PersistenceError。README 补一句。
 
-## 审查清单（逐项核对）
-1. [ ] 审批暂停语义：IpcApproval::fulfill 真正 .await park 到 resolve，而非 facade 同步「先 emit 再决策」。
-2. [ ] 工具 worktree 约束：safe_join/path 归一，禁 .. 逃逸与绝对路径。
-3. [ ] 工具 cancel 约束：shell cancel token → 中断子进程。
-4. [ ] PermissionDecider 钩子留位（§8.1）：trait + 默认 AskFrontendDecider 正确。
-5. [ ] auto/ask 策略与 plugin permission() 元数据一致：read/list/grep auto-allow、shell ask。
-6. [ ] 三路径测试覆盖：approve / deny / cancel。
-7. [ ] auto/ask 均有测试。
-8. [ ] 汇总前向缺口（非阻塞）。
-
-## 验证序列
-1. cargo fmt --all -- --check
-2. 聚焦测试（审批 + tool_turn）
-3. cargo clippy --all-targets -- -D warnings
-4. cargo test --workspace
-5. cargo doc --no-deps --workspace
+## 验证条件
+1. run 后 snapshot 写库；load_snapshot round-trip 与内存态一致。
+2. 跨重启纯对话：A 两轮→快照→丢 Engine→新 Engine resume→第三轮见前两轮上下文；id 不冲突。
+3. snapshot JSON 不含凭据/secret。
+4. 跨重启需审批：committed 快照→resume 重注入 IpcApproval→审批走跨进程往返。
+5. 聚焦 cargo test -p mag-core persist。
+6. 完整序列 fmt→clippy→test--workspace→doc。
 
 ## 进度
-- [进行中] 阅读 C3 源码（approval.rs / driver.rs / plugin.rs / registry.rs / tools / path.rs）。
+- [完成] persistence.rs（Persistence + PersistenceError + 6 单测）。
+- [完成] driver.rs restore + committed snapshot（先落库再 emit RunFinished）。
+- [完成] session.rs actor/manager/session_thread 贯穿 store + resume_session/spawn_session。
+- [完成] engine.rs with_persistence/resume_session/delete/list + SessionIdSource 续种。
+- [完成] engine::persist 跨重启测试 4 个（含需审批会话）。
+- [完成] fmt 干净；clippy -D warnings 零告警；cargo test --workspace 全绿
+  （mag-core 46 / mag-service 10 / mag-sources 1 / mag-tools 6 + builtin_tools 13）；doc 通过。
+- [完成] TODO.md C4-1 标 [DONE] + 完成记录；README Usage 更新。
+- 下一步：提交并停（不进 C4-2）。
 
 ## 处置原则
-- 纯 review 任务；若发现 spec mismatch/bug 则在当前任务修复或插入最小前置任务。
-- 若无阻塞缺口，核对 + 跑全序列 + 写完成记录 + 标 [DONE] + 提交。
-
-## 结果（2026-07-19）
-- C3-R 纯 review 完成：审查清单 1–8 全部核对通过，无阻塞缺口/spec 偏离，未改源码。
-- 关键确认：SessionActor::run 对 RespondInteraction 在 run 在飞时即时路由 → parked driver 必唤醒（无死锁不变量）。
-- 验证序列 1–5 全绿：fmt ✓ / approval 11 + tool_turn 3 ✓ / clippy 0 警告 ✓ / workspace（core 34, service 10, sources 1, tools 6+13）✓ / doc 无警告 ✓。
-- TODO.md 已把 C3-R 标 [DONE] 并补完成记录。下一未完成任务：C4-1 持久化层 + snapshot/restore。
+- 无 workaround；spec mismatch 则修或插最小前置任务。完成后标 [DONE]+补记录+提交+停。

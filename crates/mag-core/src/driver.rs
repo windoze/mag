@@ -29,7 +29,7 @@ use agent_lib::{
     agent::InteractionHandler,
     client::LlmClient,
     facade::{
-        Agent, ApprovalPolicy, FacadeError, Tool, ToolContext, ToolResult,
+        Agent, AgentSnapshot, ApprovalPolicy, FacadeError, Tool, ToolContext, ToolResult,
         ToolTrace as FacadeToolTrace, UsageSummary, WireRunEvent, WireRunOutput,
     },
 };
@@ -41,7 +41,9 @@ use mag_tools::{ToolPlugin, ToolRegistry};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::{EventBus, engine::approval::IpcApproval, session::CancelToken};
+use crate::{
+    EventBus, engine::approval::IpcApproval, persistence::Persistence, session::CancelToken,
+};
 
 const DEFAULT_MAX_TOKENS: u32 = 512;
 const DEFAULT_MAX_STEPS: u32 = 8;
@@ -76,25 +78,55 @@ impl SessionDriver {
         tools: &ToolRegistry,
         approval: Arc<IpcApproval>,
     ) -> Result<Self, FacadeError> {
+        let (facade_tools, policy) = tool_surface(tools);
         let mut builder = Agent::builder()
             .client(client)
             .model(config.model.clone())
             .max_tokens(DEFAULT_MAX_TOKENS)
             .max_steps(DEFAULT_MAX_STEPS)
             .interaction_handler(approval as Arc<dyn InteractionHandler>);
-
-        // Register each tool and gate the ones carrying a permission spec: a
-        // gated tool pauses through the injected `IpcApproval`, while a
-        // permission-free tool (read-only, `permission() == None`) stays on the
-        // default auto-allow tier and runs without interrupting the user.
-        let mut policy = ApprovalPolicy::default();
-        for plugin in tools.plugins() {
-            if plugin.permission().is_some() {
-                policy = policy.ask_tool(plugin.name());
-            }
-            builder = builder.tool(facade_tool(Arc::clone(plugin)));
+        for tool in facade_tools {
+            builder = builder.tool(tool);
         }
+        let agent = builder.approval(policy).build()?;
 
+        Ok(Self {
+            agent,
+            run_counter: AtomicU64::new(1),
+        })
+    }
+
+    /// Rebuilds a session's facade [`Agent`] from a persisted [`AgentSnapshot`].
+    ///
+    /// A snapshot is data-only (`docs/DESIGN.md` §3.6): the LLM `client`, the
+    /// executable `tools`, the [`ApprovalPolicy`], and the [`IpcApproval`]
+    /// interaction handler are all runtime handles the snapshot deliberately
+    /// omits, so they are re-injected here exactly as [`new`](Self::new) supplies
+    /// them for a fresh agent. Re-injecting the shared [`IpcApproval`] keeps a
+    /// restored session on the cross-process approval path (`PLAN.md` R-B); the
+    /// restored [`AgentState`](agent_lib::agent) carries the conversation, model,
+    /// and loop policy, so a resumed run continues exactly where the snapshot left
+    /// off. The gated-tool policy is re-derived from the same `tools` registry so
+    /// a restored session pauses on the same tools it did before.
+    ///
+    /// # Errors
+    ///
+    /// Returns any [`FacadeError`] raised while rebuilding the agent (for example
+    /// a snapshot whose state cannot be deserialized).
+    pub(crate) fn restore(
+        client: Arc<dyn LlmClient>,
+        tools: &ToolRegistry,
+        approval: Arc<IpcApproval>,
+        snapshot: AgentSnapshot,
+    ) -> Result<Self, FacadeError> {
+        let (facade_tools, policy) = tool_surface(tools);
+        let mut builder = Agent::restore()
+            .snapshot(snapshot)
+            .client(client)
+            .interaction_handler(approval as Arc<dyn InteractionHandler>);
+        for tool in facade_tools {
+            builder = builder.tool(tool);
+        }
         let agent = builder.approval(policy).build()?;
 
         Ok(Self {
@@ -122,12 +154,22 @@ impl SessionDriver {
     /// event is emitted; agent-lib abandons the in-flight turn on drop, so the
     /// agent's committed history is unchanged and the driver stays reusable for
     /// the next turn.
+    ///
+    /// A run that completes cleanly reaches a **committed consistency point**, the
+    /// only point at which the agent can be snapshotted (`docs/DESIGN.md` §3.6).
+    /// The committed [`AgentSnapshot`] is persisted to `store` *before*
+    /// [`RunFinished`](Event::RunFinished) is emitted, so any observer that sees
+    /// the terminal event can rely on the durable snapshot already being written.
+    /// A cancelled or failed turn is not snapshotted: its committed history is
+    /// unchanged from the prior committed point, whose snapshot (if any) is
+    /// already durable.
     pub(crate) async fn run_turn(
         &mut self,
         session_id: SessionId,
         text: String,
         events: &EventBus,
         cancel: &CancelToken,
+        store: &Persistence,
     ) {
         let mut stream = match self.agent.stream(text).await {
             Ok(stream) => stream,
@@ -165,10 +207,14 @@ impl SessionDriver {
 
         let terminal = match outcome {
             TurnOutcome::Completed => match final_output {
-                Some(output) => Event::RunFinished {
-                    id: session_id,
-                    output,
-                },
+                Some(output) => {
+                    // Persist the committed snapshot before announcing completion.
+                    self.persist_committed_snapshot(session_id, store);
+                    Event::RunFinished {
+                        id: session_id,
+                        output,
+                    }
+                }
                 None => Event::RunError {
                     id: session_id,
                     message: "agent stream ended without a terminal `Done` event".to_owned(),
@@ -184,6 +230,19 @@ impl SessionDriver {
             },
         };
         let _ = events.emit(terminal);
+    }
+
+    /// Captures the agent's committed [`AgentSnapshot`] and writes it to `store`.
+    ///
+    /// Persistence is best-effort: a snapshot or store failure is swallowed so it
+    /// never turns an otherwise successful run into an error. At a committed point
+    /// [`Agent::snapshot`](agent_lib::facade::Agent::snapshot) is expected to
+    /// succeed; if it cannot, the previous committed snapshot (if any) stays the
+    /// latest durable state.
+    fn persist_committed_snapshot(&self, session_id: SessionId, store: &Persistence) {
+        if let Ok(snapshot) = self.agent.snapshot() {
+            let _ = store.save_snapshot(session_id, &snapshot);
+        }
     }
 
     /// Mints the next envelope run identity for this session.
@@ -246,6 +305,27 @@ fn map_wire_event(
         // (see the function docs); every remaining variant is out of scope here.
         _ => None,
     }
+}
+
+/// Projects a [`ToolRegistry`] into the facade tool surface and its approval
+/// policy shared by [`SessionDriver::new`] and [`SessionDriver::restore`].
+///
+/// Each plugin becomes a facade [`Tool`]; a plugin declaring a
+/// [`permission`](ToolPlugin::permission) is additionally gated behind
+/// [`ApprovalPolicy::ask_tool`] so it pauses through the injected
+/// [`IpcApproval`](crate::engine::approval::IpcApproval), while a permission-free
+/// (read-only) plugin stays on the default auto-allow tier and never interrupts
+/// the run (`docs/DESIGN.md` §3.2/§3.3).
+fn tool_surface(tools: &ToolRegistry) -> (Vec<Tool>, ApprovalPolicy) {
+    let mut policy = ApprovalPolicy::default();
+    let mut facade_tools = Vec::new();
+    for plugin in tools.plugins() {
+        if plugin.permission().is_some() {
+            policy = policy.ask_tool(plugin.name());
+        }
+        facade_tools.push(facade_tool(Arc::clone(plugin)));
+    }
+    (facade_tools, policy)
 }
 
 /// Projects one facade [`Tool`] from a [`ToolPlugin`].

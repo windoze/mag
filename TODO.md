@@ -934,7 +934,7 @@ worktree/cancel 约束生效；`PermissionDecider` 钩子留位正确（§8.1）
 
 目标：SQLite，committed 一致点取 `AgentState` snapshot，`ResumeSession` 重装配；凭据 store 不进 snapshot。
 
-### [TODO] C4-1 持久化层 + snapshot/restore
+### [DONE] C4-1 持久化层 + snapshot/restore
 
 **上下文**：
 
@@ -967,6 +967,53 @@ worktree/cancel 约束生效；`PermissionDecider` 钩子留位正确（§8.1）
   scripted handler 断言 restore 后审批暂停点仍在 handler 侧应答，而非同步 `FacadeApproval`）。
 - 聚焦：`cargo test -p mag-core persist`。
 - 完整验证序列 1–5。
+
+**完成记录（2026-07-19）**：
+
+- **持久层 `crates/mag-core/src/persistence.rs`（新）**：`Persistence` 包 `Mutex<rusqlite::Connection>`
+  （`rusqlite = { version = "0.32", features = ["bundled"] }`，随包内建 SQLite，离线可编译）。`open(path)` /
+  `in_memory()` → `from_connection` 建表并写 `schema_meta(version=1)`。schema 只存稳定列：
+  `sessions(id TEXT PK, config_json, created_at)`、`snapshots(session_id TEXT PK, agent_snapshot_json,
+  committed_at, FK→sessions ON DELETE CASCADE)`。方法 `save_session`/`load_session`/`list_sessions`（按
+  `created_at` 升序）/`delete_session`/`save_snapshot`/`load_snapshot`/`max_session_id_value`。snapshot 以
+  facade `Agent::snapshot() -> AgentSnapshot` 的 serde JSON blob 落库（R-D）。公开 `PersistenceError`
+  （Sqlite/Serde/InvalidSessionId）。
+
+- **committed 点取快照（§3.6，非 run 中途）**：`driver.rs` 抽出 `tool_surface()` 复用于 `new`/`restore`；
+  `run_turn(store)` 在 drive loop 结束、`drop(stream)` 之后、仅当 `Completed` 有 output 时于**发
+  `RunFinished` 之前**调 `persist_committed_snapshot`（rusqlite autocommit 同步落库），保证观察到
+  `RunFinished` 的一方必已见到耐久快照，避开「drop Engine 取消在飞 run 致半写」竞态。失败/取消的 run 不取
+  快照（facade 丢弃在飞 turn，committed 历史不变，旧快照仍是最新）。
+
+- **`ResumeSession` 重装配（R-B 已满足）**：`SessionDriver::restore(client, tools, approval, snapshot)` 经
+  `Agent::restore()` 重注入 provider/工具（按名匹配 snapshot 声明）/approval **且**
+  `interaction_handler(Arc<IpcApproval>)`——snapshot 为 data-only 不带句柄，恢复必须重注入方跨进程审批；否则
+  才回落同步 `FacadeApproval`。`AgentState` 已存 model/max_tokens/max_steps/loop/会话历史，故 restore 不再设
+  model。`engine.rs` 的 `EngineInner` 携 `Arc<Persistence>`；构造期由 `max_session_id_value` 续种
+  `SessionIdSource`（种到 `max_u128 + 1`），跨重启新会话 id 不撞已存 id。`create_session` 先落 config；
+  `list_sessions` 改读耐久 store（含未 resume 的会话）；`resume_session` 读 config（缺→`SessionNotFound`）→读
+  snapshot→已活跃则 no-op→入表→`manager.resume_session`（失败回滚）；`delete_session` 同步删库。
+
+- **验证条件逐项**（`crates/mag-core/src/{persistence.rs,engine.rs}`）：
+  - 单测 run 后 snapshot 写库 + round-trip：`persistence::tests::save_and_load_snapshot_round_trips_with_in_memory_state`
+    与 `engine::persist::committed_run_persists_a_snapshot_to_the_store`（run 前 `load_snapshot` 为 `None`，
+    committed run 后为 `Some`）。
+  - 跨「重启」纯对话会话：`engine::persist::resume_after_restart_continues_conversation_with_prior_context`
+    ——engine1 跑两轮→`drop`→engine2 同库 `resume_session`→第三轮 `send_message`；断言 client2 的请求消息含
+    「hi/first/again/second/third」全部前文；且新 `create_session` id ≠ 且大于已存 id（续号无冲突）。
+  - snapshot 无凭据：`persistence::tests::stored_snapshot_json_contains_no_credentials` +
+    `engine::persist::snapshot_written_by_a_run_contains_no_credentials`（断言 JSON 不含
+    api_key/secret/credential/password 等）。
+  - 跨「重启」需审批会话（R-B）：`engine::persist::resumed_approval_session_still_pauses_through_ipc_approval`
+    ——engine1 带 gated `shell` 跑一 committed 文本轮→`drop`→engine2 `resume_session`→触发 gated 工具，断言
+    仍发 `InteractionRequested`（证明 `IpcApproval` 已重注入，非同步 `FacadeApproval` 回落）→
+    `respond_interaction(Approve)`→`ToolStarted`/`RunFinished`。
+  - 聚焦 `cargo test -p mag-core persist`：10 passed（含 persistence 6 + engine::persist 4）。
+
+- **完整验证序列**：`cargo fmt --all` 干净；`cargo clippy --all-targets -- -D warnings` 零告警（修
+  persistence 测试 `assert_eq!(.., true)`→`assert!`）；`cargo test --workspace` 全绿（mag-core 46 / mag-service
+  10 / mag-sources 1 / mag-tools 6 + builtin_tools 13）；`cargo doc --no-deps --workspace` 通过。README「Usage」
+  更新为反映 `Engine::with_persistence` 耐久用法。
 
 ### [TODO] C4-2 凭据存储（`mag-sources`）
 

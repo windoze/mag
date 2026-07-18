@@ -3,6 +3,7 @@
 use std::{
     collections::BTreeMap,
     fmt,
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -20,7 +21,11 @@ use mag_tools::ToolRegistry;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::{EventBus, session::SessionManager};
+use crate::{
+    EventBus,
+    persistence::{Persistence, PersistenceError},
+    session::SessionManager,
+};
 
 pub(crate) mod approval;
 
@@ -44,15 +49,21 @@ impl Engine {
     /// start runs; [`send_message`](MagService::send_message) reports a
     /// [`ServiceError::Backend`] until [`with_llm_client`](Engine::with_llm_client)
     /// is used instead.
+    ///
+    /// Persistence is backed by a private in-memory SQLite database, so session
+    /// metadata and snapshots live only as long as the engine (`docs/DESIGN.md`
+    /// §3.6). Use [`with_persistence`](Engine::with_persistence) for a durable
+    /// store that survives a restart.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            inner: Arc::new(EngineInner::new(None, Arc::new(ToolRegistry::new()))),
-        }
+        Self::assemble(None, Arc::new(ToolRegistry::new()), in_memory_store())
     }
 
     /// Creates an engine that drives chat turns through `client`, exposing the
     /// built-in minimal tool set (`docs/DESIGN.md` §3.2/§7).
+    ///
+    /// Persistence is in-memory; see [`with_persistence`](Engine::with_persistence)
+    /// for a durable store.
     #[must_use]
     pub fn with_llm_client(client: Arc<dyn LlmClient>) -> Self {
         Self::with_llm_client_and_tools(client, ToolRegistry::with_builtins())
@@ -63,11 +74,44 @@ impl Engine {
     ///
     /// This is the injection point used to supply a custom or test tool surface;
     /// [`with_llm_client`](Engine::with_llm_client) is the production default that
-    /// installs the built-in tool set.
+    /// installs the built-in tool set. Persistence is in-memory; see
+    /// [`with_persistence`](Engine::with_persistence) for a durable store.
     #[must_use]
     pub fn with_llm_client_and_tools(client: Arc<dyn LlmClient>, tools: ToolRegistry) -> Self {
+        Self::assemble(Some(client), Arc::new(tools), in_memory_store())
+    }
+
+    /// Creates an engine whose sessions and committed snapshots are persisted to a
+    /// SQLite database at `path`, so a session survives a process restart
+    /// (`docs/DESIGN.md` §3.6).
+    ///
+    /// On construction the engine seeds its session-id counter past every id
+    /// already stored, so freshly created sessions never collide with persisted
+    /// ones. A session persisted by an earlier process is made live again through
+    /// [`resume_session`](MagService::resume_session), which reloads the latest
+    /// snapshot and rebuilds the session's agent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError`] when the database cannot be opened or its
+    /// schema cannot be applied.
+    pub fn with_persistence(
+        client: Arc<dyn LlmClient>,
+        tools: ToolRegistry,
+        path: impl AsRef<Path>,
+    ) -> Result<Self, PersistenceError> {
+        let store = Arc::new(Persistence::open(path)?);
+        Ok(Self::assemble(Some(client), Arc::new(tools), store))
+    }
+
+    /// Assembles an engine over an already-opened persistence store.
+    fn assemble(
+        client: Option<Arc<dyn LlmClient>>,
+        tools: Arc<ToolRegistry>,
+        store: Arc<Persistence>,
+    ) -> Self {
         Self {
-            inner: Arc::new(EngineInner::new(Some(client), Arc::new(tools))),
+            inner: Arc::new(EngineInner::new(client, tools, store)),
         }
     }
 }
@@ -75,12 +119,19 @@ impl Engine {
 #[async_trait]
 impl MagService for Engine {
     async fn create_session(&self, config: SessionConfig) -> Result<SessionId, ServiceError> {
-        let id = {
+        let id = self.inner.session_ids.next_id();
+
+        // Persist the session config before it becomes live so a restart can find
+        // and resume it (`docs/DESIGN.md` §3.6).
+        self.inner
+            .store
+            .save_session(id, &config)
+            .map_err(persistence_backend)?;
+
+        {
             let mut sessions = self.inner.sessions.lock().await;
-            let id = self.inner.session_ids.next_id();
             sessions.insert(id, config.clone());
-            id
-        };
+        }
 
         self.inner.manager.create_session(id, config.clone());
 
@@ -93,20 +144,49 @@ impl MagService for Engine {
     }
 
     async fn list_sessions(&self) -> Result<Vec<SessionInfo>, ServiceError> {
-        let sessions = self.inner.sessions.lock().await;
-        Ok(sessions
-            .iter()
-            .map(|(id, config)| SessionInfo {
-                id: *id,
-                config: config.clone(),
-            })
-            .collect())
+        // The durable store is the source of truth for known sessions, so the
+        // listing includes sessions persisted by an earlier process that have not
+        // been resumed yet (`docs/DESIGN.md` §3.6).
+        self.inner
+            .store
+            .list_sessions()
+            .map_err(persistence_backend)
     }
 
-    async fn resume_session(&self, _id: SessionId) -> Result<(), ServiceError> {
-        Err(ServiceError::Unsupported {
-            operation: "resume_session".to_owned(),
-        })
+    async fn resume_session(&self, id: SessionId) -> Result<(), ServiceError> {
+        // Load the persisted config and latest committed snapshot before making
+        // the session live again (`docs/DESIGN.md` §3.6). An unknown session id
+        // has no stored config, so it is reported as not found.
+        let config = self
+            .inner
+            .store
+            .load_session(id)
+            .map_err(persistence_backend)?
+            .ok_or(ServiceError::SessionNotFound { id })?;
+        let snapshot = self
+            .inner
+            .store
+            .load_snapshot(id)
+            .map_err(persistence_backend)?;
+
+        {
+            let mut sessions = self.inner.sessions.lock().await;
+            if sessions.contains_key(&id) {
+                // Already live: resuming an active session is a no-op.
+                return Ok(());
+            }
+            sessions.insert(id, config.clone());
+        }
+
+        // Rebuild the session's agent from the snapshot (re-injecting client,
+        // tools, and the `IpcApproval` handler). A missing snapshot resumes the
+        // session with empty history — the same shape a freshly created session
+        // has before its first run.
+        if let Err(error) = self.inner.manager.resume_session(id, config, snapshot) {
+            self.inner.sessions.lock().await.remove(&id);
+            return Err(error);
+        }
+        Ok(())
     }
 
     async fn delete_session(&self, id: SessionId) -> Result<(), ServiceError> {
@@ -117,6 +197,10 @@ impl MagService for Engine {
             }
         }
         self.inner.manager.delete_session(id);
+        self.inner
+            .store
+            .delete_session(id)
+            .map_err(persistence_backend)?;
         Ok(())
     }
 
@@ -196,19 +280,49 @@ struct EngineInner {
     sessions: Mutex<BTreeMap<SessionId, SessionConfig>>,
     event_bus: EventBus,
     session_ids: SessionIdSource,
+    store: Arc<Persistence>,
     manager: SessionManager,
 }
 
 impl EngineInner {
-    fn new(client: Option<Arc<dyn LlmClient>>, tools: Arc<ToolRegistry>) -> Self {
+    fn new(
+        client: Option<Arc<dyn LlmClient>>,
+        tools: Arc<ToolRegistry>,
+        store: Arc<Persistence>,
+    ) -> Self {
         let event_bus = EventBus::new();
-        let manager = SessionManager::new(client, tools, event_bus.clone());
+        // Seed the id counter past every persisted session so a restarted engine
+        // never re-mints an id that already exists in the store (`docs/DESIGN.md`
+        // §3.6).
+        let session_ids = match store.max_session_id_value() {
+            Ok(Some(max)) => {
+                let next = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
+                SessionIdSource::starting_at(next)
+            }
+            _ => SessionIdSource::new(),
+        };
+        let manager = SessionManager::new(client, tools, event_bus.clone(), store.clone());
         Self {
             sessions: Mutex::new(BTreeMap::new()),
             event_bus,
-            session_ids: SessionIdSource::new(),
+            session_ids,
+            store,
             manager,
         }
+    }
+}
+
+/// Opens a private in-memory persistence store for the non-durable engine
+/// constructors, panicking only if SQLite cannot open an in-memory database
+/// (which does not happen in practice).
+fn in_memory_store() -> Arc<Persistence> {
+    Arc::new(Persistence::in_memory().expect("open in-memory persistence store"))
+}
+
+/// Maps a [`PersistenceError`] into a service-level [`ServiceError::Backend`].
+fn persistence_backend(error: PersistenceError) -> ServiceError {
+    ServiceError::Backend {
+        message: error.to_string(),
     }
 }
 
@@ -227,6 +341,14 @@ impl SessionIdSource {
     fn new() -> Self {
         Self {
             counter: AtomicU64::new(1),
+        }
+    }
+
+    /// Creates a source whose first minted id encodes `next` (clamped to at least
+    /// 1). Used to continue past a restored store's highest session id.
+    fn starting_at(next: u64) -> Self {
+        Self {
+            counter: AtomicU64::new(next.max(1)),
         }
     }
 
@@ -338,17 +460,7 @@ mod skeleton {
     #[tokio::test]
     async fn unimplemented_methods_return_unsupported() {
         let engine = Engine::new();
-        let id = engine
-            .create_session(config("model-a"))
-            .await
-            .expect("create session");
 
-        assert_eq!(
-            engine.resume_session(id).await,
-            Err(ServiceError::Unsupported {
-                operation: "resume_session".to_owned(),
-            })
-        );
         assert_eq!(
             engine.list_sources().await,
             Err(ServiceError::Unsupported {
@@ -361,6 +473,35 @@ mod skeleton {
                 operation: "probe_local_agents".to_owned(),
             })
         );
+    }
+
+    #[tokio::test]
+    async fn resume_unknown_session_reports_session_not_found() {
+        // Nothing is persisted for a never-created id, so resuming it is a
+        // not-found rather than the retired `Unsupported`.
+        let engine = Engine::new();
+        let missing = SessionId::new(Uuid::from_u128(7777));
+
+        assert_eq!(
+            engine.resume_session(missing).await,
+            Err(ServiceError::SessionNotFound { id: missing })
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_active_session_is_a_noop() {
+        // A clientless engine still tracks the session in memory, so resuming an
+        // already-live session succeeds without spawning a duplicate actor.
+        let engine = Engine::new();
+        let id = engine
+            .create_session(config("model-a"))
+            .await
+            .expect("create session");
+
+        engine
+            .resume_session(id)
+            .await
+            .expect("resume active session");
     }
 
     #[tokio::test]
@@ -1229,6 +1370,416 @@ mod tool_turn {
                 ServiceEvent::RunFinished { id, .. } if *id == session
             ),
             "the auto-allowed turn must finish: {rest:?}",
+        );
+    }
+}
+
+#[cfg(test)]
+mod persist {
+    //! Cross-"restart" persistence and restore tests driven through the public
+    //! [`MagService`] surface (`docs/DESIGN.md` §3.6, C4-1).
+    //!
+    //! Each test opens a temporary file-backed SQLite database, drives a session
+    //! on one engine, drops that engine (the "restart"), then opens a second
+    //! engine over the same database and resumes the session. Everything runs
+    //! offline through a scripted [`FakeLlmClient`]; no network, real credentials,
+    //! or real filesystem tools are involved.
+
+    use std::{
+        path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use agent_lib::{
+        client::LlmClient,
+        facade::{ToolContext, ToolResult},
+        model::{tool::Tool, usage::Usage},
+    };
+    use async_trait::async_trait;
+    use futures::stream::BoxStream;
+    use mag_service::{
+        ApprovalDecisionWire, InteractionKindWire, InteractionResponseWire, MagService,
+        RoutingMode, ServiceEvent, SessionConfig, SessionId, StepIdWire, ToolCallIdWire, UserInput,
+    };
+    use mag_tools::{PermissionSpec, ToolCategory, ToolPlugin, ToolRegistry, ToolRisk};
+    use serde_json::{Value, json};
+    use tokio::time::{Duration, timeout};
+    use uuid::Uuid;
+
+    use crate::test_support::{FakeLlmClient, text_stream_with_usage, tool_use_stream};
+
+    use super::Engine;
+
+    /// A unique temporary database path that deletes its files on drop.
+    struct TempDb {
+        path: PathBuf,
+    }
+
+    impl TempDb {
+        fn new() -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos();
+            let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "mag-persist-{}-{nanos}-{unique}.sqlite",
+                std::process::id()
+            ));
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_file(self.path.with_extension("sqlite-wal"));
+            let _ = std::fs::remove_file(self.path.with_extension("sqlite-shm"));
+        }
+    }
+
+    fn config(model: &str) -> SessionConfig {
+        SessionConfig {
+            provider: "fake".to_owned(),
+            model: model.to_owned(),
+            tool_profile: None,
+            routing: RoutingMode::ModelRouted,
+        }
+    }
+
+    fn usage(input: u32, output: u32) -> Usage {
+        Usage {
+            input,
+            output,
+            total: Some(input + output),
+            ..Usage::default()
+        }
+    }
+
+    /// The interface only supplies the decision; `step_id`/`call_id` are
+    /// reconstructed from the stored interaction, so nil placeholders are fine.
+    fn approval(decision: ApprovalDecisionWire) -> InteractionResponseWire {
+        InteractionResponseWire::Approval {
+            step_id: StepIdWire::new(Uuid::nil()),
+            call_id: ToolCallIdWire::new(Uuid::nil()),
+            decision,
+            message: None,
+        }
+    }
+
+    /// A canned gated `shell` tool: it pauses for approval and returns fixed text.
+    #[derive(Debug)]
+    struct GatedShell;
+
+    #[async_trait]
+    impl ToolPlugin for GatedShell {
+        fn name(&self) -> &str {
+            "shell"
+        }
+
+        fn declaration(&self) -> Tool {
+            Tool {
+                name: "shell".to_owned(),
+                description: "stub shell tool".to_owned(),
+                input_schema: json!({ "type": "object", "properties": {} }),
+            }
+        }
+
+        async fn invoke(&self, _ctx: ToolContext, _args: Value) -> ToolResult {
+            ToolResult::text("shell output")
+        }
+
+        fn permission(&self) -> Option<PermissionSpec> {
+            Some(PermissionSpec::new(ToolCategory::Shell, ToolRisk::Medium))
+        }
+    }
+
+    fn gated_registry() -> ToolRegistry {
+        ToolRegistry::new().register(Arc::new(GatedShell))
+    }
+
+    async fn next_event(events: &mut BoxStream<'static, ServiceEvent>) -> ServiceEvent {
+        timeout(Duration::from_secs(2), futures::StreamExt::next(events))
+            .await
+            .expect("event timed out")
+            .expect("event stream closed")
+    }
+
+    /// Reads events until (and including) the run's terminal event.
+    async fn drain_run(events: &mut BoxStream<'static, ServiceEvent>) -> Vec<ServiceEvent> {
+        let mut collected = Vec::new();
+        loop {
+            let event = next_event(events).await;
+            let terminal = matches!(
+                event,
+                ServiceEvent::RunFinished { .. } | ServiceEvent::RunError { .. }
+            );
+            collected.push(event);
+            if terminal {
+                return collected;
+            }
+        }
+    }
+
+    /// Sends `message` and drains the resulting run, asserting it finished.
+    async fn run_message(
+        engine: &Engine,
+        session: SessionId,
+        events: &mut BoxStream<'static, ServiceEvent>,
+        message: &str,
+    ) {
+        engine
+            .send_message(session, UserInput::text(message))
+            .await
+            .expect("send message");
+        let run = drain_run(events).await;
+        assert!(
+            matches!(
+                run.last().expect("terminal event"),
+                ServiceEvent::RunFinished { id, .. } if *id == session
+            ),
+            "turn `{message}` should finish cleanly: {run:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_run_persists_a_snapshot_to_the_store() {
+        let db = TempDb::new();
+        let client: Arc<dyn LlmClient> =
+            FakeLlmClient::scripted(vec![text_stream_with_usage(&["hi"], usage(2, 1))]);
+        let engine = Engine::with_persistence(client, ToolRegistry::new(), &db.path)
+            .expect("open persistent engine");
+
+        let session = engine
+            .create_session(config("fake-persist"))
+            .await
+            .expect("create session");
+        let mut events = engine.subscribe(Some(session));
+
+        // Before any run there is no snapshot; a committed run writes one.
+        assert!(
+            engine
+                .inner
+                .store
+                .load_snapshot(session)
+                .expect("load snapshot")
+                .is_none(),
+            "a never-run session must have no snapshot",
+        );
+
+        run_message(&engine, session, &mut events, "hello").await;
+
+        assert!(
+            engine
+                .inner
+                .store
+                .load_snapshot(session)
+                .expect("load snapshot")
+                .is_some(),
+            "a committed run must persist a snapshot",
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_after_restart_continues_conversation_with_prior_context() {
+        let db = TempDb::new();
+
+        // First process: two committed turns accumulate history and snapshots.
+        let client1: Arc<dyn LlmClient> = FakeLlmClient::scripted(vec![
+            text_stream_with_usage(&["first"], usage(3, 1)),
+            text_stream_with_usage(&["second"], usage(5, 2)),
+        ]);
+        let engine1 = Engine::with_persistence(client1, ToolRegistry::new(), &db.path)
+            .expect("open first engine");
+        let session = engine1
+            .create_session(config("fake-resume"))
+            .await
+            .expect("create session");
+        let mut events1 = engine1.subscribe(Some(session));
+        run_message(&engine1, session, &mut events1, "hi").await;
+        run_message(&engine1, session, &mut events1, "again").await;
+
+        // "Restart": drop the first engine (joins its session threads); the latest
+        // committed snapshot is already durable.
+        drop(events1);
+        drop(engine1);
+
+        // Second process: a fresh engine over the same database resumes the
+        // session and runs a third turn.
+        let client2 =
+            FakeLlmClient::scripted(vec![text_stream_with_usage(&["third"], usage(7, 1))]);
+        let client2_dyn: Arc<dyn LlmClient> = client2.clone();
+        let engine2 = Engine::with_persistence(client2_dyn, ToolRegistry::new(), &db.path)
+            .expect("open second engine");
+
+        // The session is visible from the durable store before it is resumed.
+        let listed = engine2.list_sessions().await.expect("list sessions");
+        assert!(
+            listed.iter().any(|info| info.id == session),
+            "the persisted session must be listed after restart: {listed:?}",
+        );
+
+        engine2
+            .resume_session(session)
+            .await
+            .expect("resume session");
+        let mut events2 = engine2.subscribe(Some(session));
+        run_message(&engine2, session, &mut events2, "third").await;
+
+        // The third turn's request carries the first two turns as history, proving
+        // the restored agent continued the snapshotted conversation.
+        let requests = client2.stream_requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "the resumed engine drove exactly one turn"
+        );
+        let flat = format!("{:?}", requests[0].messages);
+        for fragment in ["hi", "first", "again", "second", "third"] {
+            assert!(
+                flat.contains(fragment),
+                "restored context is missing `{fragment}`: {flat}",
+            );
+        }
+
+        // A freshly created session on the restarted engine gets a new id past the
+        // resumed one, so ids never collide across a restart.
+        let fresh = engine2
+            .create_session(config("fake-fresh"))
+            .await
+            .expect("create fresh session");
+        assert_ne!(
+            fresh, session,
+            "a new session must not reuse a persisted id"
+        );
+        assert!(
+            fresh.into_uuid().as_u128() > session.into_uuid().as_u128(),
+            "a new session id must be seeded past the persisted maximum",
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_written_by_a_run_contains_no_credentials() {
+        // The snapshot the actor persists after a committed run must stay
+        // data-only: no credential ever reaches the store (`docs/DESIGN.md` §9.5).
+        let db = TempDb::new();
+        let client: Arc<dyn LlmClient> =
+            FakeLlmClient::scripted(vec![text_stream_with_usage(&["ok"], usage(2, 1))]);
+        let engine = Engine::with_persistence(client, ToolRegistry::new(), &db.path)
+            .expect("open persistent engine");
+        let session = engine
+            .create_session(config("fake-clean"))
+            .await
+            .expect("create session");
+        let mut events = engine.subscribe(Some(session));
+        run_message(&engine, session, &mut events, "hello").await;
+
+        let snapshot = engine
+            .inner
+            .store
+            .load_snapshot(session)
+            .expect("load snapshot")
+            .expect("snapshot written");
+        let json = serde_json::to_string(&snapshot)
+            .expect("serialize snapshot")
+            .to_lowercase();
+        for forbidden in ["api_key", "apikey", "secret", "credential", "password"] {
+            assert!(
+                !json.contains(forbidden),
+                "persisted snapshot contains a credential-like key `{forbidden}`",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resumed_approval_session_still_pauses_through_ipc_approval() {
+        let db = TempDb::new();
+
+        // First process: one committed plain turn on an agent that also carries a
+        // gated `shell` tool, so the snapshot preserves the tool declaration.
+        let client1: Arc<dyn LlmClient> =
+            FakeLlmClient::scripted(vec![text_stream_with_usage(&["ready"], usage(2, 1))]);
+        let engine1 = Engine::with_persistence(client1, gated_registry(), &db.path)
+            .expect("open first engine");
+        let session = engine1
+            .create_session(config("fake-approve"))
+            .await
+            .expect("create session");
+        let mut events1 = engine1.subscribe(Some(session));
+        run_message(&engine1, session, &mut events1, "warm up").await;
+        drop(events1);
+        drop(engine1);
+
+        // Second process: resume, then trigger the gated tool. The restored agent
+        // must re-inject `IpcApproval`, so the tool call pauses cross-process
+        // (an `InteractionRequested` that only `respond_interaction` can release)
+        // rather than falling back to synchronous `FacadeApproval`.
+        let client2: Arc<dyn LlmClient> = FakeLlmClient::scripted(vec![
+            tool_use_stream("shell", "call-1", json!({ "command": "echo hi" })),
+            text_stream_with_usage(&["done"], usage(3, 1)),
+        ]);
+        let engine2 = Engine::with_persistence(client2, gated_registry(), &db.path)
+            .expect("open second engine");
+        engine2
+            .resume_session(session)
+            .await
+            .expect("resume session");
+        let mut events2 = engine2.subscribe(Some(session));
+
+        engine2
+            .send_message(session, UserInput::text("run shell"))
+            .await
+            .expect("send message");
+
+        assert!(matches!(
+            next_event(&mut events2).await,
+            ServiceEvent::RunStarted { id, .. } if id == session
+        ));
+
+        let request_id = match next_event(&mut events2).await {
+            ServiceEvent::InteractionRequested {
+                id,
+                request_id,
+                kind,
+            } => {
+                assert_eq!(id, session);
+                assert!(
+                    matches!(kind, InteractionKindWire::Approval { .. }),
+                    "a restored gated tool must pause with an approval interaction, got {kind:?}",
+                );
+                request_id
+            }
+            other => panic!(
+                "restored session must pause through IpcApproval, got {other:?} \
+                 (a synchronous FacadeApproval fallback would emit no InteractionRequested)"
+            ),
+        };
+
+        engine2
+            .respond_interaction(session, request_id, approval(ApprovalDecisionWire::Approve))
+            .await
+            .expect("approve");
+
+        let rest = drain_run(&mut events2).await;
+        assert!(
+            rest.iter().any(|event| matches!(
+                event,
+                ServiceEvent::ToolStarted { id, trace } if *id == session && trace.name == "shell"
+            )),
+            "an approved restored tool must execute: {rest:?}",
+        );
+        assert!(
+            matches!(
+                rest.last().expect("terminal event"),
+                ServiceEvent::RunFinished { id, output } if *id == session && output.text == "done"
+            ),
+            "the resumed approved turn must finish with the follow-up text: {rest:?}",
         );
     }
 }

@@ -10,6 +10,7 @@ futures.workspace = true
 mag-service = { path = "../mag-service" }
 mag-sources = { path = "../mag-sources" }
 mag-tools = { path = "../mag-tools" }
+rusqlite.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tokio-stream = { workspace = true, features = ["sync"] }
