@@ -70,7 +70,7 @@
 - 补充根 `README.md`，记录当前 workspace 结构、setup 与基础验证命令。
 - 验证通过：`cargo fmt --all`、`cargo fmt --all -- --check`、`cargo build --workspace`、`cargo tree -p mag-protocol`（无 `agent-lib`）、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`（30 分钟上限包装，4 个单元测试 + doctest 全绿）、`cargo doc --no-deps --workspace`。
 
-### [TODO] C0-2 `mag-protocol`：`Command` / `Event` + payload（全 serde）
+### [DONE] C0-2 `mag-protocol`：`Command` / `Event` + payload（全 serde）
 
 **上下文**：
 
@@ -98,6 +98,21 @@
 - 单元测试：每个 `Command`/`Event` 变体 `serde_json` round-trip 保真；tag 字段命名稳定。
 - 聚焦：`cargo test -p mag-protocol`。
 - 完整验证序列 1–5。
+
+**完成记录（2026-07-18）**：
+
+- 在 `mag-protocol` 中定义传输无关的顶层 `Command` / `Event` enum，使用
+  `#[serde(tag = "type", rename_all = "snake_case")]`，并为未来扩展标注 `#[non_exhaustive]`。
+- 增加 `SessionId`、`RequestId`、`RunId` 三个 UUID 透明包装 ID，并补充交互/工具追踪所需的独立 wire ID 类型。
+- 定义 `SessionConfig`（含 provider/model/tool_profile/routing，routing 默认 `model_routed`）、`RunOutput`、
+  `UsageInfo`、`ToolTrace`、`DelegationTrace`、`InteractionKindWire`、`InteractionResponseWire`、
+  `SourceInfo` 等 payload；交互与权限类型镜像 agent-lib 字段语义但不依赖 agent-lib。
+- 为所有公开协议类型、字段和变体补 rustdoc，保持 `#![warn(missing_docs)]` 干净。
+- 添加 serde 单元测试，覆盖每个 `Command` / `Event` 变体 round-trip 与稳定 tag 断言，并覆盖交互 wire 类型、
+  routing 默认值和 UUID ID 透明序列化。
+- 验证通过：`cargo fmt --all`、`cargo fmt --all -- --check`、`cargo test -p mag-protocol`（5 个单元测试 +
+  doctest 全绿）、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`（30 分钟上限包装，8 个单元测试 +
+  doctest 全绿）、`cargo doc --no-deps --workspace`。
 
 ### [TODO] C0-3 `Engine` 空壳 + 内存事件总线 + id source
 

@@ -33,3 +33,49 @@
 - 已新增 `.gitignore` 忽略 `/target/`，避免提交构建产物；`Cargo.lock` 作为 workspace 依赖锁定文件保留。
 - 下一步检查 git 状态并提交本轮变更。
 - C0-1 已完成并随本轮 git 提交保存；本轮按要求停止，不继续处理 C0-2。
+
+## C0-2 执行记录（2026-07-18）
+
+## 已识别任务
+- 首个未完成任务：`C0-2 mag-protocol：Command / Event + payload（全 serde）`。
+- 最新提交为 `[C0-1] Build workspace skeleton`，未提到与当前任务相关的未完成问题。
+- 当前工作区只有 `memory/claude_plan.md` 是本轮新增/修改，后续提交需要包含它。
+
+## C0-2 具体计划
+1. 对照 `DESIGN.md` §4.1/§4.2 与 §8.2，定义 `Command`、`Event`、`SessionConfig`、ID 包装类型、交互 wire 类型、工具/委派/来源 payload。
+2. 从 `agent-lib` 源码核对 `InteractionKind`、`InteractionResponse`、`PermissionRequest`、`PermissionRisk` 的字段语义；只镜像 wire 结构，不让 `mag-protocol` 依赖 `agent-lib`。
+3. 为 `mag-protocol` 增加必要依赖：`uuid` 用于 `SessionId`/`RequestId`/`RunId`，`serde_json` 用于测试。
+4. 用小而集中的模块实现协议类型，所有公开 API 保持 rustdoc，增长型 enum 标注 `#[non_exhaustive]`，顶层 enum 使用 `#[serde(tag = "type", rename_all = "snake_case")]`。
+5. 添加单元测试：覆盖每个 `Command` 与 `Event` 变体的 `serde_json` round-trip，并显式断言若干 tag 名称稳定。
+6. 运行验证：`cargo fmt --all -- --check`、`cargo test -p mag-protocol`、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`、`cargo doc --no-deps --workspace`。
+7. 验证通过后，把 TODO.md 中 C0-2 标题改为 `[DONE]` 并补完成记录。
+8. 提交本轮改动并停止，不进入 C0-3。
+
+## 进展
+- 已读取 `TODO.md`、最新提交、工作区状态、`DESIGN.md` 协议章节和当前 crate 骨架。
+
+## 进展更新
+- 已为 workspace 增加 `uuid` 与 `serde_json` 依赖。
+- 已在 `mag-protocol` 中实现 `Command`/`Event`、UUID 包装 ID、会话配置、工具/委派/来源 payload、交互请求/响应 wire 类型与 round-trip 测试。
+- 下一步：格式化并运行聚焦测试，修正编译或 serde 细节。
+
+## 进展更新
+- `cargo fmt --all` 已执行。
+- `cargo fmt --all -- --check` 通过。
+- `cargo test -p mag-protocol` 通过：5 个单元测试和 doctest 全绿。
+- 下一步：运行 clippy、workspace 测试和文档构建。
+
+## 进展更新
+- `cargo clippy --all-targets -- -D warnings` 通过。
+- 下一步：用 30 分钟上限运行 `cargo test --workspace`，随后运行 `cargo doc --no-deps --workspace`。
+
+## 进展更新
+- `cargo test --workspace` 已通过：8 个单元测试与 doctest 全绿。
+- `cargo doc --no-deps --workspace` 已通过。
+- `TODO.md` 已将 C0-2 标记为 `[DONE]` 并补完成记录。
+- 下一步：检查依赖图和工作区状态，然后提交。
+
+## 进展更新
+- `cargo tree -p mag-protocol` 已确认依赖只有 `serde`、`serde_json`、`uuid`，不包含 `agent-lib`。
+- 最终待提交文件：`Cargo.lock`、`Cargo.toml`、`TODO.md`、`crates/mag-protocol/Cargo.toml`、`crates/mag-protocol/src/lib.rs`、`memory/claude_plan.md`。
+- 下一步：提交 `[C0-2] Implement protocol wire types`，然后停止。
