@@ -8,6 +8,17 @@
 //! model, and their payloads and identifier types. The types are pure serde data
 //! and deliberately do not depend on `agent-lib`, even when they mirror concepts
 //! from that crate. `mag-core::Engine` is the implementation of [`MagService`].
+//!
+//! # Contract stability
+//!
+//! As of the C5-R review (`TODO.md`), the [`MagService`] trait and its
+//! [`Command`]/[`Event`] wire encoding are **frozen**: they form the stable
+//! service contract that interface crates (ACP first, then tauri/web) build
+//! against. Frozen means evolution is **additive and backward-compatible only** —
+//! new trait methods, new enum variants, and new struct fields (guarded by
+//! `#[non_exhaustive]`) may be added, but the semantics, names, and shapes of
+//! existing items must not change. Any breaking change requires re-opening this
+//! contract review rather than silently editing an interface crate around it.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

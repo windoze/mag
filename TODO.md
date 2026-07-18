@@ -1152,7 +1152,7 @@ store、恢复重注入。汇总缺口。
   ④ `cargo test --workspace`：mag-core 46 + e2e_offline 2 + mag-service 10 + mag-sources 10 + mag-tools 6 +
   builtin_tools 13，全绿；⑤ `cargo doc --no-deps --workspace` 通过。全部离线，无未调度失败测试。
 
-### [TODO] C5-R Review：mag-core 整体验收 + 契约冻结
+### [DONE] C5-R Review：mag-core 整体验收 + 契约冻结
 
 **上下文**：service 全部里程碑收官 review，决定是否放行 interface 层（`docs/DESIGN.md` §10 I1，ACP 优先）。
 
@@ -1170,6 +1170,88 @@ store、恢复重注入。汇总缺口。
 
 **验证条件**：完整验证序列 1–5 全绿；`docs/DESIGN.md` §3/§4/§9 逐条对照表 + `MagService` 方法 vs §3.0 对照；
 契约冻结说明。
+
+**完成记录**：
+
+*验收结论：放行。* C0–C1 + CS + C2–C5 全部 `[DONE]`，完整验证序列 1–5 全绿，端到端离线主干测试（经
+`Arc<dyn MagService>`）稳定通过。`MagService` trait 及其 `Command`/`Event` wire 编码就此**冻结**，后续只允许
+向后兼容地累加（新方法 / 新 enum 变体 / 新字段，靠 `#[non_exhaustive]`），不改既有语义。可另起 interface 任务单
+（第一个 = mag-acp / §10 I1，见交接 H-1）。
+
+**① `MagService` 方法 vs `docs/DESIGN.md` §3.0 对照**（`crates/mag-service/src/service.rs`）：
+
+| §3.0 示意方法 | 实现签名 | 结论 |
+|---|---|---|
+| `create_session(cfg) -> SessionId` | `async fn create_session(&self, config: SessionConfig) -> Result<SessionId, ServiceError>` | ✓ |
+| `list_sessions() -> Vec<SessionInfo>` | `async fn list_sessions(&self) -> Result<Vec<SessionInfo>, ServiceError>` | ✓ |
+| `resume_session(id)` | `async fn resume_session(&self, id: SessionId) -> Result<(), ServiceError>` | ✓ |
+| `delete_session(id)` | `async fn delete_session(&self, id: SessionId) -> Result<(), ServiceError>` | ✓ |
+| `send_message(id, input) -> RunId` | `async fn send_message(&self, id: SessionId, input: UserInput) -> Result<RunId, ServiceError>` | ✓（`UserInput` 富化 text+attachments，`SendMessage` wire 命令对齐） |
+| `cancel(id)` | `async fn cancel(&self, id: SessionId) -> Result<(), ServiceError>` | ✓ |
+| `respond_interaction(id, request_id, resp)` | `async fn respond_interaction(&self, id, request_id: RequestId, resp: InteractionResponseWire) -> Result<(), ServiceError>` | ✓ |
+| `subscribe(Option<id>) -> BoxStream<ServiceEvent>` | `fn subscribe(&self, id: Option<SessionId>) -> BoxStream<'static, ServiceEvent>` | ✓（`ServiceEvent::session_id()` 按会话过滤） |
+| `list_sources() -> Vec<SourceInfo>` | `async fn list_sources(&self) -> Result<Vec<SourceInfo>, ServiceError>` | ✓ |
+| `probe_local_agents() -> Vec<SourceInfo>` | `async fn probe_local_agents(&self) -> Result<Vec<SourceInfo>, ServiceError>` | ✓ |
+
+近全集齐备（多会话管理 / 对话运行 / 审批往返 / 事件流 / 来源探测）；object-safe（e2e 经 `Arc<dyn MagService>`
+驱动为证）。ACP（§5）只取子集，其余方法已由 `Engine` 覆盖。
+
+**② `docs/DESIGN.md` §3（接口+实现）逐条对照**：
+
+| §3 条目 | 期望 | 实现锚点 | 结论 |
+|---|---|---|---|
+| §3.0 命令方法+事件流模型、object-safe、近全集 | trait + `subscribe` + `respond_interaction`/`cancel` 分离 | `mag-service/src/service.rs` | ✓ |
+| §3.1 Engine + per-session driver actor（非 Mutex，控制命令走旁路） | run 独立 task，`cancel`/`respond_interaction` 不碰 agent `&mut` | `mag-core/src/driver.rs`、`engine.rs` | ✓（C2/C3 已测 cancel 与审批往返不被 run 阻塞） |
+| §3.2 facade `Agent` + `interaction_handler(IpcApproval)` 注入 | 不下沉自组 scope | `mag-core/src/driver.rs`（facade `Agent::builder().interaction_handler(..)`） | ✓ |
+| §3.3 审批 gate = async `InteractionHandler`，真 `.await` 暂停 | `IpcApproval::fulfill` emit + await oneshot；`ApprovalPolicy` 控暂停 | `mag-core/src/engine/approval.rs` | ✓（C3 断言 resolve 前 future 不完成） |
+| §3.4 事件桥接经 `RunEvent::to_wire()->WireRunEvent` 再映射 `Event` | `Raw*` 折叠忽略；审批经 IpcApproval 独立 emit | `mag-core/src/driver.rs` | ✓ |
+| §3.5 凭据存储（keyring/文件，绝不进 snapshot） | `CredentialStore` trait，恢复时重注入 | `mag-sources/src/credentials.rs`、`secret.rs` | ✓ |
+| §3.6 持久化 SQLite，committed 点 snapshot，restore 重装配 | 表 sessions/snapshots；`AgentRestoreBuilder::interaction_handler` 重注入 | `mag-core/src/persistence.rs`、`driver.rs` | ✓ |
+
+**③ `docs/DESIGN.md` §4（Command/Event 编码）逐条对照**（`mag-service/src/lib.rs`）：
+
+| §4 条目 | 期望 | 实现 | 结论 |
+|---|---|---|---|
+| §4.1 Command 全集 | CreateSession/ListSessions/ResumeSession/DeleteSession/SendMessage/CancelRun/RespondInteraction/ListSources/ProbeLocalAgents | `enum Command`（`#[serde(tag="type")]`，`#[non_exhaustive]`） | ✓ 9 变体齐 |
+| §4.2 Event 全集 | SessionCreated/RunStarted/RunFinished/RunError/TextDelta/ToolStarted/ToolFinished/InteractionRequested/Delegation{Started,Finished,Failed,Message}/LocalAgentsProbed | `enum Event` + `enum ServiceEvent`（结构同构，`From<Event>`） | ✓ 14 变体齐 |
+| `InteractionResponseWire` 镜像 agent-lib `InteractionResponse` | Approval/Answer/Choice/Permission | `enum InteractionResponseWire`（+ `ApprovalDecisionWire`/`PermissionDecisionWire`） | ✓ |
+| `InteractionKindWire` 覆盖 Approval/Question/Choice/Permission（带 category/risk/subject/summary） | UI 可渲染审批框 | `enum InteractionKindWire` + `PermissionCategoryWire`/有序 `PermissionRiskWire` | ✓ |
+| §4.3 internally-tagged、TS discriminated union 友好 | `serde(tag="type", rename_all="snake_case")` | Command/Event 均是 | ✓ |
+| 全变体 serde round-trip | 契约测试 | `mag-service/src/lib.rs` tests（10 项，含 tag 名断言） | ✓ |
+
+**④ `docs/DESIGN.md` §9（接入 agent-lib 约束）逐条对照**：
+
+| §9 约束 | 结论 | 说明 |
+|---|---|---|
+| 1. 审批用 facade `interaction_handler(IpcApproval)`，`ApprovalPolicy` 控暂停 | ✓ | driver 注入；shell `ask_tool`、read/grep `auto_allow` |
+| 2. 用官方 `WireRunEvent` 序列化，`Raw*` 折叠 | ✓ | driver 经 `to_wire()` 投影 |
+| 3. `Agent`（`&mut`）放 per-session actor | ✓ | §3.1 driver actor |
+| 4. 工具用 `Tool::function_with_schema` + `ToolContext` | ✓ | `mag-tools`（read_file/list_dir/grep/shell 自建） |
+| 5. snapshot/restore：committed 点、data-only、restore 重注入审批 | ✓ | `persistence.rs`；测试 `stored_snapshot_json_contains_no_credentials` 证无 secret |
+| 6. 富化 `ApprovalRequest`（tool_name/call_id/reason/input），Permission 通道有序 risk | ✓ | `InteractionKindWire::Permission` + `IpcApproval` |
+| 7. 本地 agent behind feature（R-C，推迟到 I2） | 预留 | `mag-sources` `LocalAgentSlot`/`connect_local_agent`→`LocalAgentUnsupported`，未 live 接入 |
+| 8. AI routing/verifier 接缝、permission 决策钩子 | 预留 | `RoutingMode`（§8.2）、`PermissionDecider`/`AskFrontendDecider`（§8.1） |
+
+**⑤ 扩展点留位（§8）**：`PermissionDecider` 钩子（`engine/approval.rs`，默认 `AskFrontendDecider`，AI-permission
+落点）、`RoutingMode`（`SessionConfig.routing`，默认 `ModelRouted`）、source registry 本地 agent 槽
+（`LocalAgentSlot`/`LocalAgentBackend`，默认返回 `LocalAgentUnsupported`）——结构就位、给保守默认，未写死。
+
+**契约冻结**：已在 `crates/mag-service/src/lib.rs` crate 级 rustdoc 增补 "Contract stability" 段，声明
+`MagService` + `Command`/`Event` 冻结、仅允许向后兼容累加。所有面向接口的类型（Command/Event/ServiceError 等）
+已带 `#[non_exhaustive]`，编译期保证外部匹配保留 `_` 臂，为将来加变体留空间。**TS codegen 未启用**（mag-service
+无 `ts-rs`/`schemars` 依赖），设计里为「若启用」条件项，本次跳过、无前端类型需产出/校验。
+
+**风险（R）收口**：R-A（流式 tap，已消解，走 facade `Agent::stream`）；R-B（restore 审批注入口，已消解 =
+agent-lib **M7-F1** 补齐 `AgentRestoreBuilder::interaction_handler`，需审批会话恢复已可用）；R-C（本地 agent live
+接入）转上层 = `docs/DESIGN.md` §10 **I2**（source registry 已留槽）；R-D（持久化 schema，snapshot 存 JSON blob +
+稳定列 + schema version 位）与 R-E（id source 由 facade `FacadeIds` 续号）均已按取向落地。**无 mag-core 侧
+agent-lib 阻塞缺口。**
+
+**验证序列 1–5 全绿**（本任务仅改文档：mag-service crate rustdoc + TODO.md，无编译产物语义变化）：
+① `cargo fmt --all -- --check` 干净；② 聚焦 `cargo test -p mag-core --test e2e_offline` 2/2（0.02s）；
+③ `cargo clippy --all-targets -- -D warnings` 零告警；④ `cargo test --workspace`：mag-core 46 + e2e_offline 2 +
+mag-service 10 + mag-sources 10 + mag-tools 6 + builtin_tools 13，全绿，0 失败 / 0 未调度失败测试；
+⑤ `cargo doc --no-deps --workspace` 通过。全部离线。**放行判据满足，service 主干收官。**
 
 ---
 
