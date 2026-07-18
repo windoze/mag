@@ -5,9 +5,10 @@
 mod driver;
 mod engine;
 mod event_bus;
+mod run_loop;
 
 #[cfg(test)]
 mod test_support;
 
-pub use engine::{CommandOutput, Engine, EngineError, SessionInfo};
+pub use engine::Engine;
 pub use event_bus::{EventBus, EventStream};

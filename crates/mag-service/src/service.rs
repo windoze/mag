@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt};
 
 use crate::{
-    DelegationMessageWire, DelegationTrace, InteractionKindWire, InteractionResponseWire,
+    DelegationMessageWire, DelegationTrace, Event, InteractionKindWire, InteractionResponseWire,
     RequestId, RunId, RunOutput, SessionConfig, SessionId, SourceInfo, ToolTrace,
 };
 
@@ -300,6 +300,41 @@ impl ServiceEvent {
             | Self::DelegationFailed { id, .. }
             | Self::DelegationMessage { id, .. } => Some(*id),
             Self::LocalAgentsProbed { .. } => None,
+        }
+    }
+}
+
+impl From<Event> for ServiceEvent {
+    /// Projects a transport-facing [`Event`](crate::Event) into the neutral
+    /// [`ServiceEvent`] observed through [`MagService::subscribe`].
+    ///
+    /// The two enums are structurally identical; the [`Event`](crate::Event)
+    /// protocol is simply the tauri/web wire encoding of this neutral model
+    /// (`docs/DESIGN.md` §3.0/§4), so the mapping is a variant-for-variant
+    /// projection.
+    fn from(event: Event) -> Self {
+        match event {
+            Event::SessionCreated { id, config } => Self::SessionCreated { id, config },
+            Event::RunStarted { id, run_id } => Self::RunStarted { id, run_id },
+            Event::RunFinished { id, output } => Self::RunFinished { id, output },
+            Event::RunError { id, message } => Self::RunError { id, message },
+            Event::TextDelta { id, text } => Self::TextDelta { id, text },
+            Event::ToolStarted { id, trace } => Self::ToolStarted { id, trace },
+            Event::ToolFinished { id, trace } => Self::ToolFinished { id, trace },
+            Event::InteractionRequested {
+                id,
+                request_id,
+                kind,
+            } => Self::InteractionRequested {
+                id,
+                request_id,
+                kind,
+            },
+            Event::DelegationStarted { id, trace } => Self::DelegationStarted { id, trace },
+            Event::DelegationFinished { id, trace } => Self::DelegationFinished { id, trace },
+            Event::DelegationFailed { id, trace } => Self::DelegationFailed { id, trace },
+            Event::DelegationMessage { id, message } => Self::DelegationMessage { id, message },
+            Event::LocalAgentsProbed { available } => Self::LocalAgentsProbed { available },
         }
     }
 }
@@ -616,6 +651,74 @@ mod tests {
 
         for (event, expected_tag) in cases {
             assert_round_trip(event, expected_tag);
+        }
+    }
+
+    #[test]
+    fn event_projects_into_matching_service_event() {
+        let cases = vec![
+            (
+                Event::SessionCreated {
+                    id: session_id(),
+                    config: config(),
+                },
+                ServiceEvent::SessionCreated {
+                    id: session_id(),
+                    config: config(),
+                },
+            ),
+            (
+                Event::RunStarted {
+                    id: session_id(),
+                    run_id: RunId::new(uuid(3)),
+                },
+                ServiceEvent::RunStarted {
+                    id: session_id(),
+                    run_id: RunId::new(uuid(3)),
+                },
+            ),
+            (
+                Event::TextDelta {
+                    id: session_id(),
+                    text: "hi".to_owned(),
+                },
+                ServiceEvent::TextDelta {
+                    id: session_id(),
+                    text: "hi".to_owned(),
+                },
+            ),
+            (
+                Event::ToolStarted {
+                    id: session_id(),
+                    trace: tool_trace(),
+                },
+                ServiceEvent::ToolStarted {
+                    id: session_id(),
+                    trace: tool_trace(),
+                },
+            ),
+            (
+                Event::DelegationFailed {
+                    id: session_id(),
+                    trace: delegation_trace(),
+                },
+                ServiceEvent::DelegationFailed {
+                    id: session_id(),
+                    trace: delegation_trace(),
+                },
+            ),
+            (
+                Event::LocalAgentsProbed {
+                    available: vec![source()],
+                },
+                ServiceEvent::LocalAgentsProbed {
+                    available: vec![source()],
+                },
+            ),
+        ];
+
+        for (event, expected) in cases {
+            assert_eq!(ServiceEvent::from(event), expected);
         }
     }
 

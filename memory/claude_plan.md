@@ -163,3 +163,46 @@ Review 任务：核对 mag-core 已切到 facade `Agent`+`Agent::stream`（C1-3�
 - 已定位首个未完成任务 CS-2，读毕 DESIGN §3.0、mag-service/lib.rs、mag-core engine/driver/event_bus。下一步：改 Cargo.toml、写 service.rs、接线 lib.rs。
 - 已实现 CS-2：新增 service.rs（MagService trait + ServiceEvent/ServiceError/UserInput/SessionInfo），lib.rs 接线导出，Cargo.toml 加 async-trait/futures。
 - 完整验证序列全绿；cargo tree -p mag-service 无 agent-lib。已将 TODO.md CS-2 标记 [DONE] 并补完成记录。下一步提交并停止。
+
+---
+
+## 任务 CS-3：`Engine impl MagService` + 既有路径改经 trait（当前任务）
+
+### 目标与边界
+- 在 `mag-core` 为 `Engine` 实现 `mag_service::MagService` trait；把 C0/C1 的 `handle_command` 分发下沉为 trait 各方法。
+- `subscribe` 包装现有 broadcast `EventBus`，将 `Event` 映射为 `ServiceEvent` 并按 `Option<SessionId>` 过滤。
+- 既有 C1/C0 单元测试改经 `MagService` trait 调用 + 消费 `subscribe` 流断言事件序列。
+- Command/Event 降为 wire 编码：本任务不做 Command↔trait adapter（DESIGN §3.0/§4）。
+- 未实现方法（resume/delete/cancel/respond_interaction/list_sources/probe_local_agents）返回 `ServiceError::Unsupported`，由 C2/C3/C4 落地。
+
+### 决策
+- mag-service 新增 `impl From<Event> for ServiceEvent`（两类型同构，字段 1:1），配 round-trip 测试。
+- 删除 mag-core 的 `handle_command`/`CommandOutput`/`EngineError`/`emit_unimplemented`（interim 脚手架）。
+- 删除 mag-core 自有 `SessionInfo`，改用 `mag_service::SessionInfo`（同形）。
+- 移除 `Engine` 的 inherent `subscribe()`，改由 trait `subscribe(Option<SessionId>) -> BoxStream<'static, ServiceEvent>`。
+- `send_message(id, input)`：会话不存在→`SessionNotFound`；无 client / driver 构建失败→`Backend`；run 启动后返回 `RunId`，run 内错误经事件流 `RunError` 暴露（driver 内 emit）。
+- driver.send_message 改为 mint run_id→emit RunStarted→drive→emit RunFinished/RunError，返回 `RunId`。
+- `MagIds`（C0-3）此前已在 C1-3 删除；本任务复核无残留（完成记录说明）。
+
+### 步骤
+1. mag-service：加 `From<Event> for ServiceEvent` + 测试。
+2. driver.rs：改 send_message 返回 RunId，内部 emit RunFinished/RunError。
+3. engine.rs：impl MagService；删 handle_command/CommandOutput/EngineError；用 mag_service::SessionInfo；subscribe 映射+过滤。
+4. lib.rs：更新导出。
+5. 迁移 engine.rs 内 skeleton/chat 测试到 trait；加经 `Arc<dyn MagService>` 的 create+send+subscribe 断言 RunStarted→TextDelta*→RunFinished。
+6. 验证：fmt --check → clippy -D warnings → cargo test -p mag-core → cargo test --workspace → cargo doc；cargo tree -p mag-service 无 agent-lib。
+7. 标 TODO.md CS-3 `[DONE]` + 完成记录，提交。
+
+### 阻塞与解决（Send 正确性）
+- 阻塞：facade `Agent::stream(&mut self)` 返回的 `AgentRunStream` 非 `Send`，无法在 `#[async_trait]`（默认 Send）
+  的 `impl MagService::send_message` future 内联驱动 → 编译报 "future cannot be sent between threads safely"。
+- 排查：`AgentRunStream` 内含 `Pin<Box<dyn Future + 'a>>`（无 Send），本质非 Send；但 `Agent` 本身 IS Send（已验证）。
+- 解决（非 workaround，DESIGN §3.1 最小实现）：新增 `crates/mag-core/src/run_loop.rs`——`Engine` 拥有一条专用 OS
+  线程，内跑 current_thread runtime + block_on 循环，独占 `HashMap<SessionId, SessionDriver>`；`send_message` 只经
+  `mpsc`/`oneshot` 交付 `RunLoopCommand::Run`。`RunLoop: Drop` 关 channel + join 线程。仅在 `with_llm_client` 时起线程。
+- C2-1 将其重构为 per-session actor + cancel 旁路 + 并发隔离（已在 TODO.md C2-1 上下文补起点说明）。
+
+### 完成
+- 全部验证绿：fmt --check、clippy -D warnings、cargo test -p mag-core -p mag-service（12+10）、
+  cargo test --workspace --all-targets、cargo doc --no-deps --workspace（无警告）、cargo tree -p mag-service 无 agent-lib。
+- TODO.md：CS-3 标 [DONE] + 完成记录；C2-1 上下文补 CS-3 run-executor 起点。提交后停止。

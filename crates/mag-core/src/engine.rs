@@ -1,8 +1,7 @@
-//! Transport-neutral engine entry point and session skeleton.
+//! Transport-neutral engine entry point implementing [`MagService`].
 
 use std::{
     collections::BTreeMap,
-    error::Error,
     fmt,
     sync::{
         Arc,
@@ -11,27 +10,41 @@ use std::{
 };
 
 use agent_lib::client::LlmClient;
-use mag_service::{Command, Event, SessionConfig, SessionId};
+use async_trait::async_trait;
+use futures::stream::{BoxStream, StreamExt};
+use mag_service::{
+    InteractionResponseWire, MagService, RequestId, RunId, ServiceError, ServiceEvent,
+    SessionConfig, SessionId, SessionInfo, SourceInfo, UserInput,
+};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::{EventBus, EventStream, driver::SessionDriver};
+use crate::{EventBus, run_loop::RunLoop};
 
-/// Transport-neutral command engine.
+/// Transport-neutral service engine implementing [`MagService`].
 ///
-/// The engine stores session records in memory, emits lifecycle events through
-/// an [`EventBus`], and drives pure chat turns through agent-lib.
+/// The engine stores session configuration in memory, emits neutral
+/// [`ServiceEvent`]s through an [`EventBus`] observed via
+/// [`subscribe`](MagService::subscribe), and drives chat turns through agent-lib
+/// on a dedicated run-executor thread (see the `run_loop` module). It is the
+/// single implementation of the [`MagService`] facade (`docs/DESIGN.md`
+/// §3.0/§3.1) and can be injected as `Arc<dyn MagService>`.
 #[derive(Clone)]
 pub struct Engine {
     inner: Arc<EngineInner>,
 }
 
 impl Engine {
-    /// Creates an empty engine with an in-memory session manager and event bus.
+    /// Creates an empty engine with an in-memory session store and event bus.
+    ///
+    /// Without an LLM client the engine can manage session metadata but cannot
+    /// start runs; [`send_message`](MagService::send_message) reports a
+    /// [`ServiceError::Backend`] until [`with_llm_client`](Engine::with_llm_client)
+    /// is used instead.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(EngineInner::default()),
+            inner: Arc::new(EngineInner::new(None)),
         }
     }
 
@@ -39,129 +52,109 @@ impl Engine {
     #[must_use]
     pub fn with_llm_client(client: Arc<dyn LlmClient>) -> Self {
         Self {
-            inner: Arc::new(EngineInner::with_llm_client(client)),
+            inner: Arc::new(EngineInner::new(Some(client))),
         }
     }
+}
 
-    /// Subscribes to future engine events.
-    #[must_use]
-    pub fn subscribe(&self) -> EventStream {
-        self.inner.event_bus.subscribe()
-    }
-
-    /// Handles one command and returns any immediate command output.
-    ///
-    /// Lifecycle events are emitted through [`subscribe`](Engine::subscribe).
-    /// Session-scoped commands that are not implemented in the current
-    /// milestone emit a clear `RunError` instead of silently succeeding.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EngineError::UnsupportedCommand`] for unsupported commands that
-    /// are not tied to a session and therefore cannot produce a `RunError`
-    /// event.
-    pub async fn handle_command(&self, command: Command) -> Result<CommandOutput, EngineError> {
-        match command {
-            Command::CreateSession { config } => {
-                let session = {
-                    let mut sessions = self.inner.sessions.lock().await;
-                    let id = self.inner.session_ids.next_id();
-                    sessions.create_session(id, config)
-                };
-
-                let _ = self.inner.event_bus.emit(Event::SessionCreated {
-                    id: session.id,
-                    config: session.config.clone(),
-                });
-
-                Ok(CommandOutput::SessionCreated(session))
-            }
-            Command::ListSessions => {
-                let sessions = self.inner.sessions.lock().await.list_sessions();
-                Ok(CommandOutput::Sessions(sessions))
-            }
-            Command::ResumeSession { id } => {
-                self.emit_unimplemented(id, "resume_session");
-                Ok(CommandOutput::None)
-            }
-            Command::DeleteSession { id } => {
-                self.emit_unimplemented(id, "delete_session");
-                Ok(CommandOutput::None)
-            }
-            Command::SendMessage {
-                session_id, text, ..
-            } => {
-                self.send_message(session_id, text).await;
-                Ok(CommandOutput::None)
-            }
-            Command::CancelRun { session_id } => {
-                self.emit_unimplemented(session_id, "cancel_run");
-                Ok(CommandOutput::None)
-            }
-            Command::RespondInteraction { session_id, .. } => {
-                self.emit_unimplemented(session_id, "respond_interaction");
-                Ok(CommandOutput::None)
-            }
-            Command::ListSources => Err(EngineError::UnsupportedCommand {
-                command: "list_sources",
-            }),
-            Command::ProbeLocalAgents => Err(EngineError::UnsupportedCommand {
-                command: "probe_local_agents",
-            }),
-            _ => Err(EngineError::UnsupportedCommand { command: "unknown" }),
-        }
-    }
-
-    fn emit_unimplemented(&self, id: SessionId, command: &'static str) {
-        let _ = self.inner.event_bus.emit(Event::RunError {
-            id,
-            message: format!("command `{command}` is not implemented yet"),
-        });
-    }
-
-    async fn send_message(&self, session_id: SessionId, text: String) {
-        let Some(client) = self.inner.llm_client.clone() else {
-            self.emit_run_error(session_id, "no LLM client configured");
-            return;
-        };
-        let Some((driver, config)) = self.session_entry(session_id).await else {
-            self.emit_run_error(session_id, "session not found");
-            return;
+#[async_trait]
+impl MagService for Engine {
+    async fn create_session(&self, config: SessionConfig) -> Result<SessionId, ServiceError> {
+        let id = {
+            let mut sessions = self.inner.sessions.lock().await;
+            let id = self.inner.session_ids.next_id();
+            sessions.insert(id, config.clone());
+            id
         };
 
-        let mut guard = driver.lock().await;
-        if guard.is_none() {
-            match SessionDriver::new(&config, client) {
-                Ok(driver) => *guard = Some(driver),
-                Err(error) => {
-                    self.emit_run_error(session_id, error.to_string());
-                    return;
-                }
-            }
-        }
-        let driver = guard.as_mut().expect("session driver is built");
+        let _ = self
+            .inner
+            .event_bus
+            .emit(mag_service::Event::SessionCreated { id, config });
 
-        let result = driver
-            .send_message(session_id, text, self.inner.event_bus.clone())
-            .await;
-
-        if let Err(error) = result {
-            self.emit_run_error(session_id, error.to_string());
-        }
+        Ok(id)
     }
 
-    async fn session_entry(
+    async fn list_sessions(&self) -> Result<Vec<SessionInfo>, ServiceError> {
+        let sessions = self.inner.sessions.lock().await;
+        Ok(sessions
+            .iter()
+            .map(|(id, config)| SessionInfo {
+                id: *id,
+                config: config.clone(),
+            })
+            .collect())
+    }
+
+    async fn resume_session(&self, _id: SessionId) -> Result<(), ServiceError> {
+        Err(ServiceError::Unsupported {
+            operation: "resume_session".to_owned(),
+        })
+    }
+
+    async fn delete_session(&self, _id: SessionId) -> Result<(), ServiceError> {
+        Err(ServiceError::Unsupported {
+            operation: "delete_session".to_owned(),
+        })
+    }
+
+    async fn send_message(&self, id: SessionId, input: UserInput) -> Result<RunId, ServiceError> {
+        let config = {
+            let sessions = self.inner.sessions.lock().await;
+            sessions.get(&id).cloned()
+        };
+        let Some(config) = config else {
+            return Err(ServiceError::SessionNotFound { id });
+        };
+        let Some(run) = self.inner.run.as_ref() else {
+            return Err(ServiceError::Backend {
+                message: "no LLM client configured".to_owned(),
+            });
+        };
+
+        run.run(id, config, input.text).await
+    }
+
+    async fn cancel(&self, _id: SessionId) -> Result<(), ServiceError> {
+        Err(ServiceError::Unsupported {
+            operation: "cancel".to_owned(),
+        })
+    }
+
+    async fn respond_interaction(
         &self,
-        session_id: SessionId,
-    ) -> Option<(Arc<Mutex<Option<SessionDriver>>>, SessionConfig)> {
-        self.inner.sessions.lock().await.session_entry(session_id)
+        _id: SessionId,
+        _request_id: RequestId,
+        _response: InteractionResponseWire,
+    ) -> Result<(), ServiceError> {
+        Err(ServiceError::Unsupported {
+            operation: "respond_interaction".to_owned(),
+        })
     }
 
-    fn emit_run_error(&self, id: SessionId, message: impl Into<String>) {
-        let _ = self.inner.event_bus.emit(Event::RunError {
-            id,
-            message: message.into(),
-        });
+    fn subscribe(&self, id: Option<SessionId>) -> BoxStream<'static, ServiceEvent> {
+        let stream = self.inner.event_bus.subscribe().map(ServiceEvent::from);
+        match id {
+            None => stream.boxed(),
+            Some(target) => stream
+                .filter(move |event| {
+                    let keep = event.session_id().is_none_or(|scope| scope == target);
+                    futures::future::ready(keep)
+                })
+                .boxed(),
+        }
+    }
+
+    async fn list_sources(&self) -> Result<Vec<SourceInfo>, ServiceError> {
+        Err(ServiceError::Unsupported {
+            operation: "list_sources".to_owned(),
+        })
+    }
+
+    async fn probe_local_agents(&self) -> Result<Vec<SourceInfo>, ServiceError> {
+        Err(ServiceError::Unsupported {
+            operation: "probe_local_agents".to_owned(),
+        })
     }
 }
 
@@ -172,28 +165,21 @@ impl Default for Engine {
 }
 
 struct EngineInner {
-    sessions: Mutex<SessionManager>,
+    sessions: Mutex<BTreeMap<SessionId, SessionConfig>>,
     event_bus: EventBus,
     session_ids: SessionIdSource,
-    llm_client: Option<Arc<dyn LlmClient>>,
-}
-
-impl Default for EngineInner {
-    fn default() -> Self {
-        Self {
-            sessions: Mutex::new(SessionManager::default()),
-            event_bus: EventBus::new(),
-            session_ids: SessionIdSource::new(),
-            llm_client: None,
-        }
-    }
+    run: Option<RunLoop>,
 }
 
 impl EngineInner {
-    fn with_llm_client(client: Arc<dyn LlmClient>) -> Self {
+    fn new(client: Option<Arc<dyn LlmClient>>) -> Self {
+        let event_bus = EventBus::new();
+        let run = client.map(|client| RunLoop::spawn(client, event_bus.clone()));
         Self {
-            llm_client: Some(client),
-            ..Self::default()
+            sessions: Mutex::new(BTreeMap::new()),
+            event_bus,
+            session_ids: SessionIdSource::new(),
+            run,
         }
     }
 }
@@ -202,93 +188,6 @@ impl fmt::Debug for Engine {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.debug_struct("Engine").finish_non_exhaustive()
     }
-}
-
-/// Immediate output returned from handling a command.
-#[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CommandOutput {
-    /// The command completed without direct output.
-    None,
-    /// A new session was created.
-    SessionCreated(SessionInfo),
-    /// Current in-memory sessions were listed.
-    Sessions(Vec<SessionInfo>),
-}
-
-/// In-memory session metadata exposed by `ListSessions`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SessionInfo {
-    /// Stable session identity.
-    pub id: SessionId,
-    /// Configuration used to create the session.
-    pub config: SessionConfig,
-}
-
-/// Error returned while handling an engine command.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum EngineError {
-    /// The command has no skeleton implementation yet.
-    UnsupportedCommand {
-        /// Stable command tag.
-        command: &'static str,
-    },
-}
-
-impl fmt::Display for EngineError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnsupportedCommand { command } => {
-                write!(formatter, "command `{command}` is not implemented yet")
-            }
-        }
-    }
-}
-
-impl Error for EngineError {}
-
-#[derive(Default)]
-struct SessionManager {
-    sessions: BTreeMap<SessionId, SessionRecord>,
-}
-
-impl SessionManager {
-    fn create_session(&mut self, id: SessionId, config: SessionConfig) -> SessionInfo {
-        let session = SessionInfo {
-            id,
-            config: config.clone(),
-        };
-        self.sessions.insert(
-            id,
-            SessionRecord {
-                info: session.clone(),
-                driver: Arc::new(Mutex::new(None)),
-            },
-        );
-        session
-    }
-
-    fn list_sessions(&self) -> Vec<SessionInfo> {
-        self.sessions
-            .values()
-            .map(|record| record.info.clone())
-            .collect()
-    }
-
-    fn session_entry(
-        &self,
-        id: SessionId,
-    ) -> Option<(Arc<Mutex<Option<SessionDriver>>>, SessionConfig)> {
-        self.sessions
-            .get(&id)
-            .map(|record| (Arc::clone(&record.driver), record.info.config.clone()))
-    }
-}
-
-struct SessionRecord {
-    info: SessionInfo,
-    driver: Arc<Mutex<Option<SessionDriver>>>,
 }
 
 #[derive(Debug)]
@@ -316,11 +215,16 @@ impl SessionIdSource {
 
 #[cfg(test)]
 mod skeleton {
-    use mag_service::{Command, Event, RoutingMode, SessionConfig};
+    use futures::StreamExt;
+    use futures::stream::BoxStream;
+    use mag_service::{
+        InteractionResponseWire, MagService, RequestId, RoutingMode, ServiceError, ServiceEvent,
+        SessionConfig, SessionId,
+    };
     use tokio::time::{Duration, timeout};
-    use tokio_stream::StreamExt;
+    use uuid::Uuid;
 
-    use super::{CommandOutput, Engine, EventStream};
+    use super::Engine;
 
     fn config(model: &str) -> SessionConfig {
         SessionConfig {
@@ -331,7 +235,7 @@ mod skeleton {
         }
     }
 
-    async fn next_event(events: &mut EventStream) -> Event {
+    async fn next_event(events: &mut BoxStream<'static, ServiceEvent>) -> ServiceEvent {
         timeout(Duration::from_secs(1), events.next())
             .await
             .expect("event timed out")
@@ -341,28 +245,27 @@ mod skeleton {
     #[tokio::test]
     async fn create_session_emits_session_created() {
         let engine = Engine::new();
-        let mut events = engine.subscribe();
+        let mut events = engine.subscribe(None);
         let config = config("model-a");
 
-        let output = engine
-            .handle_command(Command::CreateSession {
-                config: config.clone(),
-            })
+        let id = engine
+            .create_session(config.clone())
             .await
             .expect("create session");
         let event = next_event(&mut events).await;
 
-        let CommandOutput::SessionCreated(session) = output else {
-            panic!("unexpected command output: {output:?}");
-        };
-        assert_eq!(session.config, config);
         assert_eq!(
             event,
-            Event::SessionCreated {
-                id: session.id,
-                config
+            ServiceEvent::SessionCreated {
+                id,
+                config: config.clone(),
             }
         );
+
+        let sessions = engine.list_sessions().await.expect("list sessions");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, id);
+        assert_eq!(sessions[0].config, config);
     }
 
     #[tokio::test]
@@ -370,91 +273,104 @@ mod skeleton {
         let engine = Engine::new();
 
         let first = engine
-            .handle_command(Command::CreateSession {
-                config: config("model-a"),
-            })
+            .create_session(config("model-a"))
             .await
             .expect("create first session");
         let second = engine
-            .handle_command(Command::CreateSession {
-                config: config("model-b"),
-            })
+            .create_session(config("model-b"))
             .await
             .expect("create second session");
 
-        let CommandOutput::SessionCreated(first) = first else {
-            panic!("unexpected first output: {first:?}");
-        };
-        let CommandOutput::SessionCreated(second) = second else {
-            panic!("unexpected second output: {second:?}");
-        };
+        let listed = engine.list_sessions().await.expect("list sessions");
 
-        let listed = engine
-            .handle_command(Command::ListSessions)
-            .await
-            .expect("list sessions");
-
-        assert_eq!(listed, CommandOutput::Sessions(vec![first, second]));
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].id, first);
+        assert_eq!(listed[0].config, config("model-a"));
+        assert_eq!(listed[1].id, second);
+        assert_eq!(listed[1].config, config("model-b"));
     }
 
     #[tokio::test]
     async fn multiple_subscribers_receive_the_same_event() {
         let engine = Engine::new();
-        let mut first_subscriber = engine.subscribe();
-        let mut second_subscriber = engine.subscribe();
+        let mut first_subscriber = engine.subscribe(None);
+        let mut second_subscriber = engine.subscribe(None);
         let config = config("model-a");
 
-        let output = engine
-            .handle_command(Command::CreateSession {
-                config: config.clone(),
-            })
+        let id = engine
+            .create_session(config.clone())
             .await
             .expect("create session");
-
-        let CommandOutput::SessionCreated(session) = output else {
-            panic!("unexpected command output: {output:?}");
-        };
-        let expected = Event::SessionCreated {
-            id: session.id,
-            config,
-        };
+        let expected = ServiceEvent::SessionCreated { id, config };
 
         assert_eq!(next_event(&mut first_subscriber).await, expected);
         assert_eq!(next_event(&mut second_subscriber).await, expected);
     }
 
     #[tokio::test]
-    async fn session_scoped_unimplemented_commands_emit_run_error() {
+    async fn unimplemented_methods_return_unsupported() {
         let engine = Engine::new();
-        let mut events = engine.subscribe();
-
-        let created = engine
-            .handle_command(Command::CreateSession {
-                config: config("model-a"),
-            })
+        let id = engine
+            .create_session(config("model-a"))
             .await
             .expect("create session");
-        let CommandOutput::SessionCreated(session) = created else {
-            panic!("unexpected command output: {created:?}");
-        };
-        let _ = next_event(&mut events).await;
 
-        let output = engine
-            .handle_command(Command::CancelRun {
-                session_id: session.id,
-            })
-            .await
-            .expect("cancel skeleton command");
-        assert_eq!(output, CommandOutput::None);
-
-        let event = next_event(&mut events).await;
         assert_eq!(
-            event,
-            Event::RunError {
-                id: session.id,
-                message: "command `cancel_run` is not implemented yet".to_owned(),
-            }
+            engine.resume_session(id).await,
+            Err(ServiceError::Unsupported {
+                operation: "resume_session".to_owned(),
+            })
         );
+        assert_eq!(
+            engine.delete_session(id).await,
+            Err(ServiceError::Unsupported {
+                operation: "delete_session".to_owned(),
+            })
+        );
+        assert_eq!(
+            engine.cancel(id).await,
+            Err(ServiceError::Unsupported {
+                operation: "cancel".to_owned(),
+            })
+        );
+        assert_eq!(
+            engine
+                .respond_interaction(
+                    id,
+                    RequestId::new(Uuid::from_u128(9)),
+                    InteractionResponseWire::Answer {
+                        text: "ok".to_owned(),
+                    },
+                )
+                .await,
+            Err(ServiceError::Unsupported {
+                operation: "respond_interaction".to_owned(),
+            })
+        );
+        assert_eq!(
+            engine.list_sources().await,
+            Err(ServiceError::Unsupported {
+                operation: "list_sources".to_owned(),
+            })
+        );
+        assert_eq!(
+            engine.probe_local_agents().await,
+            Err(ServiceError::Unsupported {
+                operation: "probe_local_agents".to_owned(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_to_unknown_session_reports_session_not_found() {
+        let engine = Engine::new();
+        let missing = SessionId::new(Uuid::from_u128(999));
+
+        let error = engine
+            .send_message(missing, mag_service::UserInput::text("hi"))
+            .await
+            .expect_err("unknown session must fail");
+        assert_eq!(error, ServiceError::SessionNotFound { id: missing });
     }
 }
 
@@ -470,16 +386,16 @@ mod chat {
             usage::Usage,
         },
     };
-    use mag_service::{Command, Event, RoutingMode, SessionConfig, UsageInfo};
-    use tokio::time::{Duration, timeout};
-    use tokio_stream::StreamExt;
-
-    use crate::{
-        EventStream,
-        test_support::{FakeLlmClient, text_stream_with_usage},
+    use futures::StreamExt;
+    use futures::stream::BoxStream;
+    use mag_service::{
+        MagService, RoutingMode, ServiceEvent, SessionConfig, SessionId, UsageInfo, UserInput,
     };
+    use tokio::time::{Duration, timeout};
 
-    use super::{CommandOutput, Engine};
+    use crate::test_support::{FakeLlmClient, text_stream_with_usage};
+
+    use super::Engine;
 
     fn config(model: &str) -> SessionConfig {
         SessionConfig {
@@ -504,31 +420,18 @@ mod chat {
         Engine::with_llm_client(client)
     }
 
-    async fn next_event(events: &mut EventStream) -> Event {
+    async fn next_event(events: &mut BoxStream<'static, ServiceEvent>) -> ServiceEvent {
         timeout(Duration::from_secs(1), events.next())
             .await
             .expect("event timed out")
             .expect("event stream closed")
     }
 
-    async fn create_session(engine: &Engine, events: &mut EventStream) -> super::SessionInfo {
-        let created = engine
-            .handle_command(Command::CreateSession {
-                config: config("fake-chat"),
-            })
+    async fn create_session(engine: &Engine) -> SessionId {
+        engine
+            .create_session(config("fake-chat"))
             .await
-            .expect("create session");
-        let CommandOutput::SessionCreated(session) = created else {
-            panic!("unexpected create output: {created:?}");
-        };
-        assert_eq!(
-            next_event(events).await,
-            Event::SessionCreated {
-                id: session.id,
-                config: session.config.clone(),
-            }
-        );
-        session
+            .expect("create session")
     }
 
     fn text(message: &Message) -> String {
@@ -548,44 +451,44 @@ mod chat {
         let fake =
             FakeLlmClient::scripted(vec![text_stream_with_usage(&["hel", "lo"], usage(7, 2))]);
         let engine = engine_with_fake(fake.clone());
-        let mut events = engine.subscribe();
-        let session = create_session(&engine, &mut events).await;
+        let session = create_session(&engine).await;
+        let mut events = engine.subscribe(Some(session));
 
-        let output = engine
-            .handle_command(Command::SendMessage {
-                session_id: session.id,
-                text: "hi".to_owned(),
-                attachments: Vec::new(),
-            })
+        let run_id = engine
+            .send_message(session, UserInput::text("hi"))
             .await
             .expect("send message");
-        assert_eq!(output, CommandOutput::None);
+        assert_ne!(run_id.into_uuid(), uuid::Uuid::nil());
 
-        let Event::RunStarted { id, run_id } = next_event(&mut events).await else {
+        let ServiceEvent::RunStarted {
+            id,
+            run_id: started,
+        } = next_event(&mut events).await
+        else {
             panic!("expected run_started");
         };
-        assert_eq!(id, session.id);
-        assert_ne!(run_id.into_uuid(), uuid::Uuid::nil());
+        assert_eq!(id, session);
+        assert_eq!(started, run_id);
 
         assert_eq!(
             next_event(&mut events).await,
-            Event::TextDelta {
-                id: session.id,
+            ServiceEvent::TextDelta {
+                id: session,
                 text: "hel".to_owned(),
             }
         );
         assert_eq!(
             next_event(&mut events).await,
-            Event::TextDelta {
-                id: session.id,
+            ServiceEvent::TextDelta {
+                id: session,
                 text: "lo".to_owned(),
             }
         );
 
-        let Event::RunFinished { id, output } = next_event(&mut events).await else {
+        let ServiceEvent::RunFinished { id, output } = next_event(&mut events).await else {
             panic!("expected run_finished");
         };
-        assert_eq!(id, session.id);
+        assert_eq!(id, session);
         assert_eq!(output.text, "hello");
         assert_eq!(
             output.usage,
@@ -606,21 +509,102 @@ mod chat {
     }
 
     #[tokio::test]
+    async fn arc_dyn_service_streams_ordered_run_events() {
+        let fake = FakeLlmClient::scripted(vec![text_stream_with_usage(&["hi", "!"], usage(4, 1))]);
+        let service: Arc<dyn MagService> = Arc::new(engine_with_fake(fake));
+
+        let session = service
+            .create_session(config("fake-chat"))
+            .await
+            .expect("create session");
+        let mut events = service.subscribe(Some(session));
+
+        let run_id = service
+            .send_message(session, UserInput::text("hi"))
+            .await
+            .expect("send message");
+
+        let ServiceEvent::RunStarted {
+            id,
+            run_id: started,
+        } = next_event(&mut events).await
+        else {
+            panic!("expected run_started");
+        };
+        assert_eq!(id, session);
+        assert_eq!(started, run_id);
+
+        assert_eq!(
+            next_event(&mut events).await,
+            ServiceEvent::TextDelta {
+                id: session,
+                text: "hi".to_owned(),
+            }
+        );
+        assert_eq!(
+            next_event(&mut events).await,
+            ServiceEvent::TextDelta {
+                id: session,
+                text: "!".to_owned(),
+            }
+        );
+
+        let ServiceEvent::RunFinished { id, output } = next_event(&mut events).await else {
+            panic!("expected run_finished");
+        };
+        assert_eq!(id, session);
+        assert_eq!(output.text, "hi!");
+    }
+
+    #[tokio::test]
+    async fn subscribe_filters_events_by_session() {
+        let fake = FakeLlmClient::scripted(vec![
+            text_stream_with_usage(&["ignored"], usage(1, 1)),
+            text_stream_with_usage(&["ok"], usage(1, 1)),
+        ]);
+        let engine = engine_with_fake(fake);
+
+        let observed = create_session(&engine).await;
+        let other = create_session(&engine).await;
+        let mut events = engine.subscribe(Some(observed));
+
+        // A run on `other` must not leak into a subscription filtered to
+        // `observed`.
+        engine
+            .send_message(other, UserInput::text("ignore"))
+            .await
+            .expect("send to other session");
+        engine
+            .send_message(observed, UserInput::text("hi"))
+            .await
+            .expect("send to observed session");
+
+        let ServiceEvent::RunStarted { id, .. } = next_event(&mut events).await else {
+            panic!("expected run_started for observed session");
+        };
+        assert_eq!(id, observed);
+        assert!(matches!(
+            next_event(&mut events).await,
+            ServiceEvent::TextDelta { id, .. } if id == observed
+        ));
+        assert!(matches!(
+            next_event(&mut events).await,
+            ServiceEvent::RunFinished { id, .. } if id == observed
+        ));
+    }
+
+    #[tokio::test]
     async fn send_message_accumulates_history_in_one_session() {
         let fake = FakeLlmClient::scripted(vec![
             text_stream_with_usage(&["first"], usage(3, 1)),
             text_stream_with_usage(&["second"], usage(5, 2)),
         ]);
         let engine = engine_with_fake(fake.clone());
-        let mut events = engine.subscribe();
-        let session = create_session(&engine, &mut events).await;
+        let session = create_session(&engine).await;
+        let mut events = engine.subscribe(Some(session));
 
         engine
-            .handle_command(Command::SendMessage {
-                session_id: session.id,
-                text: "hi".to_owned(),
-                attachments: Vec::new(),
-            })
+            .send_message(session, UserInput::text("hi"))
             .await
             .expect("first send");
         for _ in 0..3 {
@@ -628,11 +612,7 @@ mod chat {
         }
 
         engine
-            .handle_command(Command::SendMessage {
-                session_id: session.id,
-                text: "again".to_owned(),
-                attachments: Vec::new(),
-            })
+            .send_message(session, UserInput::text("again"))
             .await
             .expect("second send");
         for _ in 0..3 {

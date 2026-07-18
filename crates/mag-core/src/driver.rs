@@ -61,30 +61,59 @@ impl SessionDriver {
     }
 
     /// Drives one user message through the facade [`Agent`] and emits run
-    /// lifecycle events.
+    /// lifecycle events, returning the run identity minted for this turn.
     ///
     /// The turn is streamed: a [`RunStarted`](Event::RunStarted) is emitted
     /// before the drive, each streamed text delta becomes an
     /// [`Event::TextDelta`], and the terminal `Done` event is folded into a
-    /// [`RunFinished`](Event::RunFinished).
-    ///
-    /// # Errors
-    ///
-    /// Returns any [`FacadeError`] surfaced while opening or draining the facade
-    /// stream, or [`FacadeError::InvalidState`] if the stream ends without a
-    /// terminal `Done` event.
+    /// [`RunFinished`](Event::RunFinished). A failure surfaced while draining the
+    /// facade stream is reported as an [`Event::RunError`] on the event bus
+    /// rather than a method error, because the run has already started; the
+    /// returned [`RunId`](WireRunId) still identifies the started run.
     pub(crate) async fn send_message(
         &mut self,
         session_id: SessionId,
         text: String,
         events: EventBus,
-    ) -> Result<RunOutput, FacadeError> {
+    ) -> WireRunId {
         let run_id = self.next_run_id();
         let _ = events.emit(Event::RunStarted {
             id: session_id,
             run_id,
         });
 
+        match self.drive(session_id, text, &events).await {
+            Ok(output) => {
+                let _ = events.emit(Event::RunFinished {
+                    id: session_id,
+                    output,
+                });
+            }
+            Err(error) => {
+                let _ = events.emit(Event::RunError {
+                    id: session_id,
+                    message: error.to_string(),
+                });
+            }
+        }
+
+        run_id
+    }
+
+    /// Consumes the facade stream for one turn, projecting incremental events and
+    /// folding the terminal `Done` into a [`RunOutput`].
+    ///
+    /// # Errors
+    ///
+    /// Returns any [`FacadeError`] surfaced while opening or draining the facade
+    /// stream, or [`FacadeError::InvalidState`] if the stream ends without a
+    /// terminal `Done` event.
+    async fn drive(
+        &mut self,
+        session_id: SessionId,
+        text: String,
+        events: &EventBus,
+    ) -> Result<RunOutput, FacadeError> {
         let mut final_output: Option<RunOutput> = None;
         {
             let mut stream = self.agent.stream(text).await?;
@@ -98,16 +127,11 @@ impl SessionDriver {
             }
         }
 
-        let output = final_output.ok_or_else(|| {
+        final_output.ok_or_else(|| {
             FacadeError::InvalidState(
                 "agent stream ended without a terminal `Done` event".to_owned(),
             )
-        })?;
-        let _ = events.emit(Event::RunFinished {
-            id: session_id,
-            output: output.clone(),
-        });
-        Ok(output)
+        })
     }
 
     /// Mints the next envelope run identity for this session.

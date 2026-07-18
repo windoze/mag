@@ -514,7 +514,7 @@ C2–C5 直接对着 `MagService` trait 写、测试经 trait 调用。** 设计
   mag-sources 1 + mag-tools 1，doctest 全绿）、`cargo doc --no-deps --workspace`。
 - 说明：本任务仅定义抽象，`Engine impl MagService` 与既有路径改经 trait 属 CS-3，未在此实现。
 
-### [TODO] CS-3 `Engine impl MagService` + 既有路径改经 trait
+### [DONE] CS-3 `Engine impl MagService` + 既有路径改经 trait
 
 **上下文**：
 
@@ -539,7 +539,37 @@ C2–C5 直接对着 `MagService` trait 写、测试经 trait 调用。** 设计
 - 聚焦：`cargo test -p mag-core`（trait 路径用例）。
 - 完整验证序列 1–5。
 
-### [TODO] CS-R Review：service 接口抽取一致性
+**完成记录（2026-07-18）**：
+
+- `crates/mag-core/src/engine.rs`：删除 `handle_command`/`CommandOutput`/`EngineError`/引擎本地 `SessionInfo`/
+  inherent `subscribe`，改为 `#[async_trait] impl MagService for Engine`。方法映射：`create_session`（铸 id、
+  存 `SessionConfig`、emit `SessionCreated`）、`list_sessions`、`send_message`（查会话→`SessionNotFound`；无
+  client→`Backend "no LLM client configured"`；否则交 run loop）、`subscribe(Option<SessionId>)`（包装既有
+  broadcast `EventBus`，`Event`→`ServiceEvent` 投影，`Some(id)` 时按 `session_id()` 过滤）；`resume_session`/
+  `delete_session`/`cancel`/`respond_interaction`/`list_sources`/`probe_local_agents` 暂返
+  `ServiceError::Unsupported`（分属 C2/C3/C4）。`SessionManager` 简化为 `Mutex<BTreeMap<SessionId,
+  SessionConfig>>`（仅元数据）。
+- `crates/mag-service/src/service.rs`：新增 `impl From<Event> for ServiceEvent`（变体逐一映射，同 crate 无需
+  通配）+ 单测 `event_projects_into_matching_service_event`，供 `subscribe` 投影复用。
+- `crates/mag-core/src/driver.rs`：`send_message` 现返回 `RunId` 并在内部 emit `RunStarted` 与终态
+  `RunFinished`/`RunError`；抽出私有 `drive()` 消费 `agent.stream(..)`。
+- **关键：Send 正确性**。agent-lib facade `Agent::stream` 借用 `&mut agent` 且返回的 `AgentRunStream` 非
+  `Send`，无法在 `#[async_trait]`（默认 `Send`）的 `impl MagService` future 内联驱动，也无法搬到多线程执行器。
+  故新增 `crates/mag-core/src/run_loop.rs`：`Engine`（仅在 `with_llm_client` 时）拥有一条专用 OS 线程，线程内
+  跑 `current_thread` runtime + `block_on` 循环，独占 `HashMap<SessionId, SessionDriver>`（agent 持久化以累积
+  历史）。`send_message` 只经 `mpsc`/`oneshot`（均 `Send`、跨 runtime 唤醒有效）把 `RunLoopCommand::Run` 交给
+  线程；`RunLoop: Drop` 关闭 channel 并 join 线程（测试不泄漏线程）。这是 `docs/DESIGN.md` §3.1 per-session
+  actor 机制的最小实现，**非 workaround**；C2-1 在此之上重构为 per-session actor 并加 cancel 旁路/并发隔离。
+- `MagIds`（C0-3）评估：已于 C1-3 随 facade 接入移除，改由 facade `FacadeIds` owns ids（见 `PLAN.md` R-E），
+  本任务代码无 `MagIds` 残留，仅 `SessionId` 由引擎单调铸造。
+- 既有 C1 单元测试全部改经 `MagService` trait（`create_session`/`list_sessions`/`send_message`/
+  `subscribe(Some(id))`）并保持事件序列断言等价；新增 `unimplemented_methods_return_unsupported`、
+  `send_message_to_unknown_session_reports_session_not_found`、`arc_dyn_service_streams_ordered_run_events`、
+  `subscribe_filters_events_by_session`（双流分流）。
+- 完整验证序列全绿：`cargo fmt --all -- --check`、`cargo test -p mag-core -p mag-service`（mag-core 12 +
+  mag-service 10）、`cargo clippy --all-targets -- -D warnings`（干净）、`cargo test --workspace --all-targets`
+  （mag-core 12 + mag-service 10 + mag-sources 1 + mag-tools 1）、`cargo doc --no-deps --workspace`（无警告）；
+  `cargo tree -p mag-service` 仍不含 agent-lib。
 
 **做什么**：核对 `mag-service` 与 `docs/DESIGN.md` §2/§3.0/§4 一致——纯抽象不依赖 agent-lib、object-safe、
 近全集覆盖（多会话/审批/委派/source 都在 trait 里，即便暂无 interface 用）；`Engine` 实现无遗漏；
@@ -560,6 +590,10 @@ Command/Event 归属 mag-service 且仍是 `ServiceEvent` 的投影。汇总缺�
 - `docs/DESIGN.md` §3.1：每会话一个 actor，持 `mpsc<SessionCommand>` 入口；run 在 actor 内独立 task 推进；
   控制命令（cancel/respond）走旁路。用 actor 而非 Mutex，避免 run 长借用阻塞控制命令。
 - agent-lib `Agent`/machine 是 `&mut self`，一个会话内 run 必须串行；actor 天然串行化会话内命令。
+- 起点：CS-3 已建单条全局 run-executor 线程（`crates/mag-core/src/run_loop.rs`，`current_thread` runtime +
+  `HashMap<SessionId, SessionDriver>`，run 串行、`send_message` 经 `mpsc`/`oneshot` 交付）。本任务把它重构为
+  per-session actor（每会话一线程/task），并叠加 cancel 旁路与跨会话并发隔离；沿用其非 `Send` stream 只在
+  持有 agent 的线程内驱动这一约束。
 
 **做什么**：
 
