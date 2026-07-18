@@ -158,7 +158,7 @@
   `cargo test -p mag-core ids`、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`（30 分钟上限包装，
   15 个单元测试 + doctest 全绿）、`cargo doc --no-deps --workspace`。
 
-### [TODO] C0-R Review：骨架 + 协议一致性
+### [DONE] C0-R Review：骨架 + 协议一致性
 
 **上下文**：C0-1..C0-3 收官 review。
 
@@ -169,6 +169,58 @@
 - 汇总遗留缺口为后续任务。
 
 **验证条件**：完整验证序列 1–5 全绿；协议对照表（§4 承诺 vs 已实现）。
+
+**完成记录（2026-07-18）**：
+
+- 核对 `DESIGN.md` §2：workspace 只包含 C0 范围内的 `mag-protocol`、`mag-core`、`mag-tools`、
+  `mag-sources` 四个 crate；`mag-core` 依赖 `agent-lib` 与三个本地核心 crate，未引入 tauri / axum / ACP
+  front door crate。
+- `cargo tree -p mag-protocol` 确认 `mag-protocol` 没有 `agent-lib` 依赖；其直接依赖仅为 wire
+  payload 所需的 `serde`、`serde_json`、`uuid`。
+- 核对 `DESIGN.md` §4 时发现 `Event::DelegationMessage` 尚未实现；已在 `mag-protocol` 补齐
+  `Event::DelegationMessage { id, message }` 与 `DelegationMessageWire`，并加入稳定 tag/serde round-trip 测试。
+- 核对会增长的公开 enum：`Command`、`Event`、`RoutingMode`、`ToolStatusWire`、
+  `InteractionKindWire`、`InteractionResponseWire`、`ApprovalRequirementWire`、
+  `ApprovalDecisionWire`、`PermissionCategoryWire`、`PermissionRiskWire`、
+  `PermissionDecisionWire`、`SourceKindWire` 均已标注 `#[non_exhaustive]`。
+- 关键 serde 覆盖：`Command` 每个变体、`Event` 每个变体、交互 request/response、routing 默认值、
+  UUID-backed wire id 均有 round-trip 或稳定 tag 单元测试。
+
+| `DESIGN.md` §4 承诺 | 已实现状态 |
+|---|---|
+| `Command::CreateSession { config }` | 已实现，serde tag `create_session` |
+| `Command::ListSessions` | 已实现，serde tag `list_sessions` |
+| `Command::ResumeSession { id }` | 已实现，serde tag `resume_session` |
+| `Command::DeleteSession { id }` | 已实现，serde tag `delete_session` |
+| `Command::SendMessage { session_id, text, attachments? }` | 已实现，`attachments` 默认空且空时不序列化，serde tag `send_message` |
+| `Command::CancelRun { session_id }` | 已实现，serde tag `cancel_run` |
+| `Command::RespondInteraction { session_id, request_id, response }` | 已实现，serde tag `respond_interaction` |
+| `Command::ListSources` | 已实现，serde tag `list_sources` |
+| `Command::ProbeLocalAgents` | 已实现，serde tag `probe_local_agents` |
+| `Event::SessionCreated { id, config }` | 已实现，serde tag `session_created` |
+| `Event::RunStarted { id, run_id }` | 已实现，serde tag `run_started` |
+| `Event::RunFinished { id, output }` | 已实现，serde tag `run_finished` |
+| `Event::RunError { id, message }` | 已实现，serde tag `run_error` |
+| `Event::TextDelta { id, text }` | 已实现，serde tag `text_delta` |
+| `Event::ToolStarted { id, trace }` | 已实现，serde tag `tool_started` |
+| `Event::ToolFinished { id, trace }` | 已实现，serde tag `tool_finished` |
+| `Event::InteractionRequested { id, request_id, kind }` | 已实现，serde tag `interaction_requested` |
+| `Event::DelegationStarted { id, trace }` | 已实现，serde tag `delegation_started` |
+| `Event::DelegationFinished { id, trace }` | 已实现，serde tag `delegation_finished` |
+| `Event::DelegationFailed { id, trace }` | 已实现，serde tag `delegation_failed` |
+| `Event::DelegationMessage { id, .. }` | 已实现为 `{ id, message: DelegationMessageWire }`，serde tag `delegation_message` |
+| `Event::LocalAgentsProbed { available }` | 已实现，serde tag `local_agents_probed` |
+| `InteractionKindWire::{Approval, Question, Choice, Permission}` | 已实现；`Permission` 含 `category`、`risk`、`summary`、`subject` |
+| `InteractionResponseWire::{Approval, Answer, Choice, Permission}` | 已实现，独立 wire 类型，不依赖 `agent-lib` |
+| `SessionConfig` provider/model/tool profile/routing | 已实现；`routing` 默认 `model_routed` |
+| `ToolTrace` / `DelegationTrace` / `SourceInfo` | 已实现为传输无关 serde payload |
+
+- C0 review 未发现需要插入 `TODO.md` 的遗留阻塞缺口；后续纯对话流式、会话 actor、审批、工具、持久化等能力仍按
+  C1+ 既有任务推进。
+- 验证通过：`cargo fmt --all`、`cargo fmt --all -- --check`、`cargo test -p mag-protocol`、
+  `cargo tree -p mag-protocol`、`cargo tree -p mag-core` 依赖边界核对、
+  `cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`（30 分钟上限包装，15 个单元测试 +
+  doctest 全绿）、`cargo doc --no-deps --workspace`。
 
 ---
 

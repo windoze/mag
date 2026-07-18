@@ -239,6 +239,13 @@ pub enum Event {
         /// Delegation trace data available at failure time.
         trace: DelegationTrace,
     },
+    /// A delegated child agent emitted a message.
+    DelegationMessage {
+        /// Session that owns the delegation.
+        id: SessionId,
+        /// Delegated-agent message payload.
+        message: DelegationMessageWire,
+    },
     /// Local coding-agent probes completed.
     LocalAgentsProbed {
         /// Available sources discovered by the probe.
@@ -368,6 +375,18 @@ pub struct DelegationTrace {
     /// Optional failure or status message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+/// Message emitted by a delegated child agent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationMessageWire {
+    /// Optional parent run identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<RunId>,
+    /// Stable delegate name or source key.
+    pub delegate: String,
+    /// Message text emitted by the delegated agent.
+    pub text: String,
 }
 
 /// Interaction request shown to a user or policy engine.
@@ -656,6 +675,14 @@ mod tests {
         }
     }
 
+    fn delegation_message() -> DelegationMessageWire {
+        DelegationMessageWire {
+            run_id: Some(run_id()),
+            delegate: "codex".to_owned(),
+            text: "child agent update".to_owned(),
+        }
+    }
+
     fn interaction_kind() -> InteractionKindWire {
         InteractionKindWire::Permission {
             action_id: "action-1".to_owned(),
@@ -834,6 +861,13 @@ mod tests {
                     trace: delegation_trace(Some("delegate crashed")),
                 },
                 "delegation_failed",
+            ),
+            (
+                Event::DelegationMessage {
+                    id: session_id(),
+                    message: delegation_message(),
+                },
+                "delegation_message",
             ),
             (
                 Event::LocalAgentsProbed {
