@@ -301,13 +301,16 @@ committed_at）、`messages`（可选冗余，供列表预览）。
 - **快照时机**：agent-lib 的 `AgentState` snapshot 只能在 **committed 一致点**取。actor 在每次 run
   成功结束后取快照写库。run 进行中（审批挂起、tool round 中途）不能安全 snapshot。
 - **恢复**：`ResumeSession` → 读快照 → `Agent::restore()` builder 重注入 provider / 工具 / approval
-  （client / 工具闭包 / 审批 handler 不在快照里，须重建）。本地 agent 委派用 agent-lib 的
-  `RestoreExternal::MarkInterrupted` 保守默认（coding agent 可能已改工作区，盲目重启有风险）。
-- **⚠ 已知缺口（跟踪中）**：agent-lib 的 `Agent::restore()`（`AgentRestoreBuilder`）**目前没有
-  `interaction_handler(..)` 注入口**，恢复出的 `Agent` 强制回落到同步 `FacadeApproval`——即恢复后的会话
-  暂时无法用 `IpcApproval` 做跨进程审批。已在 agent-lib 追加后续任务补齐该注入口（与 `AgentBuilder` 对齐）。
-  在其落地前，mag 的持久化恢复只对**纯对话 / 只读工具（auto-allow，不触发审批）**的会话完全可用；需审批的
-  会话恢复要等该缺口修复（见 `../PLAN.md` R-B、`../TODO.md` C4-1 依赖）。
+  （client / 工具闭包 / 审批 handler 不在快照里，须重建）。审批经
+  `AgentRestoreBuilder::interaction_handler(Arc<IpcApproval>)` 重注入（见下）。本地 agent 委派用 agent-lib
+  的 `RestoreExternal::MarkInterrupted` 保守默认（coding agent 可能已改工作区，盲目重启有风险）。
+- **恢复后的跨进程审批（缺口已消解）**：agent-lib **M7-F1（`29c4e2a`，已 `[DONE]`）** 已给
+  `Agent::restore()`（`AgentRestoreBuilder`）补上 `interaction_handler(Arc<dyn InteractionHandler>)`
+  注入口，签名 / 相对 `.approval(..)` 的优先级 / 同步 + 流式两路生效均与 `AgentBuilder::interaction_handler`
+  完全对齐。因此恢复出的会话重注入 `IpcApproval` 后即可继续跨进程审批，**需审批的会话恢复不再受限**。
+  snapshot 仍是 data-only、不携带该运行期句柄，故恢复时**必须**重注入；未重注入才回落到同步 `FacadeApproval`
+  （与恢复前行为一致，向后兼容）。原「恢复只对纯对话 / 只读工具会话可用」的限制已作废（见 `../PLAN.md` R-B、
+  `../TODO.md` C4-1）。
 
 ---
 
@@ -538,9 +541,11 @@ trait ToolPlugin {
 4. **工具**用 `Tool::function_with_schema`（无需 feature），handler 是 async 闭包 + `ToolContext`；经
    `AgentBuilder::tool(..)` 注册。agent-lib 只有工具框架无具体实现——fs/shell 全由 mag 自建（§7）。
 5. **snapshot/restore**：`Agent::snapshot()` 只在 committed 一致点取，data-only 无 secret；
-   `Agent::restore()` builder 重注入 provider / 工具 / approval。**⚠ restore builder 目前无
-   `interaction_handler` 注入口**（恢复会话回落到同步 `FacadeApproval`）——已反馈 agent-lib 补齐；在其
-   落地前，需审批的会话恢复受限（见 §3.6、`../PLAN.md` R-B）。
+   `Agent::restore()` builder 重注入 provider / 工具 / approval。审批经
+   `AgentRestoreBuilder::interaction_handler(Arc<dyn InteractionHandler>)`（agent-lib **M7-F1**，与
+   `AgentBuilder::interaction_handler` 对齐）重注入 `IpcApproval`；未重注入才回落到同步 `FacadeApproval`。
+   需审批的会话恢复已完全可用（见 §3.6）。协作原语（mailbox/blackboard/plan）的 snapshot/restore 也已在
+   agent-lib M3 落实为真实数据保存（早期会丢弃，现已修复）。
 6. **富化的 `ApprovalRequest`**（agent-lib M7-3，在 prelude）带 `tool_name`/`call_id`/`reason`/`input`
    （已脱敏摘要），UI 可据此渲染有意义的审批框。Permission 通道（`agent/permission.rs`）带 category /
    有序 risk / subject，是 AI-permission 落点（§8.1）。
@@ -551,8 +556,11 @@ trait ToolPlugin {
    备选钩子 `ApprovalPolicy::on_permission(..)`（但 mag 整体注入 `IpcApproval` 时以后者为准，§8.1）。
 
 > agent-lib 的 **Milestone 7（宿主嵌入接入面，已 `[DONE]`）** 补齐了上述注入口，使 mag **无需下沉自组
-> `HandlerScope`/`drain`**，绝大部分留在 facade 内。唯一残留缺口是约束 5 的 restore 注入口，已在 agent-lib
-> 追加后续任务跟踪。
+> `HandlerScope`/`drain`**，绝大部分留在 facade 内。M7 之后 agent-lib 又做了一轮 refinement（M1–M6 +
+> **M7-F1**，均 `[DONE]`）：**M7-F1 补齐了约束 5 的 restore `interaction_handler` 注入口**（原唯一残留缺口，
+> 现已消解）；M1 让流式 stream 提前 drop 自动 abandon 在途 turn，M2 让非流式 `RunOutput.events` 也含
+> `ApprovalRequested`（流式/非流式事件契约对齐），M3 让协作原语 snapshot/restore 真正保存数据。这些都巩固了
+> mag 依赖的「失败/取消后回到 committed 一致点」与「可恢复」契约，**mag 侧不再有 agent-lib 阻塞缺口**。
 
 ---
 
@@ -581,9 +589,9 @@ demo，协议向后兼容累加。
 1. **审批异步暂停是地基，不能事后补**。通过 facade 注入口 `AgentBuilder::interaction_handler(IpcApproval)`
    解决（agent-lib M7-1）；`fulfill` 里真正 await，machine 停在暂停点。service 主干（阶段 S）早期用 facade
    `ChatSession` 作纯对话脚手架，随后切到 `Agent` + 注入。
-2. **restore 无审批注入口（残留缺口）**。`Agent::restore()` 目前回落到同步 `FacadeApproval`，恢复后的会话
-   暂时无法跨进程审批。已反馈 agent-lib 补齐；在其落地前，需审批的会话恢复受限（纯对话 / 只读工具会话不受
-   影响）。见 §3.6、`../PLAN.md` R-B。
+2. **restore 审批注入口（缺口已消解）**。agent-lib **M7-F1** 已给 `Agent::restore()` 补上
+   `interaction_handler(..)` 注入口（与 `AgentBuilder` 对齐），恢复出的会话重注入 `IpcApproval` 后即可跨进程
+   审批，需审批的会话恢复不再受限；未重注入才回落到同步 `FacadeApproval`（向后兼容）。见 §3.6、`../PLAN.md` R-B。
 3. **snapshot 只能在 committed 一致点**。run 进行中崩溃/退出，会话回到上一个 committed 点，进行中的
    turn 丢失；本地 agent 更麻烦（可能已改工作区）→ `MarkInterrupted` 保守默认。
 4. **web / ACP 的安全边界**。web 绑 `127.0.0.1` 不够（DNS-rebinding / 本机其它进程）→ 加启动时生成的

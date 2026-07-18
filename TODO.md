@@ -322,7 +322,10 @@
   `WireRunEvent` 序列化投影、`default_external_session_handler` 等，全部 `[DONE]`）。这使 mag **不再需要**
   下沉自组 `HandlerScope`/`drain`——原因见 `docs/DESIGN.md` §3.2 与 `PLAN.md` R-A/R-B。C1-1（自建
   `StreamingTapHandler`）与 C1-2（自组 `MagScope`+`drain`+`AgentSpec` 装配）是 M7 之前的实现，本任务把它们
-  切到 facade 路径。
+  切到 facade 路径。M7 之后 agent-lib 又完成一轮 refinement（M1–M6 + **M7-F1**，全 `[DONE]`）：M7-F1 补齐
+  `AgentRestoreBuilder::interaction_handler(..)`（消解 R-B）；M1 流式 drop 自动 abandon、M2 非流式
+  `RunOutput.events` 含 `ApprovalRequested`、M3 协作原语 snapshot/restore 真正保存数据——巩固了 mag 依赖的
+  一致点/可恢复契约。
 - 目标接入面（`docs/DESIGN.md` §9、`PLAN.md` 锚点，已核对 agent-lib 源码）：
   - `facade::Agent::builder().provider(..).model(..).build()`（纯对话；带工具/审批见 C3）。
   - `Agent::stream(input) -> AgentRunStream`：逐 `RunEvent` 消费；`RunEvent::TextDelta` 直接产出。
@@ -745,27 +748,29 @@ worktree/cancel 约束生效；`PermissionDecider` 钩子留位正确（§8.1）
   （facade `Agent::snapshot()` 约束，run 中途不可 snapshot）。恢复用 `Agent::restore()` builder 重注入
   provider/工具/approval（client/工具闭包/审批 handler 不在 snapshot 里）。
 - `PLAN.md` R-D：snapshot 存 JSON blob（agent-lib `AgentSnapshot` serde），schema 只存稳定列 + version 列。
-- **⚠ R-B 依赖**：facade `Agent::restore()`（`AgentRestoreBuilder`）**目前无 `interaction_handler(..)`
-  注入口**，恢复出的 `Agent` 回落到同步 `FacadeApproval`——**需审批的会话恢复后无法跨进程审批**。已在
-  agent-lib 追加后续任务补该注入口（见其 `TODO.md`）。本任务**依赖该修复**才能完整支持"需审批会话恢复"；
-  在其落地前，C4-1 只实现并测试**纯对话 / 只读工具（auto-allow）会话**的恢复，需审批会话的恢复标为受限
-  （测试用 auto-allow 会话，或用 `#[ignore]` 占位待 restore 注入口就绪）。
+- **R-B 依赖已满足**：agent-lib **M7-F1（`29c4e2a`，`[DONE]`）** 已给 `Agent::restore()`
+  （`AgentRestoreBuilder`）补上 `interaction_handler(Arc<dyn InteractionHandler>)` 注入口，签名 / 相对
+  `.approval(..)` 优先级 / 同步 + 流式两路生效均与 `AgentBuilder::interaction_handler` 对齐。恢复时重注入
+  `IpcApproval` 即可跨进程审批，**本任务可直接完整支持"需审批会话恢复"，不再受限、不再需要 `#[ignore]` 占位**。
+  snapshot 仍 data-only 不带该句柄，故恢复**必须**重注入；未重注入才回落同步 `FacadeApproval`。
 
 **做什么**：
 
 - 实现持久层（`rusqlite`/`sqlx`）：建表、`save_session`/`save_snapshot`/`load_snapshot`/`list_sessions`/
   `delete_session`。snapshot 存 facade `Agent::snapshot() -> AgentSnapshot` 的 JSON。
 - actor 在每次 run 成功结束（committed）后取快照写库。
-- `ResumeSession`：读快照 → `Agent::restore()` 重注入 provider/工具/approval（审批注入待 R-B 修复）→
-  会话可继续。
+- `ResumeSession`：读快照 → `Agent::restore()` 重注入 provider/工具/approval（审批经
+  `AgentRestoreBuilder::interaction_handler(Arc<IpcApproval>)` 重注入，R-B 已满足）→ 会话可继续。
 
 **验证条件**：
 
 - 单元测试（临时 SQLite）：run 后 snapshot 写库；`load_snapshot` round-trip 与内存态一致。
-- 单元测试（跨"重启"，**纯对话/只读工具会话**）：会话 A 跑两轮 → 取快照 → 丢弃内存 Engine → 新 Engine
+- 单元测试（跨"重启"，纯对话/只读工具会话）：会话 A 跑两轮 → 取快照 → 丢弃内存 Engine → 新 Engine
   `ResumeSession(A)` → 历史可见、第三轮 `SendMessage` 能看到前两轮上下文；id 不冲突。
 - 单元测试：snapshot JSON 不含任何凭据/secret（断言）。
-- 需审批会话的恢复测试：待 agent-lib restore 注入口落地后补齐（本任务可留 `#[ignore]` 占位并注明依赖）。
+- 单元测试（跨"重启"，**需审批会话**，R-B 已满足）：会话跑到审批挂起 → 取快照（在挂起前的 committed 点）→
+  新 Engine `ResumeSession` 重注入 `IpcApproval` → 后续 run 触发的审批仍走跨进程 `IpcApproval` 往返（离线用
+  scripted handler 断言 restore 后审批暂停点仍在 handler 侧应答，而非同步 `FacadeApproval`）。
 - 聚焦：`cargo test -p mag-core persist`。
 - 完整验证序列 1–5。
 
@@ -834,7 +839,7 @@ store、恢复重注入。汇总缺口。
 - **冻结 `MagService` trait 契约**（后续只加方法/变体/字段，不改既有语义）；`Command`/`Event` 作为其 wire
   编码一并冻结；若启用 TS codegen，产出并校验前端类型。
 - 汇总所有里程碑遗留缺口；确认无未调度失败测试；记录哪些 R（风险）已消解、哪些转为上层任务
-  （如 R-B facade restore 注入口回收 = 依赖 agent-lib M7-F1、R-C 本地 agent 接入 = §10 I2）。
+  （**R-B facade restore 注入口 = agent-lib M7-F1 已落地、缺口已消解**；R-C 本地 agent 接入 = §10 I2）。
 - **放行判据**：C0–C1 + CS + C2–C5 全 `[DONE]`、完整验证序列全绿、端到端离线主干测试（经 `MagService`）
   稳定通过。满足后方可另起 interface 任务单，**第一个是 mag-acp（I1）**。
 

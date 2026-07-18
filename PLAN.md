@@ -74,7 +74,8 @@ interface**（ACP/web/Tauri 都在上层）。具体：
   PermissionDecision, PermissionResponse}`（全 serde；risk 有序）；AI-permission 落点在 `IpcApproval` 的
   Permission 分支（`docs/DESIGN.md` §8.1）。
 - **持久化**：`Agent::snapshot() -> AgentSnapshot`（committed 一致点，data-only）/ `Agent::restore()`
-  builder 重注入 provider/工具/approval。**⚠ restore 无 `interaction_handler` 注入口**（见 R-B）。
+  builder 重注入 provider/工具/approval，审批经 `AgentRestoreBuilder::interaction_handler(..)`（agent-lib
+  M7-F1，与 `AgentBuilder` 对齐）重注入 `IpcApproval`（见 R-B，缺口已消解）。
 - **纯对话备选（C0/C1 早期脚手架）**：facade `Chat`/`ChatSession`（`src/facade/chat.rs`，无工具）。
 - **id source**：facade 内建 `FacadeIds`；mag 若需确定性可选 `AgentBuilder::ids(..)`。自组 scope 时代的
   `MagIds`（已在 C0-3 实现）在 facade 路径下降级为可选/仅测试用，切换时评估去留。
@@ -147,11 +148,12 @@ interface，第一个），再到 I2/I3/I4。**
 - **R-A【已消解】流式 tap**：早期担心库 `LlmClientHandler` 内部聚合、需自建 `StreamingTapHandler`。
   agent-lib M7 之后走 facade `Agent::stream`（已产 `TextDelta`）+ `WireRunEvent`，无需自建。C1 早期实现的
   自建 tap 随 C1-3 切换移除。
-- **R-B【反转】restore 无审批注入口（残留缺口）**：M7-1 已透出 `AgentBuilder::interaction_handler(..)`，
-  主路径注入 `IpcApproval` 已可行；但 `Agent::restore()`（`AgentRestoreBuilder`）**没有对应注入口**，恢复
-  出的 `Agent` 回落到同步 `FacadeApproval`。影响：需审批的会话**恢复后无法跨进程审批**。取向：已在 agent-lib
-  追加后续任务补 restore 注入口；在其落地前，C4 恢复只对纯对话/只读工具（auto-allow）会话完全可用，需审批
-  会话的恢复标为受限并依赖该修复（C4-1 记录依赖）。
+- **R-B【已消解】restore 审批注入口**：M7-1 透出 `AgentBuilder::interaction_handler(..)`（主路径），
+  **M7-F1（`29c4e2a`）已补齐对应的 `AgentRestoreBuilder::interaction_handler(Arc<dyn InteractionHandler>)`**，
+  签名 / 相对 `.approval(..)` 优先级 / 同步 + 流式两路生效均与 `AgentBuilder` 对齐。恢复出的会话重注入
+  `IpcApproval` 后即可跨进程审批，**C4 恢复对需审批会话已完全可用**，原「只对纯对话/只读工具会话可用」的限制
+  作废。snapshot 仍 data-only 不带该句柄，故恢复须重注入；未重注入才回落同步 `FacadeApproval`。C4-1 不再被
+  此缺口阻塞。
 - **R-C 本地 agent 来源推迟**：mag-core 主干先只做 LLM API + 本地工具。source registry 与委派结构必须
   为本地 agent 预留位置（enum 变体 / trait 对象槽），但不实现 live 接入。I2（`docs/DESIGN.md` §10）用 M7-4 的
   `default_external_session_handler` 直接接入，无需自己 wire。避免主干被 external feature 与 CLI 环境

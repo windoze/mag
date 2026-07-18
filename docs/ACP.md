@@ -105,9 +105,9 @@ mag-acp 持有一个 `Arc<dyn MagService>`（由 bin 在启动时用 mag-core `E
 
 - 仅当 §3.1 宣告了 `load_session`。`LoadSessionRequest` 带 ACP `SessionId`。
 - 反查 mag `SessionId`，调 `service.resume_session(id).await`，回 `LoadSessionResponse`。
-- **约束**：mag 的持久化恢复目前对"需审批会话"受限（依赖 agent-lib restore 注入口，见 `DESIGN.md` §3.6、
-  §7）。因此 `load_session` 是否宣告为 `true`，取决于 mag-core 恢复能力的实际就绪度——未就绪则宣告 `false`，
-  client 不会调用它。
+- **恢复能力**：需审批会话的恢复已完全可用（agent-lib M7-F1 已补齐 restore 的 `interaction_handler` 注入口，
+  见 `DESIGN.md` §3.6、§7）。`load_session` 是否宣告为 `true` 仅取决于 mag-core 恢复能力的实际就绪度（C4）——
+  未就绪则宣告 `false`，client 不会调用它。
 
 ### 3.4 `session/prompt`（核心：请求 vs 事件流的桥接）
 
