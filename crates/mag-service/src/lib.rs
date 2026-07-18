@@ -1,10 +1,13 @@
 #![warn(missing_docs)]
 
-//! Transport-neutral command and event protocol types for mag.
+//! Transport-neutral service protocol types for mag.
 //!
-//! This crate owns the wire contract between front doors and `mag-core`. The
-//! types are pure serde data and deliberately do not depend on `agent-lib`, even
-//! when they mirror concepts from that crate.
+//! This crate is the home of the `mag-service` layer. It owns the wire contract
+//! between front doors and `mag-core`: the [`Command`]/[`Event`] protocol plus
+//! their payloads and identifier types. The types are pure serde data and
+//! deliberately do not depend on `agent-lib`, even when they mirror concepts
+//! from that crate. Later tasks add the `MagService` trait alongside these
+//! protocol types.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

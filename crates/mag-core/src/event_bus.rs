@@ -5,7 +5,7 @@ use std::{
     task::{Context, Poll, ready},
 };
 
-use mag_protocol::Event;
+use mag_service::Event;
 use tokio::sync::broadcast;
 use tokio_stream::{
     Stream,

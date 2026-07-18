@@ -11,7 +11,7 @@ use std::{
 };
 
 use agent_lib::client::LlmClient;
-use mag_protocol::{Command, Event, SessionConfig, SessionId};
+use mag_service::{Command, Event, SessionConfig, SessionId};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -316,7 +316,7 @@ impl SessionIdSource {
 
 #[cfg(test)]
 mod skeleton {
-    use mag_protocol::{Command, Event, RoutingMode, SessionConfig};
+    use mag_service::{Command, Event, RoutingMode, SessionConfig};
     use tokio::time::{Duration, timeout};
     use tokio_stream::StreamExt;
 
@@ -470,7 +470,7 @@ mod chat {
             usage::Usage,
         },
     };
-    use mag_protocol::{Command, Event, RoutingMode, SessionConfig, UsageInfo};
+    use mag_service::{Command, Event, RoutingMode, SessionConfig, UsageInfo};
     use tokio::time::{Duration, timeout};
     use tokio_stream::StreamExt;
 

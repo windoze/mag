@@ -421,7 +421,7 @@ C2–C5 直接对着 `MagService` trait 写、测试经 trait 调用。** 设计
 > 顺序说明：CS 在 C1（含 C1-3 切 facade、C1-R）之后、C2 之前执行——此时 Engine 表面积最小，抽接口最便宜。
 > 本 milestone 会重构 C0-2 建立的 `mag-protocol`（迁移类型 + 删 crate），但不改任何 `[DONE]` 任务的记录。
 
-### [TODO] CS-1 新建 `mag-service` crate + 迁移 Command/Event（并入 mag-protocol）
+### [DONE] CS-1 新建 `mag-service` crate + 迁移 Command/Event（并入 mag-protocol）
 
 **上下文**：
 
@@ -443,6 +443,25 @@ C2–C5 直接对着 `MagService` trait 写、测试经 trait 调用。** 设计
 - 迁移后既有协议 round-trip 测试全绿（从 mag-protocol 移到 mag-service）。
 - `cargo tree -p mag-service` 不含 agent-lib；workspace 无 `mag-protocol` 残留。
 - 完整验证序列 1–5。
+
+**完成记录**：
+
+- `git mv crates/mag-protocol crates/mag-service` 整体迁移，保留文件历史；协议类型（`Command`/`Event`/
+  payload/ID 类型、`define_id!` 生成的 6 个 ID、`SessionConfig`/各 wire 枚举/`SourceInfo` 等）与 serde
+  契约、tag 命名逐字不变；协议 round-trip 测试（`mod tests`，5 个用例）随文件迁入 mag-service。
+- crate 改名：`mag-service/Cargo.toml` `name = "mag-service"`（依赖仍仅 serde/serde_json/uuid，不含
+  agent-lib）；crate 级 rustdoc 更新为「service protocol 载体，后续任务在此加 `MagService` trait」。
+- workspace `Cargo.toml` 成员 `crates/mag-protocol` → `crates/mag-service`；`mag-core/Cargo.toml` 依赖
+  `mag-protocol` → `mag-service = { path = "../mag-service" }`。
+- 源码 `use` 路径 `mag_protocol::` → `mag_service::`：`engine.rs`×3、`driver.rs`×2、`event_bus.rs`×1。
+  `README.md` crate 列表同步更新为 `mag-service`。历史/已 `[DONE]` 记录（TODO.md、PLAN.md、docs、memory）
+  中的 mag-protocol 字样按规则保持不变。
+- 删除 `crates/mag-protocol`（随 git mv 迁走，无残留）；`grep mag[_-]protocol crates/ Cargo.toml README.md`
+  无匹配；`Cargo.lock` 无 `mag-protocol`（cargo 已重生成含 `mag-service`）。
+- 完整验证序列全绿：`cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`（干净）、
+  `cargo test --workspace`（mag-core 9 + mag-service 5 + mag-sources 1 + mag-tools 1，doctest 全绿）、
+  `cargo doc --no-deps --workspace`；`cargo tree -p mag-service` 依赖仅 serde/serde_json/uuid（agent-lib
+  计数 0）。
 
 ### [TODO] CS-2 定义 `MagService` trait（近全集）+ `ServiceEvent`
 

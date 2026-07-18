@@ -7,7 +7,7 @@ edition.workspace = true
 agent-lib.workspace = true
 async-trait.workspace = true
 futures.workspace = true
-mag-protocol = { path = "../mag-protocol" }
+mag-service = { path = "../mag-service" }
 mag-sources = { path = "../mag-sources" }
 mag-tools = { path = "../mag-tools" }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }

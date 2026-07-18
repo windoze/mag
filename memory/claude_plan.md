@@ -102,3 +102,32 @@ Review 任务：核对 mag-core 已切到 facade `Agent`+`Agent::stream`（C1-3�
 - 完整验证序列 1–5 全绿：fmt --check、clippy -D warnings（干净）、cargo test --workspace（mag-core 9 + mag-protocol 5 + mag-sources 1 + mag-tools 1）、cargo doc。
 - Review 未发现新阻塞缺口；前向变体映射已由 C3+ 覆盖。
 - 已将 TODO.md C1-R 标 [DONE] 并补完成记录。下一步：git 提交。
+
+## CS-1 新建 `mag-service` crate + 迁移 Command/Event（并入 mag-protocol）（当前任务）
+
+### 目标
+把 `mag-protocol` 整体迁入新的 `crates/mag-service`（crate 名改为 `mag-service`），
+删除 `mag-protocol`，更新 workspace 成员、依赖与所有 `use` 路径。CS-1 只迁移协议中立类型，
+`MagService` trait 由 CS-2 引入。`mag-service` 仍不依赖 agent-lib（仅 serde/serde_json/uuid）。
+
+### 决策
+- 用 `git mv crates/mag-protocol crates/mag-service` 保留历史；文件内容原样迁入（serde 契约/tag 不变）。
+- `mag-service/Cargo.toml`：`name = "mag-service"`。更新 crate 级 rustdoc 说明其为 service protocol 载体。
+- workspace `Cargo.toml` 成员：`crates/mag-protocol` → `crates/mag-service`。
+- `mag-core/Cargo.toml`：`mag-protocol = {path=..}` → `mag-service = {path="../mag-service"}`。
+- 源码 use：`mag_protocol::` → `mag_service::`（engine.rs×3、driver.rs×2、event_bus.rs×1）。
+- README.md crate 列表：`mag-protocol` → `mag-service`。
+- TODO.md/PLAN.md/docs 中已 `[DONE]` 任务或历史记录里的 mag-protocol 字样保持不变（不改完成记录）。
+
+### 步骤
+1. git mv 目录；改 Cargo.toml name；更新 crate rustdoc。
+2. 更新 workspace 成员、mag-core 依赖、源码 use 路径、README。
+3. 验证序列：fmt --check → clippy -D warnings → cargo test --workspace → cargo doc；
+   另跑 `cargo tree -p mag-service`（无 agent-lib）、确认无 mag-protocol 代码残留。
+4. 标记 TODO.md CS-1 `[DONE]` 并补完成记录，提交。
+
+### 进度（CS-1 完成）
+- git mv 迁移 + 改名 mag-service；更新 workspace 成员、mag-core 依赖、6 处 use 路径、README、crate rustdoc。
+- 验证全绿：fmt --check、clippy -D warnings、cargo test --workspace（9+5+1+1）、cargo doc；
+  cargo tree -p mag-service 无 agent-lib；Cargo.lock/代码无 mag-protocol 残留。
+- 已标 TODO.md CS-1 [DONE] 并补完成记录。下一步：git 提交后停止。

@@ -6,7 +6,8 @@ workspace skeleton for the engine and its direct support crates.
 
 ## Workspace
 
-- `mag-protocol`: wire protocol types for commands and events.
+- `mag-service`: transport-neutral service protocol types (commands and events);
+  later hosts the `MagService` trait.
 - `mag-core`: engine entry point, session management, event bus, persistence,
   and driver integration.
 - `mag-tools`: tool registry and built-in tool integration points.

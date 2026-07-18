@@ -18,7 +18,7 @@ use agent_lib::{
     client::LlmClient,
     facade::{Agent, FacadeError, UsageSummary, WireRunEvent, WireRunOutput},
 };
-use mag_protocol::{Event, RunId as WireRunId, RunOutput, SessionConfig, SessionId, UsageInfo};
+use mag_service::{Event, RunId as WireRunId, RunOutput, SessionConfig, SessionId, UsageInfo};
 use uuid::Uuid;
 
 use crate::EventBus;
@@ -176,7 +176,7 @@ mod tests {
             usage::Usage,
         },
     };
-    use mag_protocol::{Event, SessionId, UsageInfo};
+    use mag_service::{Event, SessionId, UsageInfo};
     use serde_json::Map;
     use uuid::Uuid;
 

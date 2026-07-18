@@ -543,7 +543,7 @@ dependencies = [
  "agent-lib",
  "async-trait",
  "futures",
- "mag-protocol",
+ "mag-service",
  "mag-sources",
  "mag-tools",
  "serde_json",
@@ -553,7 +553,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mag-protocol"
+name = "mag-service"
 version = "0.1.0"
 dependencies = [
  "serde",
