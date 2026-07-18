@@ -1,28 +1,35 @@
-# 实施计划：mag-core（引擎核心）
+# 实施计划：mag service（`mag-service` 接口 + `mag-core` 实现）
 
-> 唯一设计输入：[`DESIGN.md`](DESIGN.md)（尤其 §1 全局架构、§3 mag-core、§4 协议、§9 接入 agent-lib 约束）。
+> 唯一设计输入：[`docs/DESIGN.md`](docs/DESIGN.md)（尤其 §1 全局架构、§3 mag-service 接口与 mag-core 实现、
+> §4 Command/Event 编码、§9 接入 agent-lib 约束）。
 > 底层库 [`agent-lib`](../agent-lib) 的接入面见其 [`README.md`](../agent-lib/README.md) 与
-> [`DESIGN.md`](../agent-lib/DESIGN.md)；facade 缺口与后续注入口见 agent-lib 的
+> [`docs/DESIGN.md`](../agent-lib/DESIGN.md)；facade 缺口与后续注入口见 agent-lib 的
 > [`PLAN.md`](../agent-lib/PLAN.md) Milestone 7。
 >
-> **本计划只覆盖 mag-core（引擎）+ 其直接依赖的 mag-protocol / mag-tools / mag-sources 的核心部分。**
-> 上层（mag-tauri / mag-server / mag-acp / app 前端）**不在本计划范围**——它们必须等 mag-core 充分测试
-> 通过、契约稳定后，再按 `DESIGN.md` §10 里程碑 M1+ 单独规划。逐任务清单见 [`TODO.md`](TODO.md)。
+> **本计划覆盖 service 主干：`mag-service`（抽象接口）+ `mag-core`（实现 `MagService` 的引擎）+ 直接依赖的
+> mag-tools / mag-sources 核心。** 各 interface（mag-acp / mag-server / mag-tauri / app 前端）**不在本计划
+> 范围**——它们必须等 service 充分测试通过、`MagService` 契约稳定后，再按 `docs/DESIGN.md` §10 的 I1（ACP 优先）
+> 起单独规划。逐任务清单见 [`TODO.md`](TODO.md)。
 
 ## 目标
 
-落地 `DESIGN.md` §3 描述的引擎核心：一个**传输无关**的 `mag-core::Engine`，能装配并驱动 agent-lib、
-管理多会话、把跨传输的审批往返做成异步暂停点、持久化会话、并把这一切通过统一的 `Command`/`Event`
-协议（§4）暴露——**但不绑定任何具体传输**（Tauri/web/ACP 都在上层）。具体：
+落地 `docs/DESIGN.md` §3 描述的 service：一个 **interface 无关**的 service——抽象为 `mag-service::MagService`
+trait（trait + 中立 serde 类型，含 Command/Event 编码），由 `mag-core::Engine` 实现。它能装配并驱动
+agent-lib、管理多会话、把跨 interface 的审批往返做成异步暂停点、持久化会话——**但不绑定任何具体
+interface**（ACP/web/Tauri 都在上层）。具体：
 
-- **传输无关的引擎 API**：`Engine` 只接受 `Command`、产生 `Event`，通过内存 channel 驱动，不知道自己
-  跑在哪个 front door 后面。测试直接喂 `Command`、断言 `Event` 序列。
-- **下沉到 agent 层自组 scope**（`DESIGN.md` §3.2、§9.1）：不用 facade `Agent::run/stream`，用
-  `DefaultAgentMachine` + 自组 `HandlerScope` + `drain`，以获得异步审批控制权。
-- **跨传输审批 gate**（§3.3）：`IpcApproval` 实现底层 async `InteractionHandler`，`fulfill` 里发
+- **interface 无关的 service 接口**：`MagService` 是 object-safe 的 async trait（命令方法 + `subscribe`
+  事件流 + `respond_interaction`/`cancel`，`docs/DESIGN.md` §3.0）；`Engine` 是唯一实现。测试直接调 trait 方法、
+  断言 `subscribe` 事件流序列。Command/Event（§4）是它面向 tauri/web 的 wire 编码，随接口一起定义在
+  `mag-service`。
+- **facade `Agent` + 注入 `IpcApproval`**（`docs/DESIGN.md` §3.2、§9.1）：用 facade `Agent::builder()` +
+  `Agent::stream`，经 `AgentBuilder::interaction_handler(Arc<IpcApproval>)`（agent-lib M7-1）注入异步审批
+  handler。**不再下沉自组 scope**（M7 已把注入口透出到 facade）。
+- **跨传输审批 gate**（§3.3）：`IpcApproval` 实现 async `InteractionHandler`，`fulfill` 里发
   `InteractionRequested`、await oneshot、收 `RespondInteraction` 后折回。machine 真正停在 `.await`。
-- **流式**：自定义 `StreamingTapHandler`（逐 `Delta::Text` emit `TextDelta`），因为库自带
-  `LlmClientHandler` 在流式模式内部聚合、不 tap delta（§9）。
+  审批 gate 由 `ApprovalPolicy`（`ask_tool`/`auto_allow`）控制，`IpcApproval` 是被暂停交互的应答方。
+- **流式**：facade `Agent::stream` 直接产出 `RunEvent::TextDelta`；用官方 `RunEvent::to_wire()
+  -> WireRunEvent`（agent-lib M7-2）序列化后映射进 mag `Event`。**不再自建 tap handler**。
 - **会话生命周期**：per-session driver actor（§3.1），run 在独立 task 推进，`CancelRun`/
   `RespondInteraction` 走不碰 agent `&mut` 的旁路。
 - **持久化**：committed 一致点取 `AgentState` snapshot 写 SQLite；`ResumeSession` 重装配（§3.6）。
@@ -32,61 +39,81 @@
 
 ## 非目标（本计划）
 
-- 不做任何具体传输（Tauri invoke/emit、web WebSocket、ACP stdio）——那是上层，等 mag-core 稳定后再做。
+- 不做任何具体 interface（ACP stdio、web WebSocket、Tauri invoke/emit）——那是上层，等 service 稳定、
+  `MagService` 契约冻结后再做（第一个是 ACP，`docs/DESIGN.md` §10 I1）。**但 `MagService` trait 本计划就要按
+  近全集一次成型**（含多会话管理、审批、委派、source 探测），使后续 interface 无需改接口。
 - 不做前端（React/app）。
-- 不做本地 agent 来源的 live 接入（external features / `ExternalSessionHandler` 生产实现）——第一版
-  mag-core 先跑通 **LLM API 来源 + 本地工具**这条主干；本地 agent 来源作为 `DESIGN.md` §10 的 M2 单列。
-  但 mag-core 的 source registry / 委派数据结构要为它**预留位置**，不写死。
+- 不做本地 agent 来源的 live 接入（打开 external features、用 `default_external_session_handler`）——
+  service 主干先跑通 **LLM API 来源 + 本地工具**；本地 agent 来源作为 `docs/DESIGN.md` §10 的 I2 单列。但
+  source registry / 委派数据结构要为它**预留位置**，不写死。
 - 不实现 AI-based permission / AI-based routing 的**决策逻辑**（§8）——只把接缝（`PermissionDecider`
   钩子位置、routing 配置字段）留在结构里。
 
 ## 现有代码锚点（mag-core 的精确接入面，全部已核对 agent-lib 源码）
 
-- **自组 scope 完整样板**：`../agent-lib/examples/agent_chat.rs`——id source（`DemoIds`：`RequirementIds`
-  + `ToolExecutionIds`，uuid from 单调计数器）、`AgentSpec`→`AgentState`→`DefaultAgentMachine`、
-  自建 `HandlerScope`（`ChatScope`）、`drain(&mut machine, input, &scope, None, &ctx)`、`RunContext`。
-- **审批暂停点**：`agent::InteractionHandler`（`../agent-lib/src/agent/drive.rs:155`，`#[async_trait]
-  async fn fulfill(&self, req: &Interaction, ctx: &RunContext) -> RequirementResult`）。样板
-  `StdinApproval`（`agent_chat.rs:212`）。`Interaction`/`InteractionKind`/`InteractionResponse`/
-  `ApprovalResponse` 均 serde 友好（`src/agent/interaction.rs`、`approval.rs`）。
-- **流式 tap 参考**：facade `StreamingTapHandler`（`../agent-lib/src/facade/agent/stream.rs:436`）——
-  `chat_stream` + 逐 `StreamEvent::BlockDelta{delta: Delta::Text}` emit + `Accumulator` 折叠。
-- **参考 handler**：库自带 `LlmClientHandler`（`src/agent/drive/reference.rs:73`，非流式或内部聚合）、
-  `ToolRegistryHandler`（:122）；`drain`（`src/agent/drive.rs:369`）。
-- **工具**：`agent::ToolRegistry` trait（`WeatherRegistry` 模式，`agent_chat.rs:130`）或 facade
-  `Tool::function_with_schema`（`src/facade/tool.rs`，无需 feature）。`ToolContext` 带
-  `worktree`/`cancel`/`tool_call_id`。
+> **接入面已随 agent-lib Milestone 7（已 `[DONE]`）更新**：mag-core 走 facade 注入路径，不再下沉自组
+> scope。下列锚点以 facade M7 API 为准。
+
+- **facade Agent 构造 + 审批注入**：`facade::Agent::builder().provider(..).model(..).tool(..)
+  .approval(policy).interaction_handler(Arc<dyn InteractionHandler>).build()`
+  （`AgentBuilder::interaction_handler` = `../agent-lib/src/facade/agent.rs:1015`；同步/流式两路都生效）。
+  `Agent::stream(input) -> AgentRunStream`（逐 `RunEvent`）。
+- **审批 handler trait**：`agent::InteractionHandler`（`../agent-lib/src/agent/drive.rs:154`，`#[async_trait]
+  async fn fulfill(&self, req: &Interaction, ctx: &RunContext) -> RequirementResult`；**不在 prelude，需从
+  `agent_lib::agent` import**）。`IpcApproval` 实现它，在 `fulfill` 里 emit + await oneshot。
+  `Interaction`/`InteractionKind`/`InteractionResponse` 均 serde 友好（`src/agent/interaction.rs`）。
+- **事件序列化**：`RunEvent::to_wire() -> WireRunEvent`（`../agent-lib/src/facade/run.rs:329`）；
+  `WireRunEvent`（`run.rs:392`，`serde(tag="type",content="data")`）与 `WireRunOutput` 在 prelude。
+  `RawStream`/`RawNotification` 折叠为 `WireRunEvent::Raw(RawEventKind)`。
+- **富化审批请求**：`facade::ApprovalRequest`（`run.rs:464`，prelude）带
+  `tool_name`/`call_id`/`reason`/`input`（脱敏摘要）。
+- **工具**：`facade::Tool::function_with_schema(name, desc, json_schema, handler)`（`src/facade/tool.rs`，
+  无需 feature），async 闭包 `|ctx: ToolContext, args| async {..}`；`AgentBuilder::tool(..)` 注册。
+  `ToolContext` 带 `worktree`/`cancel`/`tool_call_id`。审批 gate 用 `ApprovalPolicy::ask_tool`/`auto_allow`。
 - **权限模型**：`agent::permission::{PermissionRequest, PermissionCategory, PermissionRisk,
-  PermissionDecision, PermissionResponse}`（`src/agent/permission.rs`，全 serde；risk 有序）。
-- **持久化**：`AgentState` snapshot / restore（committed 一致点）；`facade::ChatSession` 的
-  `ConversationSnapshot` 路径可作纯对话备选参考。
-- **纯对话备选（M0 脚手架）**：facade `Chat`/`ChatSession`（`src/facade/chat.rs`，无工具，tool-use 报错）。
+  PermissionDecision, PermissionResponse}`（全 serde；risk 有序）；AI-permission 落点在 `IpcApproval` 的
+  Permission 分支（`docs/DESIGN.md` §8.1）。
+- **持久化**：`Agent::snapshot() -> AgentSnapshot`（committed 一致点，data-only）/ `Agent::restore()`
+  builder 重注入 provider/工具/approval。**⚠ restore 无 `interaction_handler` 注入口**（见 R-B）。
+- **纯对话备选（C0/C1 早期脚手架）**：facade `Chat`/`ChatSession`（`src/facade/chat.rs`，无工具）。
+- **id source**：facade 内建 `FacadeIds`；mag 若需确定性可选 `AgentBuilder::ids(..)`。自组 scope 时代的
+  `MagIds`（已在 C0-3 实现）在 facade 路径下降级为可选/仅测试用，切换时评估去留。
 
 ## 里程碑
 
-逐层增加概念、每层可独立**离线**验证。C0–C2 是引擎主干，C3 加工具+审批，C4 持久化，C5 收官验收。
+逐层增加概念、每层可独立**离线**验证。C0–C1 是引擎主干起步，**CS 抽取 `mag-service` 接口**，C2 会话
+生命周期，C3 工具+审批，C4 持久化，C5 收官验收。
+
+> **执行顺序**：C0 → C1（含 C1-3 切 facade、C1-R）→ **CS**（抽 `mag-service`、`Engine impl MagService`）→
+> C2 → C3 → C4 → C5。CS 插在 C1 之后、C2 之前，因为此时 Engine 表面积最小、抽接口最便宜；C2 起的会话/
+> 工具/审批都直接对着 `MagService` trait 写。
 
 | 里程碑 | 主题 | 主要产出 | 默认测试形态 |
 |---|---|---|---|
-| C0 | 骨架 + 协议 | workspace、`mag-protocol`（`Command`/`Event` + payload，全 serde）、`Engine` 空壳 + 内存事件总线、id source | 单元（协议 round-trip、Engine 起停） |
-| C1 | 纯对话流式 | 自组 scope 驱动一次 LLM turn、`StreamingTapHandler` emit `TextDelta`、`SendMessage`→`RunFinished` | 单元（fake `LlmClient` 脚本化 delta，离线） |
-| C2 | 会话生命周期 | per-session driver actor、`CreateSession`/`ListSessions`/`CancelRun`、多会话隔离、cancel 旁路 | 单元（并发会话、run 中途 cancel，离线） |
-| C3 | 工具 + 交互审批 | `mag-tools` registry + 最小集、`IpcApproval` 异步暂停、`InteractionRequested`/`RespondInteraction` 往返、`ToolStarted`/`ToolFinished` | 单元（脚本化工具 + 审批 channel，验证 machine 真停到 resolve） |
-| C4 | 持久化 | SQLite、committed 点 snapshot、`ResumeSession` 重装配、凭据 store（不进 snapshot） | 单元（snapshot round-trip、跨"重启"恢复历史，离线临时库） |
-| C5 | 收官验收 | 端到端离线主干（建会话→多轮带工具+审批→cancel→持久化→恢复）、契约冻结 review | 集成（离线全链路）+ review |
+| C0 | 骨架 + 协议 | workspace、`mag-protocol`（`Command`/`Event` + payload，全 serde）、`Engine` 空壳 + 内存事件总线、id source。**[DONE]（mag-protocol 后由 CS 并入 mag-service）** | 单元（协议 round-trip、Engine 起停） |
+| C1 | 纯对话流式 | facade `Agent::stream` 驱动一次 LLM turn、经 `WireRunEvent` 映射 emit `TextDelta`、`SendMessage`→`RunFinished`（早期按自组 scope 实现，随 agent-lib M7 落地切到 facade，见 `TODO.md` C1-3） | 单元（fake `LlmClient` 脚本化 delta，离线） |
+| **CS** | **抽取 `mag-service` 接口** | 新建 `mag-service` crate、`Command`/`Event` 等从 `mag-protocol` 迁入、删 `mag-protocol`；定义 `MagService` trait（近全集，object-safe）+ `ServiceEvent`；`Engine impl MagService`；mag-core 依赖 mag-service | 单元（trait 方法调用 + `subscribe` 事件流断言；既有 C1 测试改经 trait 后仍绿） |
+| C2 | 会话生命周期 | per-session driver actor、`create_session`/`list_sessions`/`cancel`（`MagService` 方法）、多会话隔离、cancel 旁路 | 单元（并发会话、run 中途 cancel，离线） |
+| C3 | 工具 + 交互审批 | `mag-tools` registry + 最小集、`IpcApproval` 异步暂停、`InteractionRequested`/`respond_interaction` 往返、`ToolStarted`/`ToolFinished` | 单元（脚本化工具 + 审批 channel，验证 machine 真停到 resolve） |
+| C4 | 持久化 | SQLite、committed 点 snapshot、`resume_session` 重装配、凭据 store（不进 snapshot） | 单元（snapshot round-trip、跨"重启"恢复历史，离线临时库） |
+| C5 | 收官验收 | 端到端离线主干（建会话→多轮带工具+审批→cancel→持久化→恢复）、`MagService` 契约冻结 review | 集成（离线全链路，经 `MagService` trait）+ review |
 
 每个里程碑末尾隐含一次自检：全部离线测试绿、无网络/凭据/CLI 依赖、契约变更向后兼容（只加 enum 变体/
-`#[non_exhaustive]` 加字段）。C5 通过后方可推进 `DESIGN.md` §10 的 M1+（传输/前端/本地 agent）。
+`#[non_exhaustive]` 加字段）。**C5 通过（`MagService` 契约冻结）后方可推进 `docs/DESIGN.md` §10 的 I1（ACP
+interface，第一个），再到 I2/I3/I4。**
 
 ## 关键设计约束（落地时必须守）
 
-- **引擎传输无关**：`mag-core` 不依赖 tauri / axum / ACP crate；只依赖 agent-lib、mag-protocol、
-  mag-tools、mag-sources。任何"发事件"都写内存事件总线，由（未来的）传输层订阅。
-- **协议独立**：`mag-protocol` 不依赖 agent-lib；需要的底层类型（`InteractionResponse` 等）薄封装或
-  重定义为 mag 自己的 wire 类型，不把 agent-lib 内部类型泄漏进公开协议。
+- **service interface 无关**：`mag-core` 不依赖 tauri / axum / ACP crate；只依赖 mag-service、agent-lib、
+  mag-tools、mag-sources。任何"发事件"都写内存事件总线，由 `subscribe` 暴露、（未来的）interface 订阅。
+- **接口与实现分离**：`mag-service` 是纯抽象（`MagService` trait + 中立 serde 类型，含 Command/Event），
+  **不依赖 agent-lib、不含实现**；`mag-core::Engine` 是唯一实现。需要的底层类型（`InteractionResponse`
+  等）在 mag-service 侧薄封装/重定义为 wire 类型，不把 agent-lib 内部类型泄漏进接口。
+- **`MagService` 一次按近全集成型**：CS 里就带上 GUI 视角需要的方法（多会话管理、委派、source 探测），
+  即使 I1（ACP）只用子集——避免 ACP 视角把签名带窄，后续 interface 免改接口（`docs/DESIGN.md` §11 风险 6）。
 - **审批是异步暂停点，不是通知**：`IpcApproval::fulfill` 必须真正 await；决不能像 facade 那样"先 emit
   再同步决策"。测试必须断言 machine 在 resolve 前不前进。
-- **run 与控制命令解耦**：actor 里 run 占用 agent `&mut`；`CancelRun`/`RespondInteraction` 只碰 cancel
+- **run 与控制命令解耦**：actor 里 run 占用 agent `&mut`；`cancel`/`respond_interaction` 只碰 cancel
   token / pending oneshot map，永不阻塞在 run 上。
 - **snapshot 无 secret**：agent-lib snapshot 本就 data-only；mag 的持久层同样不存凭据/闭包/handle。
   凭据只在 `CredentialStore`，恢复时重注入。
@@ -117,17 +144,20 @@
 
 ## 风险与待确认
 
-- **R-A 流式 tap 自建**：库自带 `LlmClientHandler` 流式模式内部聚合、不逐 delta tap（已核对
-  `reference.rs`）。mag 必须自建 `StreamingTapHandler`（参考 facade `stream.rs:436`）。取向：在 mag-core
-  内实现，约 50 行，换取流式 + 完全审批控制。
-- **R-B facade 注入口未就绪**：当前必须下沉自组 scope（agent-lib facade 无 `interaction_handler(..)`
-  注入口）。若 agent-lib Milestone 7（M7-1）先落地，mag-core 可改为留在 facade 内注入 `IpcApproval`，
-  减少 id source / spec / drain 样板。取向：先按自组 scope 落地（不阻塞）；M7-1 就绪后作为化简任务回收。
+- **R-A【已消解】流式 tap**：早期担心库 `LlmClientHandler` 内部聚合、需自建 `StreamingTapHandler`。
+  agent-lib M7 之后走 facade `Agent::stream`（已产 `TextDelta`）+ `WireRunEvent`，无需自建。C1 早期实现的
+  自建 tap 随 C1-3 切换移除。
+- **R-B【反转】restore 无审批注入口（残留缺口）**：M7-1 已透出 `AgentBuilder::interaction_handler(..)`，
+  主路径注入 `IpcApproval` 已可行；但 `Agent::restore()`（`AgentRestoreBuilder`）**没有对应注入口**，恢复
+  出的 `Agent` 回落到同步 `FacadeApproval`。影响：需审批的会话**恢复后无法跨进程审批**。取向：已在 agent-lib
+  追加后续任务补 restore 注入口；在其落地前，C4 恢复只对纯对话/只读工具（auto-allow）会话完全可用，需审批
+  会话的恢复标为受限并依赖该修复（C4-1 记录依赖）。
 - **R-C 本地 agent 来源推迟**：mag-core 主干先只做 LLM API + 本地工具。source registry 与委派结构必须
-  为本地 agent 预留位置（enum 变体 / trait 对象槽），但不实现 live 接入。避免主干被 external feature
-  与 CLI 环境依赖拖慢。
+  为本地 agent 预留位置（enum 变体 / trait 对象槽），但不实现 live 接入。I2（`docs/DESIGN.md` §10）用 M7-4 的
+  `default_external_session_handler` 直接接入，无需自己 wire。避免主干被 external feature 与 CLI 环境
+  依赖拖慢。
 - **R-D 持久化 schema 演进**：SQLite schema 首版可能变。取向：snapshot 存 JSON blob（agent-lib
-  `AgentState` 的 serde），schema 只存 id/config/时间戳等稳定列，降低迁移成本；预留 schema version 列。
-- **R-E id source 一致性**：mag 的 `RequirementIds`+`ToolExecutionIds` 实现须保证会话内 id 唯一且恢复后
-  不冲突（参考 facade `FacadeIds::continuing_after`）。取向：per-session 单调计数器，恢复时从快照记录的
-  高水位续号。
+  `AgentSnapshot` 的 serde），schema 只存 id/config/时间戳等稳定列，降低迁移成本；预留 schema version 列。
+- **R-E id source**：facade 路径下会话 id 由内建 `FacadeIds` 管理，恢复经 `Agent::restore()` 的
+  `FacadeIds::continuing_after` 续号，mag 一般不需自管。C0-3 已实现的 `MagIds` 在 facade 路径下降级为
+  可选/仅测试；C1-3 切换时评估是否保留。
