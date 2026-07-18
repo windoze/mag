@@ -877,13 +877,56 @@ Command/Event 归属 mag-service 且仍是 `ServiceEvent` 的投影。汇总缺�
   mag-service 10 / mag-sources 1 / mag-tools 6+13）全绿 ✓；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
   --workspace`（无警告）✓。
 
-### [TODO] C3-R Review：工具 + 审批正确性（重点）
+### [DONE] C3-R Review：工具 + 审批正确性（重点）
 
 **做什么**：**重点核对审批暂停语义**（machine 真停到 resolve，非 facade 式先 emit 再同步决策）；工具
 worktree/cancel 约束生效；`PermissionDecider` 钩子留位正确（§8.1）；auto/ask 策略与 plugin 元数据一致。
 汇总缺口。
 
 **验证条件**：完整验证序列 1–5 全绿；审批三路径（approve/deny/cancel）+ auto/ask 均有测试。
+
+**完成记录（2026-07-19）**：
+
+- 纯 review 任务，逐项核对 C3-1/C3-2/C3-3 落地代码，未发现阻塞缺口或 spec 偏离，无需改动源码。
+
+- **审批暂停语义（machine 真停到 resolve，§3.3/§9.1）**：
+  - `IpcApproval::emit_and_await`（`engine/approval.rs`）注册 `oneshot` pending → 发
+    `Event::InteractionRequested` → 在 `tokio::select!` 于 `waiter` 与 session cancel token 间**真正 park 在
+    `.await`**，非 facade `FacadeApproval` 的同步「先 emit 再内联决策」。`pause_then_approve_runs_the_tool`
+    以 `futures::poll!` 断言 respond 送达**前** driver future 恒 `Poll::Pending`、gated 工具计数为 0，锁定暂停语义。
+  - **关键无死锁不变量**：`SessionActor::run` 对每条命令直接 `handle()`，`RespondInteraction` 在 run 在飞时也
+    立即路由到 `ipc.respond`（run 在独立 `spawn_local` 推进），故 parked driver 必被唤醒——`respond` 只碰
+    reply/oneshot，不借 agent `&mut`，符合 §3.1 侧信道约束。`engine::tool_turn::gated_tool_pauses_then_runs_after_approve`
+    端到端验证「send→run 在飞并 park→respond_interaction→工具执行」全链路。
+- **工具 worktree/cancel 约束生效（§7）**：
+  - `path::safe_join` 纯词法归一：`..` 逐级 pop、越根 → `PathError::Escapes`，`RootDir`/`Prefix` → `Absolute`，
+    不触盘故不被 symlink 欺骗；`read_file_rejects_worktree_escape` + `path` 单测覆盖逃逸/绝对/内部 `..`。
+  - `shell` 以 20ms 轮询 `ToolContext.cancel`（poll-based token）→ `start_kill` 中断子进程；
+    `shell_cancellation_interrupts_the_command` 预取消跑 `sleep 30`，断言 <5s 返回 `cancelled`（远小于 1 分钟纪律）。
+    `current_dir(worktree)` 约束 cwd，`shell_runs_in_the_worktree` 验证。
+- **`PermissionDecider` 钩子留位正确（§8.1）**：trait + 默认 `AskFrontendDecider`（返 `None`→emit+await）；
+  `fulfill` 的 `Permission` 分支先问 decider，命中即短路不发前端。
+  `permission_uses_default_decider_to_emit_and_await`（默认走 emit+await）与
+  `custom_decider_short_circuits_without_emitting`（自定义 decider 不 emit）双侧锁定 seam 行为。
+- **auto/ask 策略与 plugin 元数据一致（§3.3）**：`SessionDriver::new` 对 `plugin.permission().is_some()` 的插件
+  调 `ApprovalPolicy::ask_tool(name)` gate，其余留默认 auto-allow；gate 决策用静态 `permission()`（`permission_for`
+  仅细化 UI risk，不改 gate，plugin doc 明示）。`permission_metadata_matches_the_gate_policy` 断言
+  read/list/grep→`None`（auto）、shell→`Some(Shell,Medium)`（ask）；`auto_allowed_tool_runs_without_interaction`
+  端到端验证 read_file 不暂停、直接 `ToolStarted/Finished`。
+- **审批三路径 + auto/ask 测试齐备**：approve/deny/cancel 见 `engine::approval::{pause_then_approve_runs_the_tool,
+  pause_then_deny_skips_the_tool, cancel_while_paused_resolves_without_running_the_tool}`（cancel 兼验晚到 respond→
+  `InteractionNotFound`）；auto vs ask 端到端见 `engine::tool_turn` 三例。四变体 kind↔wire 双向保真、族不匹配→
+  `Backend`、未知 request_id→`InteractionNotFound` 亦有单测。
+- **前向缺口汇总（非阻塞，均属后续里程碑或明确留位，无未排期失败测试）**：
+  - `ToolTrace` 的 `input`/`output`/`message` 现为 `None`（facade trace 只带 name/call_id）；富化留后续。
+  - facade `ApprovalRequested` 刻意不映射（mag 规范暂停事件为 `IpcApproval` 的 `InteractionRequested`，§3.4），
+    由 `approval_requested_is_dropped` 锁定。
+  - `ToolCategory` 现只建模 `Shell`（内置集所需）；新类别随新插件增补。
+  - 规则/LLM `PermissionDecider`、committed 一致点 snapshot（§3.6）留待 C4+。
+- **验证（完整序列 1–5 全绿）**：`cargo fmt --all -- --check` ✓；`cargo test -p mag-core engine::approval`（11）
+  + `engine::tool_turn`（3）✓；`cargo clippy --all-targets -- -D warnings`（0 警告）✓；`cargo test --workspace`
+  （mag-core 34 / mag-service 10 / mag-sources 1 / mag-tools 6+13，doctests 0）全绿 ✓；`cargo doc --no-deps
+  --workspace`（无警告）✓。
 
 ---
 
