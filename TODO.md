@@ -219,7 +219,57 @@
   `async-trait`/`futures`/`tokio` 仅 dev-dependencies，供 e2e 的 fake `Arc<dyn MagService>` 与运行时用）；
   无 `mag-core`/`agent-lib`/`tauri`/`axum`。
 
-### [TODO] M1-3 `session/new` handler → `create_session`（cwd → `SessionConfig`）
+### [TODO] M1-3 `SessionConfig.cwd` 承载 + 会话 worktree 落位（service 主干向后兼容加字段）
+
+**上下文**：
+
+- 这是 M1-4（`session/new` → `create_session`）的**前置契约缺口修复**任务（M1-4 显式依赖本任务）。
+  ACP `NewSessionRequest.cwd: PathBuf`（绝对路径，**必填**）是会话工作根（`docs/ACP.md` §3.2/§6）；mag 的
+  内建工具（`read_file`/`shell`/`grep`/`list_dir`，`crates/mag-tools`）**全部**相对 facade `Agent` 的
+  **worktree** 执行并受 `safe_join` 约束（`docs/DESIGN.md` §3.2）。
+- **缺口（已就地核实）**：`mag_service::SessionConfig`（`crates/mag-service/src/lib.rs`）只有
+  `provider/model/tool_profile/routing`，**无 cwd 字段**；`mag-core::SessionDriver::new`
+  （`crates/mag-core/src/driver.rs`）建 facade `Agent` 时**从不**调 `.worktree(..)`，agent-lib 默认回落
+  `WorktreeRef::new(".")`（`agent-lib/src/facade/agent.rs`）；`MagService::create_session(SessionConfig)` 是
+  唯一入口，cwd 只能经 `SessionConfig` 流入。故 ACP 传入的 cwd 现在**无处承载会被丢弃**，工具会在 mag 进程
+  cwd 而非客户端指定目录执行——违反 ACP §3.2/§6。按 `PLAN.md` line 36-37 / 本文件通用规则：回 service 主干
+  **向后兼容**加字段（只加字段，不改既有语义），不在 mag-acp 侧丢 cwd。
+- **向后兼容硬约束**：`SessionConfig` 被持久化（`crates/mag-core/src/persistence.rs`）。新字段须
+  `#[serde(default)]`，旧快照（无 cwd 键）必须仍能反序列化为缺省值。
+
+**做什么**：
+
+1. `mag-service`（`crates/mag-service/src/lib.rs`）：给 `SessionConfig` 加
+   `pub cwd: Option<std::path::PathBuf>`，`#[serde(default, skip_serializing_if = "Option::is_none")]`
+   （与 `tool_profile` 同风格），带 rustdoc（会话工作根 / 映射到 agent worktree；`None` = 沿用默认 `"."`，
+   兼容旧持久化）。补齐本 crate 内所有 `SessionConfig { .. }` 字面量（含测试）的 `cwd` 字段。
+2. `mag-core`：
+   - `SessionDriver::new`（`crates/mag-core/src/driver.rs`）：`config.cwd` 为 `Some(path)` 时对
+     `Agent::builder()` 调 `.worktree(agent_lib::agent::WorktreeRef::new(path.clone()))`；`None` 保持现状
+     （默认 `"."`）。`restore` 路径不动（worktree 已随 `AgentSnapshot`/`AgentSpec` 烘入，`docs/DESIGN.md` §3.6）。
+   - 补齐 `mag-core` 内所有 `SessionConfig { .. }` 字面量（`engine.rs`/`persistence.rs`/`driver.rs` 及各自
+     测试）的 `cwd`（默认 `None`；worktree 落位测试用 `Some`）。
+3. 测试：
+   - `mag-service`：`SessionConfig` serde round-trip 含 `cwd: Some(path)`；**向后兼容**——不含 `cwd` 键的旧
+     JSON 反序列化 → `cwd: None`。
+   - `mag-core`：断言 `SessionDriver::new(config cwd=Some(p), ..)` 建出的 agent worktree == `p`（经
+     `self.agent.snapshot()` 序列化后断言 `worktree` 路径，或 agent-lib 若暴露可读访问器则直接读）；
+     `cwd=None` → worktree == `"."`。（已核实 worktree 序列化进快照，故从 mag-core 侧可观测；若发现确实
+     不可观测，按同规则插 agent-lib 前置任务。）
+
+**验证条件**：
+
+- 聚焦测试：`cargo test -p mag-service session_config` + `cargo test -p mag-core worktree`（1 分钟内绿）。
+- 完整验证序列 1–5（`cargo fmt` → 聚焦 → `cargo clippy --all-targets -- -D warnings` → `cargo test --workspace`
+  → `cargo doc`）。
+- 依赖边界不变：**不动** mag-acp；本任务只改 `mag-service` + `mag-core`。完成后 M1-4 可无损把 ACP cwd 映射进
+  `SessionConfig.cwd`。
+- **完成后同步**：更新 `PLAN.md` §`mag-service` 契约清单（约 line 105）把 `SessionConfig` 字段补上 `cwd`
+  （该处是契约事实描述，随字段落地一并订正；这是契约字段变更，非阶段计划改写）。
+
+### [TODO] M1-4 `session/new` handler → `create_session`（cwd → `SessionConfig.cwd`）
+
+**依赖**：M1-3（`SessionConfig.cwd` 字段）。M1-3 未 `[DONE]` 前不得开始本任务。
 
 **上下文**：
 
@@ -229,25 +279,23 @@
   `mcp_servers` 第一版可忽略（后续来源接入点，非本单范围）。
 - 调 `service.create_session(cfg).await`，把返回的 mag `SessionId` 用 M1-1 的 `mag_session_id_to_acp` 映射为
   ACP `SessionId`，回 `NewSessionResponse::new(acp_session_id)`。
-- `SessionConfig{provider,model,tool_profile,routing}`：第一版 `provider`/`model` 取一个明确的默认常量（如
-  `provider="openai"`、`model` 用占位默认），`tool_profile=None`、`routing=RoutingMode::default()`。cwd 的落位：
-  若 `SessionConfig` 无 cwd 字段，第一版把 cwd 作为工作根记录点由 mag-core 侧消费——**若发现 `SessionConfig`
-  确实无处承载 cwd 而 mag-core 又需要它**，这是契约缺口：在本文件插最小前置任务回主干加字段（向后兼容），
-  不在 mag-acp 侧丢弃 cwd。
+- `SessionConfig{provider,model,tool_profile,routing,cwd}`：第一版 `provider`/`model` 取一个明确的默认常量（如
+  `provider="openai"`、`model` 用占位默认），`tool_profile=None`、`routing=RoutingMode::default()`；cwd 经 M1-3
+  新增字段落位——`cwd = Some(req.cwd.clone())`（ACP cwd 为绝对路径，直接承载，不在 mag-acp 侧丢弃）。
 
 **做什么**：
 
 1. `map`：`pub fn new_session_request_to_config(req: &NewSessionRequest) -> SessionConfig`（纯函数，含默认
-   provider/model + cwd 落位约定），带 rustdoc + 单测。
+   provider/model + `cwd = Some(req.cwd.clone())`），带 rustdoc + 单测。
 2. handler：`session/new` request handler，调 `service.create_session(..)`，映射并回 `NewSessionResponse`。
 3. e2e：扩展 M1-2 的内存管道夹具，跑 `initialize → session/new`，断言 fake service 收到 `create_session`
-   且回的 ACP SessionId 可被 `acp_session_id_to_mag` 解回同一 mag SessionId。
+   （且 `config.cwd == Some(req.cwd)`）且回的 ACP SessionId 可被 `acp_session_id_to_mag` 解回同一 mag SessionId。
 
 **验证条件**：
 
 - 聚焦测试：`cargo test -p mag-acp session_new`（纯函数 + handler 级 + 内存管道往返）1 分钟内绿。
 - 完整验证序列 1–5；clippy / doc 无警告。
-- 若插了「cwd 承载」前置任务，本任务显式依赖它并在完成记录注明。
+- 本任务显式依赖 M1-3，并在完成记录注明 cwd 经 `SessionConfig.cwd` 承载。
 
 ### [TODO] M1-R Review：M1 crate 骨架 + `initialize` + `session/new`
 
@@ -259,8 +307,10 @@
    （builder + `on_receive_request!()` 宏）、`connect_to` run loop 均如实实现。
 2. 核对依赖边界：`mag-acp` 不依赖 `mag-core`/`agent-lib`；`mag` bin 是唯一装配点。
 3. 核对能力宣告保守性（§3.1/§7）：未实现的位一律未打开。
-4. 确认无未调度失败测试；跑完整验证序列 1–5 并记录结果。
-5. 汇总 M1 遗留缺口（若有 acp crate / 契约缺口已插前置任务，列出依赖关系）。
+4. 核对 **M1-3 契约缺口修复**：ACP `cwd` 经 `SessionConfig.cwd`（向后兼容 `#[serde(default)]`）承载并在
+   `SessionDriver::new` 落位为 facade `Agent` 的 worktree（`docs/ACP.md` §3.2/§6）；cwd 未在 mag-acp 侧被丢弃。
+5. 确认无未调度失败测试；跑完整验证序列 1–5 并记录结果。
+6. 汇总 M1 遗留缺口（若有 acp crate / 契约缺口已插前置任务，列出依赖关系；含 M1-3 → M1-4 依赖）。
 
 **验证条件**：
 

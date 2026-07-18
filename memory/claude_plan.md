@@ -1,51 +1,45 @@
-# Claude 执行计划 — M1-2 bin 装配 + `initialize` handler + 内存管道 e2e 骨架
+# Claude 执行计划 — M1-3 前置契约缺口：`SessionConfig.cwd` 承载
 
-## 当前任务
-`TODO.md` 首个未完成任务 = **M1-2**（M1-1 已 `[DONE]` 并提交）。
-- 唯一设计输入：`docs/ACP.md` §1/§2/§3.1/§7 + `PLAN.md`。
-- 范围：mag-acp 库暴露 `serve`（Agent.builder 注册 initialize + authenticate 占位 → connect_to），
-  新增顶层 `mag` bin（唯一同时见 mag-core + mag-acp 的装配点），内存管道 e2e 证明 initialize 往返。
+## 定位
+`TODO.md` 首个未完成任务原为 **M1-3**（`session/new` handler → `create_session`，cwd → `SessionConfig`）。
+M1-1 / M1-2 均已 `[DONE]` 且提交，工作区干净。
 
-## 已核对的 acp crate 真实 API（cargo 缓存 v1.2.0 / schema v1.4.0）
-- agent 端：`agent_client_protocol::Agent.builder().name(..)`
-  `.on_receive_request(closure, on_receive_request!())` `.connect_to(transport: impl ConnectTo<Agent>+'static).await`。
-- request handler 闭包：`async move |req: XxxRequest, responder: Responder<XxxResponse>, cx: ConnectionTo<Client>|
-  -> Result<(), acp::Error>`；`responder.respond(resp) -> Result<(), Error>`（`()` 实现 IntoHandled → Handled::Yes）。
-- `InitializeRequest{protocol_version, client_capabilities, ..}`；
-  `InitializeResponse::new(protocol_version).agent_capabilities(caps)`（`auth_methods` 默认空）。
-- `AuthenticateResponse::new()`（Default 空响应）。
-- 内存传输：acp crate **自带** `agent_client_protocol::Channel::duplex() -> (Channel, Channel)`，
-  `impl<R:Role> ConnectTo<R> for Channel`，纯 in-memory mpsc 交叉连接。→ 已有现成内存构造子，
-  **无需**自搭 tokio::io::duplex 适配（任务放行条件："若无现成内存构造子才搭"）。也有 `ByteStreams`(AsyncRead/Write) 备选。
-- `Client.builder().connect_with(transport: impl ConnectTo<Client>, |cx| async { .. })`，
-  `cx.send_request(InitializeRequest::new(ProtocolVersion::V1)).block_task().await?`。
-- `ProtocolVersion` 在 `agent_client_protocol::schema::ProtocolVersion`（不在 schema::v1）。
-- `Client`/`Agent`/`Channel`/`ConnectionTo`/`Responder`/`Stdio`/`ConnectTo` 均 crate 根 re-export。
-- 与 docs/ACP.md §1 一致，无需修正锚点。
+## 关键发现（就地核实）——契约缺口，阻塞 M1-3
+- ACP `NewSessionRequest.cwd: PathBuf`（绝对路径，**必填**）= 会话工作根
+  （acp schema v1.4.0 `agent.rs`；`docs/ACP.md` §3.2/§6）。
+- mag 内建工具（read_file/shell/grep/list_dir，`crates/mag-tools`）**全部**相对 facade `Agent` 的
+  **worktree** 执行并受 `safe_join` 约束（`docs/DESIGN.md` §3.2）。
+- 缺口：
+  1. `mag_service::SessionConfig`（`crates/mag-service/src/lib.rs:276`）只有
+     `provider/model/tool_profile/routing`，**无 cwd 字段**。
+  2. `mag-core::SessionDriver::new`（`crates/mag-core/src/driver.rs:75`）建 facade `Agent` 时**从不**
+     调 `.worktree(..)`；agent-lib 默认回落 `WorktreeRef::new(".")`（`agent-lib/src/facade/agent.rs:1295`）。
+  3. `MagService::create_session(SessionConfig)` 是唯一入口，cwd 只能经 `SessionConfig` 流入。
+- 结论：ACP 传入 cwd 现在**无处承载、会被丢弃**，工具将在 mag 进程 cwd 而非客户端目录执行 →
+  违反 ACP §3.2/§6。这正是 M1-3 上下文预设的契约缺口触发条件
+  （“若 `SessionConfig` 确实无处承载 cwd 而 mag-core 又需要它”）。
 
-## 依赖边界
-- mag-acp/Cargo.toml：仍只 `mag-service` + `agent-client-protocol`（正常依赖不加 mag-core/agent-lib）。
-  dev-deps：tokio(macros,rt-multi-thread,time) + futures + async-trait（仅测试/fake service 用）。
-- 新 `mag` bin：依赖 mag-core + mag-acp + agent-client-protocol(Stdio) + tokio。唯一装配点。
+## 决策（依据 TODO.md 通用规则 line 22-24 + PLAN.md line 36-37）
+不在 mag-acp 侧丢 cwd、不臆造语义。回 service 主干**向后兼容**加字段，并在 `TODO.md` 正确依赖位置
+插入最小前置任务，让被阻塞任务显式依赖它，然后**提交并停止**。
 
-## 做什么
-1. `mag-acp/Cargo.toml`：加 dev-deps。
-2. `mag-acp/src/handlers.rs`：`initialize` / `authenticate` 两个 `pub(crate) async fn`（带 rustdoc）。
-3. `mag-acp/src/lib.rs`：`mod handlers;` + `pub async fn serve<T: ConnectTo<Agent>+'static>(service: Arc<dyn MagService>, transport: T) -> Result<(), acp::Error>`。
-4. `mag-acp/tests/e2e.rs`：内存管道夹具（Channel::duplex）+ 最小 fake `Arc<dyn MagService>` + `initialize` 往返断言 caps==agent_capabilities()。
-5. `crates/mag`：bin crate（`mag --acp` → `Engine::new()` 装 Arc<dyn MagService> → `serve(service, Stdio::new())`）。加入 workspace members。
+## 本次动作
+1. `TODO.md`：
+   - 新增前置任务 **M1-3**：`SessionConfig.cwd: Option<PathBuf>`（`#[serde(default)]` 向后兼容）+
+     `SessionDriver::new` 在 `Some` 时 `.worktree(WorktreeRef::new(cwd))`。
+   - 原 `session/new` handler 任务顺延为 **M1-4**，显式依赖 M1-3（cwd → `SessionConfig.cwd`）。
+   - **M1-R** review 范围补：cwd→worktree 落位核对。
+2. `memory/claude_plan.md`：本文件。
+3. 提交并停止（下次调用执行新 M1-3 trunk 修复）。
 
-## 验证序列
-1. `cargo fmt --all -- --check`  2. `cargo test -p mag-acp initialize`  3. `cargo clippy --all-targets -- -D warnings`
-4. `cargo test --workspace`  5. `RUSTDOCFLAGS=-D warnings cargo doc --no-deps --workspace`；依赖边界自检。
+## 可行性已核实（供下次 M1-3 实现参考）
+- facade builder `Agent::builder().worktree(WorktreeRef)`（`facade/agent.rs:1086`）存在。
+- `WorktreeRef` 经 `agent_lib::agent::{WorktreeRef}`（`agent/mod.rs:92`）/facade 可从 mag-core 达。
+- worktree 序列化进 `AgentSpec`（`agent/spec.rs:60/332`），`self.agent.snapshot()` → `AgentSnapshot`
+  内 `agent_state` 保留 spec；mag-core 测试可经快照 JSON 断言 worktree 路径（可观测）。
+- SessionConfig 被 `persistence.rs` 持久化；`#[serde(default)]` 保旧快照（无 cwd）反序列化为 `None`。
 
-## 进度
-- [x] 定位首个未完成任务 = M1-2
-- [x] 核对 acp crate agent/client/transport API
-- [x] 实现 serve + handlers + bin + e2e
-- [x] 验证序列 1–5 全绿（+真实 stdio 冒烟绿）
-- [x] TODO.md 标 M1-2 [DONE] + 完成记录
-- [x] 提交并停
-
-## 完成后停止
-只做 M1-2，完成后 `git commit`，不进入 M1-3。
+## 未改动
+- 不动 mag-acp（依赖边界保持）。本次仅编辑 TODO.md + memory；无代码改动，故不跑测试套件。
+- PLAN.md 不改：line 37 已预置“回主干加字段 + TODO 插前置任务”流程，无阶段计划变更；
+  §mag-service 契约清单（line ~105）待 M1-3 真正落地字段时一并订正。
