@@ -1114,7 +1114,7 @@ store、恢复重注入。汇总缺口。
 
 ## Milestone C5 — 收官验收
 
-### [TODO] C5-1 端到端离线主干集成测试
+### [DONE] C5-1 端到端离线主干集成测试
 
 **上下文**：把 C1–C4 串成一条离线全链路，作为 service 稳定的证据，也是推进 interface（I1/ACP）的前置门槛。
 全链路**经 `MagService` trait**（`Arc<dyn MagService>`）驱动，不碰 Engine 内部。
@@ -1132,6 +1132,25 @@ store、恢复重注入。汇总缺口。
 - 集成测试全绿，离线、无网络/凭据/CLI 依赖，1 分钟内完成。
 - 聚焦：`cargo test -p mag-core --test e2e_offline`。
 - 完整验证序列 1–5。
+
+**完成记录**：
+
+- 新增集成测试 `crates/mag-core/tests/e2e_offline.rs`（独立 test crate，**只用 mag-core 公有 API、全程经
+  `Arc<dyn MagService>` 驱动**，不碰 Engine 内部）。自建离线 fixtures：脚本化 fake `LlmClient`（FIFO + 按
+  `request.model` 路由两种取脚本方式）、`StubTool`（auto `read_file` + gated `shell`）、临时文件 SQLite
+  `TempDb`、内存审批经 `respond_interaction`。
+- `full_offline_backbone_through_service`：create_session（断言 `SessionCreated`）→ 纯文本流式对话（消费
+  `subscribe`，断言 `RunStarted`/`TextDelta`/`RunFinished` 与最终文本）→ auto read 工具（无
+  `InteractionRequested`、有 `ToolStarted`/`ToolFinished`）→ gated shell 审批 approve（`InteractionRequested`
+  → `respond_interaction` → 工具执行 → 完成）→ 一次 deny（无工具事件、run 仍 `RunFinished`）→ run 中途
+  `cancel`（`RunError "run cancelled"`，不落库）→ drop engine1（join 线程、快照落盘）→ 同库新 Engine
+  `resume_session` → 续对话；断言恢复请求携带 A–D 已提交历史片段且**不含**被取消轮的 `long task`。
+- `concurrent_sessions_are_isolated_by_subscription`：同一 engine 两会话并发发消息，`subscribe(Some(id))`
+  各只见本会话事件（`session_id()` 过滤）、各恰好一条 `RunStarted`、按 model 路由得确定文本 `alpha`/`beta`。
+- 验证序列 1–5 全绿：① `cargo fmt --all -- --check` 干净；② 聚焦 `cargo test -p mag-core --test e2e_offline`
+  2/2（0.01s）；③ `cargo clippy --all-targets -- -D warnings` 零告警（修一处 `collapsible_if` → let-chain）；
+  ④ `cargo test --workspace`：mag-core 46 + e2e_offline 2 + mag-service 10 + mag-sources 10 + mag-tools 6 +
+  builtin_tools 13，全绿；⑤ `cargo doc --no-deps --workspace` 通过。全部离线，无未调度失败测试。
 
 ### [TODO] C5-R Review：mag-core 整体验收 + 契约冻结
 
