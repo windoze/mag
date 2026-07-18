@@ -793,7 +793,7 @@ cancel/load（M4）。M1-3→M1-4 依赖已在各自完成记录标注。
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无警告。
 - PLAN.md 不改（无阶段计划变更）。下一个未完成任务：M3-R（Review：M3 审批桥接）。
 
-### [TODO] M3-R Review：M3 审批桥接
+### [DONE] M3-R Review：M3 审批桥接
 
 **上下文**：核对 M3 对 `docs/ACP.md` §5/§6 的完整性；真实任务，不得跳过。
 
@@ -805,6 +805,50 @@ cancel/load（M4）。M1-3→M1-4 依赖已在各自完成记录标注。
 3. 确认无未调度失败测试；跑完整验证序列 1–5。
 
 **验证条件**：完整验证序列 1–5 全绿；review 结论 + 对照表 + 缺口汇总写入完成记录。
+
+**完成记录**（本次调用）：
+
+- **结论**：M3（M3-1 映射 + M3-2 泵接入）**忠实实现** `docs/ACP.md` §5/§6，无未调度失败测试、无绕过审批
+  路径、无 papering over。就地复核了 `crates/mag-acp/src/map.rs`、`crates/mag-acp/src/handlers.rs`、
+  `crates/mag-acp/tests/permission_bridge.rs` 及 `map` 单测。本任务仅复核 + 文档，未改任何编译产物。
+
+- **§5 对照表**（要点 → 实现/证据）：
+
+  | §5 要求 | 实现 | 证据 |
+  | --- | --- | --- |
+  | options：≥ `AllowOnce`(approve)+`RejectOnce`(deny)，稳定 `PermissionOptionId`，不虚报 always | `permission_options()` 只给 once-scoped allow/reject；稳定常量 `PERMISSION_OPTION_ALLOW/REJECT`；mag wire 无持久语义故**不宣告** `AllowAlways/RejectAlways`（§7 如实宣告） | `map.rs:412` + 单测 `permission_options_offer_stable_once_scoped_allow_and_reject`（断言 kind + 不含 always） |
+  | tool_call 富化（Approval 支） | `approval_tool_call`：id=call_id（对齐已流式 `ToolCall`）、status=Pending、reason 入 content | `map.rs:472` + 单测 `approval_request_addresses_tool_call_and_carries_reason` |
+  | tool_call 富化（Permission 支） | `permission_tool_call`：id=action_id、category→ToolKind、summary→title、subject→raw_input、reason→content | `map.rs:499` + 单测 `permission_request_enriches_tool_call_from_action` |
+  | outcome→response：`Selected` 判 approve/deny | `outcome_to_decision` + `option_id_to_choice`：仅精确 `ALLOW` id→Approve，其余→Deny | 单测 `approval_outcomes_map_to_matching_decisions`、`permission_outcomes_map_to_matching_decisions` |
+  | outcome→response：`Cancelled`→保守 deny/cancel | `Cancelled`（及未来 `_` outcome）→`Decision::Cancel`；Approval 组 `ApprovalDecisionWire::Cancel`（带 model-visible message）、Permission 组 `PermissionDecisionWire::Cancel` | 单测同上（cancel 分支）+ handler `approval_bridge_maps_cancelled_outcome_to_cancel` |
+  | `Approval` 与 `Permission` 走**同一**通道 | `interaction_to_permission_request` 对两 kind 都产 `RequestPermissionRequest`；`bridge_permission` 对 kind 泛化，仅富化来源不同 | `map.rs:562`、`handlers.rs:241` |
+  | 异步暂停被**显式测试** | `bridge_permission` 真正 `connection.send_request(req).block_task().await?` 后才 `respond_interaction`；泵 `spawn` 出 event loop 避免 `block_task` 死锁 | `handlers.rs:135/252`；测试断言 `paused_before_decision`（收到权限请求时 after 哨兵尚未流出）+ `resumed` |
+
+- **§6 安全对照**：
+
+  | §6 要求 | 实现 | 证据 |
+  | --- | --- | --- |
+  | shell 等特权工具审批不可省，走同一 gate | `Approval`/`Permission` 均只经 `session/request_permission`；泵 `InteractionRequested` 分支唯一出口是 `bridge_permission`，无旁路 | `handlers.rs:181-198`（无绕过分支）；`permission_category_to_tool_kind`：`Shell→Execute` |
+  | 未知/取消 fail-safe 绝不批准 | 未知 option id、`Cancelled`、未来 outcome 一律**不**映射为 Approve | 单测 `unknown_option_id_denies_fail_safe`（Deny）+ `outcome_to_decision` 默认臂 |
+  | 凭据不经 ACP、不写日志 | mag-acp 不触碰凭据；仅消费 `Arc<dyn MagService>`，依赖边界内无 `CredentialStore` | 依赖边界（`Cargo.toml` 仅 `mag-service`+acp+futures+serde_json） |
+
+- **缺口汇总**（均**非阻塞、非未调度失败**）：
+  1. §5 文案设想 `Approval` 携 `tool_name`/`input` 摘要（agent-lib M7-3，见 `DESIGN.md` §9），但冻结 wire
+     `InteractionKindWire::Approval` 目前**只有** `call_id + requirement`。M3-1 已如实只用现有字段、不臆造
+     （`approval_tool_call` 注释明示）。待 agent-lib M7-3 富化 wire 后可回填 tool_call 字段——属**上游 wire 演进**，
+     不在 mag-acp 范围内，不新增前置任务。
+  2. handler 级 3 条测试只跑 `Approval` 家族；`Permission` 家族的 request 组装与三态回译由 `map` 单测覆盖
+     （`bridge_permission` 对 kind 泛化，桥接逻辑与家族无关）。判定为**充分覆盖**，不补任务。
+  3. §5「cancel 期间挂起权限收尾」（`await` 中收 `session/cancel`）**明确调度在 M4-1**（本节上下文与 M4-1
+     标题均注明），非本任务范围、非未调度缺口。
+
+- **验证序列 1–5 全绿**（本次独立复核，非复用旧绿）：`cargo fmt --all -- --check` 干净；聚焦
+  `cargo test -p mag-acp 'map::'` 22 passed + `--test permission_bridge` 3 passed；
+  `cargo clippy --all-targets -- -D warnings` 无警告；`cargo test --workspace` 全绿（121：mag-acp 22+2+3+3=30、
+  mag-core 48+2、mag-service 12、mag-sources 10、mag-tools 6+13，0 fail）；
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无警告。
+- PLAN.md 不改（无阶段计划变更）。M3 里程碑全部 `[DONE]`。下一个未完成任务：M4-1（`session/cancel`
+  notification + 挂起权限的 cancel 收尾）。
 
 ---
 

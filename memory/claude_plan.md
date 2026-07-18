@@ -393,3 +393,38 @@ scripted subscribe 流：先发若干可观测事件（如 TextDelta），再发
 - 新增 `tests/permission_bridge.rs` 3 条（approve/deny/cancel + 暂停语义），全绿。
 - 验证 1–5 全绿（workspace 121 tests，clippy/doc 无警告）。
 - TODO.md：M3-2 → [DONE] + 完成记录。下一个：M3-R。
+
+---
+
+# 更新（本次调用）：M3-R Review — M3 审批桥接
+
+## 定位
+`TODO.md` 首个未完成任务 = **M3-R**（line 796，`[TODO]`）。M3-1/M3-2 已 `[DONE]` 且提交，工作区干净。
+这是 review 任务（真实任务，不得跳过）。
+
+## 复核范围（docs/ACP.md §5/§6）
+1. §5 请求组装：options（稳定 id、once-scoped allow/reject、不宣告 always）、tool_call 富化
+   （Approval / Permission 两支）、outcome 回译（Selected approve/deny、Cancelled→cancel、未知 id fail-safe deny）。
+2. §5 同一通道：Approval 与 Permission 都走 `session/request_permission`，仅富化来源不同。
+3. §5 异步暂停：`bridge_permission` 真正 `await` client 决定后才 `respond_interaction`；handler 测试显式
+   断言 driver 在 outcome 回灌前不前进。
+4. §6 安全：shell 等特权工具审批不可省（走同一 gate）；未知/取消 fail-safe 绝不批准；mag-acp 任何路径不绕过。
+5. 无未调度失败测试；跑完整验证序列 1–5。
+
+## 已就地核实（读源码 + 测试）
+- `map.rs`：`interaction_to_permission_request` / `outcome_to_interaction_response` + 稳定常量
+  `PERMISSION_OPTION_ALLOW/REJECT` + helper。单测覆盖 options 稳定性、Approval/Permission request 组装、
+  approve/deny/cancel 回译、未知 id fail-safe deny、Permission 家族回译。
+- `handlers.rs`：`bridge_permission` 按 §5 伪码；泵 `spawn` 出 event loop（避免 `block_task` 死锁）。
+- `tests/permission_bridge.rs`：3 条 handler 级测试断言暂停语义 + approve/deny/cancel 家族正确回灌。
+
+## 已识别缺口（非阻塞，如实记录）
+- §5 文案提到 `Approval` 携 `tool_name`/`input` 摘要（agent-lib M7-3），但冻结 wire `InteractionKindWire::
+  Approval` 只有 `call_id + requirement`。M3-1 已如实只用现有字段、不臆造；待 agent-lib M7-3 富化 wire 后
+  再补 tool_call 字段。非当前任务缺口，不阻塞 M3-R。
+- handler 级测试只跑 Approval 家族；Permission 家族的回译在 map 单测覆盖（bridge 对 kind 泛化）。可接受。
+
+## 动作
+1. 跑完整验证序列 1–5（review 独立复核，不复用旧绿）。
+2. TODO.md：M3-R → `[DONE]` + 完成记录（结论 + §5/§6 对照表 + 缺口汇总）。
+3. 提交并停止。
