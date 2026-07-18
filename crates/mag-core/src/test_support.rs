@@ -27,17 +27,48 @@ use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use serde_json::Value;
 
+/// One scripted response the [`FakeLlmClient`] hands to the facade.
+///
+/// [`StreamScript::Complete`] yields its events and then ends the stream, while
+/// [`StreamScript::Stall`] yields its events and then pends forever. The latter
+/// models a run that is still in progress so a cancellation can land mid-stream;
+/// dropping the facade stream tears the pending tail down cleanly.
+#[derive(Clone, Debug)]
+pub(crate) enum StreamScript {
+    /// Yield the events, then terminate the stream normally.
+    Complete(Vec<StreamEvent>),
+    /// Yield the events, then pend forever (the run never completes on its own).
+    Stall(Vec<StreamEvent>),
+}
+
+impl StreamScript {
+    /// Returns the concrete events the script begins with.
+    fn events(self) -> Vec<StreamEvent> {
+        match self {
+            Self::Complete(events) | Self::Stall(events) => events,
+        }
+    }
+}
+
 /// Offline scripted [`LlmClient`] fixture.
 #[derive(Debug)]
 pub(crate) struct FakeLlmClient {
-    scripts: Mutex<VecDeque<Vec<StreamEvent>>>,
+    scripts: Mutex<VecDeque<StreamScript>>,
     chat_requests: Mutex<Vec<ChatRequest>>,
     stream_requests: Mutex<Vec<ChatRequest>>,
 }
 
 impl FakeLlmClient {
     /// Creates a fake client from raw stream event scripts.
+    ///
+    /// Each script yields its events and then ends the stream; use
+    /// [`FakeLlmClient::scripted_streams`] for scripts that stall instead.
     pub(crate) fn scripted(scripts: Vec<Vec<StreamEvent>>) -> Arc<Self> {
+        Self::scripted_streams(scripts.into_iter().map(StreamScript::Complete).collect())
+    }
+
+    /// Creates a fake client from explicit [`StreamScript`]s.
+    pub(crate) fn scripted_streams(scripts: Vec<StreamScript>) -> Arc<Self> {
         Arc::new(Self {
             scripts: Mutex::new(scripts.into()),
             chat_requests: Mutex::new(Vec::new()),
@@ -66,7 +97,7 @@ impl FakeLlmClient {
             .clone()
     }
 
-    fn pop_script(&self) -> Result<Vec<StreamEvent>, ClientError> {
+    fn pop_script(&self) -> Result<StreamScript, ClientError> {
         self.scripts
             .lock()
             .expect("fake llm script lock")
@@ -86,8 +117,8 @@ impl LlmClient for FakeLlmClient {
             .lock()
             .expect("chat requests lock")
             .push(request);
-        let script = self.pop_script()?;
-        collect(stream::iter(script.into_iter().map(Ok::<_, ClientError>)))
+        let events = self.pop_script()?.events();
+        collect(stream::iter(events.into_iter().map(Ok::<_, ClientError>)))
             .await
             .map_err(collect_error_to_client_error)
     }
@@ -101,8 +132,14 @@ impl LlmClient for FakeLlmClient {
             .lock()
             .expect("stream requests lock")
             .push(request);
-        let script = self.pop_script()?;
-        Ok(stream::iter(script.into_iter().map(Ok::<_, ClientError>)).boxed())
+        match self.pop_script()? {
+            StreamScript::Complete(events) => {
+                Ok(stream::iter(events.into_iter().map(Ok::<_, ClientError>)).boxed())
+            }
+            StreamScript::Stall(events) => Ok(stream::iter(events.into_iter().map(Ok))
+                .chain(stream::pending::<Result<StreamEvent, ClientError>>())
+                .boxed()),
+        }
     }
 }
 
@@ -131,6 +168,30 @@ pub(crate) fn text_stream_with_usage(chunks: &[&str], usage: Usage) -> Vec<Strea
         stop_reason: Normalized::from_mapped(StopReason::EndTurn, "end_turn"),
     });
     events
+}
+
+/// Builds a stalling text stream: the given chunks are emitted as live text
+/// deltas and then the stream pends forever without a terminal `MessageStop`.
+///
+/// This models a run that is still in progress after producing some output, so a
+/// cancellation can land while the facade stream is parked. The block is left
+/// open on purpose; dropping the facade stream tears the pending tail down.
+pub(crate) fn stalling_text_stream(chunks: &[&str]) -> StreamScript {
+    let block_id = BlockId::new("text-1");
+    let mut events = vec![
+        StreamEvent::MessageStart {
+            role: Role::Assistant,
+        },
+        StreamEvent::BlockStart {
+            id: block_id.clone(),
+            kind: BlockKind::Text,
+        },
+    ];
+    events.extend(chunks.iter().map(|chunk| StreamEvent::BlockDelta {
+        id: block_id.clone(),
+        delta: Delta::Text((*chunk).to_owned()),
+    }));
+    StreamScript::Stall(events)
 }
 
 /// Builds a complete tool-use response stream.

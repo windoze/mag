@@ -21,7 +21,7 @@ use agent_lib::{
 use mag_service::{Event, RunId as WireRunId, RunOutput, SessionConfig, SessionId, UsageInfo};
 use uuid::Uuid;
 
-use crate::EventBus;
+use crate::{EventBus, session::CancelToken};
 
 const DEFAULT_MAX_TOKENS: u32 = 512;
 const DEFAULT_MAX_STEPS: u32 = 8;
@@ -60,78 +60,87 @@ impl SessionDriver {
         })
     }
 
-    /// Drives one user message through the facade [`Agent`] and emits run
-    /// lifecycle events, returning the run identity minted for this turn.
+    /// Drives one user message through the facade [`Agent`] under a
+    /// [`CancelToken`], emitting the run's streamed and terminal events.
     ///
-    /// The turn is streamed: a [`RunStarted`](Event::RunStarted) is emitted
-    /// before the drive, each streamed text delta becomes an
-    /// [`Event::TextDelta`], and the terminal `Done` event is folded into a
-    /// [`RunFinished`](Event::RunFinished). A failure surfaced while draining the
-    /// facade stream is reported as an [`Event::RunError`] on the event bus
-    /// rather than a method error, because the run has already started; the
-    /// returned [`RunId`](WireRunId) still identifies the started run.
-    pub(crate) async fn send_message(
+    /// The caller (the session actor) mints the run identity and emits
+    /// [`RunStarted`](Event::RunStarted) before invoking this; `run_turn` streams
+    /// the turn: each text delta becomes an [`Event::TextDelta`] and the run ends
+    /// with exactly one terminal event:
+    ///
+    /// - [`Event::RunFinished`] when the facade stream reaches its terminal
+    ///   `Done`.
+    /// - [`Event::RunError`] when the facade stream yields a failure, or ends
+    ///   without a terminal `Done`.
+    /// - [`Event::RunError`] carrying `"run cancelled"` when `cancel` fires while
+    ///   the turn is in flight.
+    ///
+    /// Cancellation and failure both drop the facade stream before the terminal
+    /// event is emitted; agent-lib abandons the in-flight turn on drop, so the
+    /// agent's committed history is unchanged and the driver stays reusable for
+    /// the next turn.
+    pub(crate) async fn run_turn(
         &mut self,
         session_id: SessionId,
         text: String,
-        events: EventBus,
-    ) -> WireRunId {
-        let run_id = self.next_run_id();
-        let _ = events.emit(Event::RunStarted {
-            id: session_id,
-            run_id,
-        });
-
-        match self.drive(session_id, text, &events).await {
-            Ok(output) => {
-                let _ = events.emit(Event::RunFinished {
-                    id: session_id,
-                    output,
-                });
-            }
+        events: &EventBus,
+        cancel: &CancelToken,
+    ) {
+        let mut stream = match self.agent.stream(text).await {
+            Ok(stream) => stream,
             Err(error) => {
                 let _ = events.emit(Event::RunError {
                     id: session_id,
                     message: error.to_string(),
                 });
+                return;
             }
-        }
+        };
 
-        run_id
-    }
-
-    /// Consumes the facade stream for one turn, projecting incremental events and
-    /// folding the terminal `Done` into a [`RunOutput`].
-    ///
-    /// # Errors
-    ///
-    /// Returns any [`FacadeError`] surfaced while opening or draining the facade
-    /// stream, or [`FacadeError::InvalidState`] if the stream ends without a
-    /// terminal `Done` event.
-    async fn drive(
-        &mut self,
-        session_id: SessionId,
-        text: String,
-        events: &EventBus,
-    ) -> Result<RunOutput, FacadeError> {
         let mut final_output: Option<RunOutput> = None;
-        {
-            let mut stream = self.agent.stream(text).await?;
-            while let Some(item) = stream.next().await {
-                let event = item?;
-                if let Some(mag_event) =
-                    map_wire_event(session_id, event.to_wire(), &mut final_output)
-                {
-                    let _ = events.emit(mag_event);
-                }
+        let outcome = loop {
+            tokio::select! {
+                item = stream.next() => match item {
+                    Some(Ok(event)) => {
+                        if let Some(mag_event) =
+                            map_wire_event(session_id, event.to_wire(), &mut final_output)
+                        {
+                            let _ = events.emit(mag_event);
+                        }
+                    }
+                    Some(Err(error)) => break TurnOutcome::Failed(error.to_string()),
+                    None => break TurnOutcome::Completed,
+                },
+                () = cancel.cancelled() => break TurnOutcome::Cancelled,
             }
-        }
+        };
 
-        final_output.ok_or_else(|| {
-            FacadeError::InvalidState(
-                "agent stream ended without a terminal `Done` event".to_owned(),
-            )
-        })
+        // Release the mutable agent borrow before emitting the terminal event; a
+        // cancelled or failed turn is abandoned on drop (committed history is
+        // left intact) so the next `run_turn` on this driver can proceed.
+        drop(stream);
+
+        let terminal = match outcome {
+            TurnOutcome::Completed => match final_output {
+                Some(output) => Event::RunFinished {
+                    id: session_id,
+                    output,
+                },
+                None => Event::RunError {
+                    id: session_id,
+                    message: "agent stream ended without a terminal `Done` event".to_owned(),
+                },
+            },
+            TurnOutcome::Failed(message) => Event::RunError {
+                id: session_id,
+                message,
+            },
+            TurnOutcome::Cancelled => Event::RunError {
+                id: session_id,
+                message: "run cancelled".to_owned(),
+            },
+        };
+        let _ = events.emit(terminal);
     }
 
     /// Mints the next envelope run identity for this session.
@@ -139,10 +148,20 @@ impl SessionDriver {
     /// The facade owns the drive's internal ids and does not surface a run id on
     /// the event stream, so mag mints its own monotonic id purely to tag the
     /// [`RunStarted`](Event::RunStarted) / cancellation envelope.
-    fn next_run_id(&self) -> WireRunId {
+    pub(crate) fn next_run_id(&self) -> WireRunId {
         let value = self.run_counter.fetch_add(1, Ordering::Relaxed);
         WireRunId::new(Uuid::from_u128(u128::from(value)))
     }
+}
+
+/// Terminal outcome of one [`SessionDriver::run_turn`] drive loop.
+enum TurnOutcome {
+    /// The facade stream reached its terminal `Done`.
+    Completed,
+    /// The facade stream yielded a failure carrying this message.
+    Failed(String),
+    /// The [`CancelToken`] fired while the turn was in flight.
+    Cancelled,
 }
 
 /// Maps one projected [`WireRunEvent`] into a mag [`Event`].

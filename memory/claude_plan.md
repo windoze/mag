@@ -206,3 +206,85 @@ Review 任务：核对 mag-core 已切到 facade `Agent`+`Agent::stream`（C1-3�
 - 全部验证绿：fmt --check、clippy -D warnings、cargo test -p mag-core -p mag-service（12+10）、
   cargo test --workspace --all-targets、cargo doc --no-deps --workspace（无警告）、cargo tree -p mag-service 无 agent-lib。
 - TODO.md：CS-3 标 [DONE] + 完成记录；C2-1 上下文补 CS-3 run-executor 起点。提交后停止。
+
+---
+
+## 当前任务：C2-1 per-session driver actor（TODO.md 589 行）
+
+### 目标（TODO.md + DESIGN.md §3.1）
+把 CS-3 的单条全局 run-executor（`run_loop.rs`）重构为 **per-session driver actor**：
+- 每会话隔离：各会话独占其 facade `Agent`；跨会话 run 并发独立；事件按 `session_id` 分流。
+- cancel 旁路：`CancelRun` 走 cancel token，不碰 agent `&mut`，永不被 run 饿死。
+- `RespondInteraction` 留 C3 钩子。
+
+### 设计
+- **每会话一条专用 OS 线程**（current_thread runtime + `LocalSet`）。命令 `mpsc` sender 在
+  `create` 中同步登记，无竞态；actor 线程独立启动并消费无界通道。跨会话真并行。
+- actor 持 `SessionDriver`。`SendMessage`：mint run_id → emit `RunStarted` → 提前回 run_id →
+  `spawn_local` run task（拥有 driver，驱动 `agent.stream`，受 `CancelToken` 控制）；结束把
+  driver 经通道交还 actor。
+- `CancelRun`：actor 触发 run 的 `CancelToken`（不碰 agent `&mut`）。run task 的驱动循环用
+  `select!` 在 stream 与 `cancel.cancelled()` 间竞争；取消时丢弃 stream（agent-lib
+  `AgentRunStream::Drop` 会 abandon 在途 turn，committed 历史不变），emit
+  `RunError { message: "run cancelled" }`。
+- `RespondInteraction`：路由到 actor 钩子，暂回 `Unsupported`（C3 填充）。
+- run 进行中到达的 `SendMessage`：延后处理（会话内串行）。
+
+### CancelToken
+- 无新依赖的小 `CancelToken`（`Arc<AtomicBool>` + `tokio::sync::Notify`），可克隆，C3 `IpcApproval` 复用。
+
+### 文件
+- 新增 `session.rs`（替换 `run_loop.rs`）：`SessionCommand` / `CancelToken` / `SessionActor` /
+  `SessionManager` / `SessionHandle`。
+- `driver.rs`：暴露 `next_run_id`；`send_message` → cancel 感知的 `run_turn`。
+- `engine.rs`：改用 `SessionManager`；实现 `cancel`（路由 `CancelRun`）与 `delete_session`
+  （停 actor + 删元数据）；`respond_interaction` 路由到钩子。新增 `mod session` 测试。
+- `test_support.rs`：加 stalling stream 脚本，供 cancel 测试构造"进行中"的 run。
+- `lib.rs`：`mod run_loop` → `mod session`。
+
+### 测试（聚焦 `cargo test -p mag-core engine::session`）
+1. 两会话并行 SendMessage：TextDelta/RunFinished 按 session_id 分流、不串。
+2. 长（stalling）run 中途 CancelRun → 干净终止、emit RunError（cancelled）、无 RunFinished、
+   会话仍可用；另一会话不受影响。
+- 同步更新 `unimplemented_methods_return_unsupported`（cancel/delete_session 现返回 Ok）。
+
+### 进度
+- [x] test_support stalling 脚本
+- [x] driver run_turn + next_run_id
+- [x] session.rs（actor + manager + CancelToken；`DriverState::Idle` 装箱避免 large_enum_variant）
+- [x] engine 接线 + cancel/delete/respond
+- [x] engine::session 测试（两测试稳定通过）
+- [x] 更新 unimplemented 测试 + 新增 cancel/delete 已知/未知会话测试
+- [x] cargo fmt --all --check ✓
+- [x] cargo clippy --all-targets -- -D warnings ✓（0 警告）
+- [x] cargo test --workspace ✓（mag-core 16 / mag-service 10 / sources 1 / tools 1）
+- [x] cargo doc --no-deps --workspace ✓（无警告）
+- [x] TODO.md 标 [DONE] + 完成记录
+- [ ] 提交（待并发 review 复核后）
+
+---
+
+## 当前任务：C2-R Review 会话隔离与 cancel 正确性（TODO.md 649 行）
+
+### 目标（纯 review 任务）
+核对 per-session actor 模型：无死锁/饿死（cancel 不被 run 阻塞，§3.1）、多会话事件分流正确、
+run 失败/取消后会话状态一致；汇总缺口；跑完整验证序列 1–5。
+
+### Review 结论（代码核对，无源码改动）
+- 无死锁/饿死：actor 循环 `select!` 收命令 + 归还 driver，run 在独立 `spawn_local` task 推进，
+  `CancelRun` 只翻 `CancelToken`（不碰 agent `&mut`），永不饿死；`CancelToken::cancelled()` enable 后再查标志，
+  无丢唤醒；single-thread + LocalSet 协作让点，stalling 流在 pending 处 park 让出执行器。
+- 多会话分流：每会话独立线程/runtime/agent，命令 sender 同步登记无竞态；事件带 session_id 走广播 + 过滤订阅；
+  `two_sessions_route_events_by_session_id` 证明不串话。
+- 状态一致：`run_turn` 总 drop stream + emit 单一终止事件，再交还 driver → Idle；cancel/失败后会话续用；
+  `cancel_mid_run_terminates_and_session_stays_usable` 证明；`delete_session` drop sender + join，在途 run abandon。
+- 前向缺口（非阻塞）：RespondInteraction→C3；cancel 不移除 deferred SendMessage（符合规范）；
+  next_run_id 跨会话可能重复（当前恒与 session_id 成对故安全）；snapshot→C4。无未排期失败测试，无需新前置任务。
+
+### 验证（完整序列 1–5 全绿）
+- fmt --check ✓；`cargo test -p mag-core engine::session`（2 用例，3 次稳定）✓；
+  clippy -D warnings（0 警告）✓；`cargo test --workspace`（16/10/1/1）✓；`cargo doc --no-deps --workspace` ✓。
+
+### 进度
+- 已核对 session.rs / driver.rs / engine.rs / event_bus.rs / test_support.rs 与 DESIGN §3.1；结论如上。
+- 已将 TODO.md C2-R 标 [DONE] 并补完成记录（含 review 对照与缺口汇总）。下一步：git 提交后停止。

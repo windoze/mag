@@ -586,7 +586,7 @@ Command/Event 归属 mag-service 且仍是 `ServiceEvent` 的投影。汇总缺�
 
 目标：per-session driver actor（`docs/DESIGN.md` §3.1），多会话隔离，`CancelRun` 走不碰 agent `&mut` 的旁路。
 
-### [TODO] C2-1 per-session driver actor
+### [DONE] C2-1 per-session driver actor
 
 **上下文**：
 
@@ -616,12 +616,78 @@ Command/Event 归属 mag-service 且仍是 `ServiceEvent` 的投影。汇总缺�
 - 聚焦：`cargo test -p mag-core engine::session`。
 - 完整验证序列 1–5。
 
-### [TODO] C2-R Review：会话隔离与 cancel 正确性
+**完成记录**：
+
+- 用 `crates/mag-core/src/session.rs`（新增，替换 CS-3 的 `run_loop.rs`，后者已 `git rm`）实现 per-session
+  actor 架构：
+  - `SessionManager`：`create_session` 为每个会话起一条独立 OS 线程（`current_thread` runtime + `LocalSet`），
+    在返回前同步登记该会话的命令 sender（避免与后续路由竞争）；命令按 `session_id` 路由；`delete_session`
+    丢弃 sender 并 join 线程；`Drop` join 所有线程。跨会话彻底隔离（各自线程/runtime/agent）。
+  - `SessionActor`：状态机 `Idle(Box<SessionDriver>)`/`Running`/`Failed`。`run()` 循环 `select!` 收
+    `SessionCommand` 与 run task 归还 driver 的 `run_done_rx`——即使 run 正在进行，actor 仍在等命令，
+    `CancelRun` 不会被 run 借用阻塞（§3.1 旁路）。`SendMessage`（Idle）铸 run_id、emit `RunStarted`、
+    提前回 run_id（使调用方可中途 cancel），再 `spawn_local` 驱动 `driver.run_turn(..)`；`SendMessage`
+    （Running）入 `deferred` 队列，空闲后经 `take_idle_deferred` 重放；`RespondInteraction` 留钩子（回
+    `Unsupported`，C3 用）。
+  - `CancelToken`（`Arc<AtomicBool>` + `Arc<Notify>`）：`cancelled()` 快路径查标志，否则 `enable()` 后再查
+    标志才 await，`cancel()` 置标志 + `notify_waiters()`，无丢唤醒。
+- `crates/mag-core/src/driver.rs`：`run_turn` 用 `tokio::select!` 在 `stream.next()` 与 `cancel.cancelled()`
+  间取舍；取消时先 drop stream（agent-lib `AgentRunStream::Drop` 干净 abandon，committed 历史不变、agent
+  可复用）再 emit `RunError{message:"run cancelled"}`。cancel/respond 均不碰 agent `&mut`。
+- `crates/mag-core/src/engine.rs`：`EngineInner` 改持 `SessionManager`；接通 `cancel`/`delete_session`/
+  `send_message`/`respond_interaction`。`crates/mag-core/src/test_support.rs`：加 `StreamScript`（
+  `Complete`/`Stall`）+ `stalling_text_stream` 供取消用例造"慢"流。
+- 测试（`engine::session`）：`two_sessions_route_events_by_session_id`（两会话并行，事件按 `session_id`
+  分流不串）；`cancel_mid_run_terminates_and_session_stays_usable`（长 run 中途 `CancelRun` → emit
+  `RunError`、会话续用 `SendMessage` 正常、另一会话不受影响）。另加
+  `cancel_and_delete_unknown_session_report_session_not_found` 与
+  `cancel_and_delete_known_session_succeed`，并更新 `unimplemented_methods_return_unsupported`。
+- 验证：`cargo fmt --all --check` ✓；`cargo test -p mag-core engine::session`（多次稳定）✓；
+  `cargo clippy --all-targets -- -D warnings` 0 警告 ✓；`cargo test --workspace` 全绿（mag-core 16 /
+  mag-service 10 / mag-sources 1 / mag-tools 1，doctests 0）✓；`cargo doc --no-deps --workspace` 无警告 ✓。
+
+### [DONE] C2-R Review：会话隔离与 cancel 正确性
 
 **做什么**：核对 actor 模型无死锁/饿死（cancel 不被 run 阻塞，§3.1）；多会话事件分流正确；会话状态在 run
 失败/取消后一致。汇总缺口。
 
 **验证条件**：完整验证序列 1–5 全绿；并发/取消用例覆盖。
+
+**完成记录（2026-07-18）**：
+
+- 纯 review 任务，代码核对无阻塞缺口，无需改动源码。
+
+- **无死锁/饿死（cancel 不被 run 阻塞，§3.1）**：
+  - `SessionActor::run` 用 `select!` 同时等 `commands.recv()` 与 run task 归还 driver 的 `run_done_rx`；
+    run 在独立 `spawn_local` task 推进，因此即使 run 在途，actor 循环仍随时可服务 `CancelRun`——cancel 永不饿死。
+  - `CancelRun` 只翻 `CancelToken`（`AtomicBool` + `Notify`），`RespondInteraction` 只碰 reply oneshot；
+    两者都不借用 agent `&mut`，符合 §3.1「旁路」约束。
+  - `CancelToken::cancelled()` 在第二次读标志前先 `enable()` 注册 waiter，`cancel()` 落在 check→await 窗口内
+    也不会丢唤醒（无 lost wakeup）。
+  - single-thread runtime + `LocalSet`：run task 与 actor 循环协作让点。有限（`Complete`）流会 drain 后结束；
+    stalling 流在 `stream::pending()` 处 park，让出执行器给控制命令，无忙轮询饿死。
+- **多会话事件分流**：每会话独占 OS 线程/runtime/agent（`SessionManager::create_session`），命令 sender 在
+  返回前同步登记，`send_message` 不与 actor 线程竞态；事件写共享广播 `EventBus`（各带 `session_id`），
+  `subscribe(Some(id))` 过滤。`two_sessions_route_events_by_session_id` 证明两 actor 不串话。
+- **run 失败/取消后状态一致**：`run_turn` 总会 drop stream（agent-lib 丢弃在途 turn、committed 历史不变）并
+  emit 恰好一个终止事件（`RunFinished` / `RunError` / `"run cancelled"`），随后经 `run_done_tx` 交还 driver，
+  actor 收回 → `Idle`、清 `cancel`，会话续用。`cancel_mid_run_terminates_and_session_stays_usable` 证明：
+  中途取消 → `RunError(cancelled)`、无 `RunFinished`、会话可续用、另一会话不受影响。driver 构建失败 →
+  `Failed`，每次 `SendMessage` 回 `Backend` 且不 emit `RunStarted`。`delete_session` drop sender → actor 循环
+  退出 → join 线程（在途 run 经 `LocalSet` 拆除而 abandon）；`send_message` 在 park 前 drop 克隆 sender，
+  避免 deferred run 撑开命令通道阻塞 join。
+- **前向缺口（非阻塞，已被后续里程碑覆盖或超出 C2 范围）**：
+  - `RespondInteraction` 现回 `Unsupported`——C3 落地交互往返（actor 钩子已就位）。
+  - `cancel(session_id)` 只取消在途 run，不移除已排队/deferred 的 `SendMessage`；符合规范「active run, if any」，
+    无用例依赖丢弃 deferred；若 C3+ 引入按 run_id 取消语义再补。
+  - `next_run_id` 为每会话单调（per-driver 计数器铸 uuid），会话内唯一、跨会话可能相同；因 run id 恒与
+    `session_id` 成对且 `cancel` 以会话为目标，当前安全；若未来引入按 run_id 取消/全局关联，应换全局唯一 id 源。
+  - committed 一致点 snapshot（§3.6）尚未接线——属 C4 持久化，明确后续里程碑。
+  - 以上均非阻塞，也无未排期失败测试，无需插入新前置任务。
+- **验证（完整序列 1–5 全绿）**：`cargo fmt --all -- --check` ✓；`cargo test -p mag-core engine::session`
+  （2 用例，连跑 3 次稳定）✓；`cargo clippy --all-targets -- -D warnings`（0 警告）✓；
+  `cargo test --workspace`（mag-core 16 / mag-service 10 / mag-sources 1 / mag-tools 1，doctests 0）✓；
+  `cargo doc --no-deps --workspace`（无警告）✓。
 
 ---
 

@@ -19,16 +19,16 @@ use mag_service::{
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::{EventBus, run_loop::RunLoop};
+use crate::{EventBus, session::SessionManager};
 
 /// Transport-neutral service engine implementing [`MagService`].
 ///
 /// The engine stores session configuration in memory, emits neutral
 /// [`ServiceEvent`]s through an [`EventBus`] observed via
 /// [`subscribe`](MagService::subscribe), and drives chat turns through agent-lib
-/// on a dedicated run-executor thread (see the `run_loop` module). It is the
-/// single implementation of the [`MagService`] facade (`docs/DESIGN.md`
-/// §3.0/§3.1) and can be injected as `Arc<dyn MagService>`.
+/// on per-session driver actors (see the `session` module). It is the single
+/// implementation of the [`MagService`] facade (`docs/DESIGN.md` §3.0/§3.1) and
+/// can be injected as `Arc<dyn MagService>`.
 #[derive(Clone)]
 pub struct Engine {
     inner: Arc<EngineInner>,
@@ -67,6 +67,8 @@ impl MagService for Engine {
             id
         };
 
+        self.inner.manager.create_session(id, config.clone());
+
         let _ = self
             .inner
             .event_bus
@@ -92,44 +94,52 @@ impl MagService for Engine {
         })
     }
 
-    async fn delete_session(&self, _id: SessionId) -> Result<(), ServiceError> {
-        Err(ServiceError::Unsupported {
-            operation: "delete_session".to_owned(),
-        })
+    async fn delete_session(&self, id: SessionId) -> Result<(), ServiceError> {
+        {
+            let mut sessions = self.inner.sessions.lock().await;
+            if sessions.remove(&id).is_none() {
+                return Err(ServiceError::SessionNotFound { id });
+            }
+        }
+        self.inner.manager.delete_session(id);
+        Ok(())
     }
 
     async fn send_message(&self, id: SessionId, input: UserInput) -> Result<RunId, ServiceError> {
-        let config = {
+        {
             let sessions = self.inner.sessions.lock().await;
-            sessions.get(&id).cloned()
-        };
-        let Some(config) = config else {
-            return Err(ServiceError::SessionNotFound { id });
-        };
-        let Some(run) = self.inner.run.as_ref() else {
-            return Err(ServiceError::Backend {
-                message: "no LLM client configured".to_owned(),
-            });
-        };
+            if !sessions.contains_key(&id) {
+                return Err(ServiceError::SessionNotFound { id });
+            }
+        }
 
-        run.run(id, config, input.text).await
+        self.inner.manager.send_message(id, input.text).await
     }
 
-    async fn cancel(&self, _id: SessionId) -> Result<(), ServiceError> {
-        Err(ServiceError::Unsupported {
-            operation: "cancel".to_owned(),
-        })
+    async fn cancel(&self, id: SessionId) -> Result<(), ServiceError> {
+        {
+            let sessions = self.inner.sessions.lock().await;
+            if !sessions.contains_key(&id) {
+                return Err(ServiceError::SessionNotFound { id });
+            }
+        }
+        self.inner.manager.cancel(id);
+        Ok(())
     }
 
     async fn respond_interaction(
         &self,
-        _id: SessionId,
+        id: SessionId,
         _request_id: RequestId,
         _response: InteractionResponseWire,
     ) -> Result<(), ServiceError> {
-        Err(ServiceError::Unsupported {
-            operation: "respond_interaction".to_owned(),
-        })
+        {
+            let sessions = self.inner.sessions.lock().await;
+            if !sessions.contains_key(&id) {
+                return Err(ServiceError::SessionNotFound { id });
+            }
+        }
+        self.inner.manager.respond_interaction(id).await
     }
 
     fn subscribe(&self, id: Option<SessionId>) -> BoxStream<'static, ServiceEvent> {
@@ -168,18 +178,18 @@ struct EngineInner {
     sessions: Mutex<BTreeMap<SessionId, SessionConfig>>,
     event_bus: EventBus,
     session_ids: SessionIdSource,
-    run: Option<RunLoop>,
+    manager: SessionManager,
 }
 
 impl EngineInner {
     fn new(client: Option<Arc<dyn LlmClient>>) -> Self {
         let event_bus = EventBus::new();
-        let run = client.map(|client| RunLoop::spawn(client, event_bus.clone()));
+        let manager = SessionManager::new(client, event_bus.clone());
         Self {
             sessions: Mutex::new(BTreeMap::new()),
             event_bus,
             session_ids: SessionIdSource::new(),
-            run,
+            manager,
         }
     }
 }
@@ -322,18 +332,6 @@ mod skeleton {
             })
         );
         assert_eq!(
-            engine.delete_session(id).await,
-            Err(ServiceError::Unsupported {
-                operation: "delete_session".to_owned(),
-            })
-        );
-        assert_eq!(
-            engine.cancel(id).await,
-            Err(ServiceError::Unsupported {
-                operation: "cancel".to_owned(),
-            })
-        );
-        assert_eq!(
             engine
                 .respond_interaction(
                     id,
@@ -358,6 +356,48 @@ mod skeleton {
             Err(ServiceError::Unsupported {
                 operation: "probe_local_agents".to_owned(),
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_and_delete_unknown_session_report_session_not_found() {
+        let engine = Engine::new();
+        let missing = SessionId::new(Uuid::from_u128(4242));
+
+        assert_eq!(
+            engine.cancel(missing).await,
+            Err(ServiceError::SessionNotFound { id: missing })
+        );
+        assert_eq!(
+            engine.delete_session(missing).await,
+            Err(ServiceError::SessionNotFound { id: missing })
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_and_delete_known_session_succeed() {
+        let engine = Engine::new();
+        let id = engine
+            .create_session(config("model-a"))
+            .await
+            .expect("create session");
+
+        // Without a run in flight, cancel is an accepted no-op.
+        engine.cancel(id).await.expect("cancel known session");
+
+        engine.delete_session(id).await.expect("delete session");
+        assert!(
+            engine
+                .list_sessions()
+                .await
+                .expect("list sessions")
+                .is_empty()
+        );
+
+        // Deleting again reports the session as gone.
+        assert_eq!(
+            engine.delete_session(id).await,
+            Err(ServiceError::SessionNotFound { id })
         );
     }
 
@@ -637,5 +677,219 @@ mod chat {
         let last = second_messages.last().expect("second request has messages");
         assert_eq!(last.role, Role::User);
         assert_eq!(text(last), "again");
+    }
+}
+
+#[cfg(test)]
+mod session {
+    use std::sync::Arc;
+
+    use agent_lib::{client::LlmClient, model::usage::Usage};
+    use futures::stream::BoxStream;
+    use mag_service::{MagService, RoutingMode, ServiceEvent, SessionConfig, SessionId, UserInput};
+    use tokio::time::{Duration, timeout};
+
+    use crate::test_support::{
+        FakeLlmClient, StreamScript, stalling_text_stream, text_stream_with_usage,
+    };
+
+    use super::Engine;
+
+    fn config(model: &str) -> SessionConfig {
+        SessionConfig {
+            provider: "fake".to_owned(),
+            model: model.to_owned(),
+            tool_profile: None,
+            routing: RoutingMode::ModelRouted,
+        }
+    }
+
+    fn usage(input: u32, output: u32) -> Usage {
+        Usage {
+            input,
+            output,
+            total: Some(input + output),
+            ..Usage::default()
+        }
+    }
+
+    fn complete(chunks: &[&str], usage: Usage) -> StreamScript {
+        StreamScript::Complete(text_stream_with_usage(chunks, usage))
+    }
+
+    fn engine_with_fake(fake: Arc<FakeLlmClient>) -> Engine {
+        let client: Arc<dyn LlmClient> = fake;
+        Engine::with_llm_client(client)
+    }
+
+    async fn create_session(engine: &Engine, model: &str) -> SessionId {
+        engine
+            .create_session(config(model))
+            .await
+            .expect("create session")
+    }
+
+    async fn next_event(events: &mut BoxStream<'static, ServiceEvent>) -> ServiceEvent {
+        timeout(Duration::from_secs(2), futures::StreamExt::next(events))
+            .await
+            .expect("event timed out")
+            .expect("event stream closed")
+    }
+
+    /// Reads events until the run reaches a terminal `RunFinished`/`RunError`.
+    async fn collect_run(events: &mut BoxStream<'static, ServiceEvent>) -> Vec<ServiceEvent> {
+        let mut collected = Vec::new();
+        loop {
+            let event = next_event(events).await;
+            let terminal = matches!(
+                event,
+                ServiceEvent::RunFinished { .. } | ServiceEvent::RunError { .. }
+            );
+            collected.push(event);
+            if terminal {
+                break;
+            }
+        }
+        collected
+    }
+
+    /// Asserts a clean `RunStarted → TextDelta+ → RunFinished` lifecycle whose
+    /// every event is scoped to `session`.
+    fn assert_run_ok(events: &[ServiceEvent], session: SessionId, run_id: mag_service::RunId) {
+        for event in events {
+            assert_eq!(
+                event.session_id(),
+                Some(session),
+                "event leaked across sessions: {event:?}",
+            );
+        }
+
+        let ServiceEvent::RunStarted {
+            id,
+            run_id: started,
+        } = &events[0]
+        else {
+            panic!("expected run_started, got {:?}", events[0]);
+        };
+        assert_eq!(*id, session);
+        assert_eq!(*started, run_id);
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ServiceEvent::TextDelta { .. })),
+            "run produced no text delta: {events:?}",
+        );
+
+        let last = events.last().expect("run has at least one event");
+        assert!(
+            matches!(last, ServiceEvent::RunFinished { id, .. } if *id == session),
+            "expected run_finished, got {last:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn two_sessions_route_events_by_session_id() {
+        let fake = FakeLlmClient::scripted(vec![
+            text_stream_with_usage(&["ok"], usage(1, 1)),
+            text_stream_with_usage(&["ok"], usage(1, 1)),
+        ]);
+        let engine = engine_with_fake(fake);
+
+        let a = create_session(&engine, "fake-a").await;
+        let b = create_session(&engine, "fake-b").await;
+        let mut events_a = engine.subscribe(Some(a));
+        let mut events_b = engine.subscribe(Some(b));
+
+        let run_a = engine
+            .send_message(a, UserInput::text("hi"))
+            .await
+            .expect("send to session a");
+        let run_b = engine
+            .send_message(b, UserInput::text("hi"))
+            .await
+            .expect("send to session b");
+
+        // Each subscriber only ever observes its own session's run, proving the
+        // two per-session actors never cross-talk on the shared event bus.
+        let a_events = collect_run(&mut events_a).await;
+        let b_events = collect_run(&mut events_b).await;
+
+        assert_run_ok(&a_events, a, run_a);
+        assert_run_ok(&b_events, b, run_b);
+    }
+
+    #[tokio::test]
+    async fn cancel_mid_run_terminates_and_session_stays_usable() {
+        let fake = FakeLlmClient::scripted_streams(vec![
+            // Session S's first run stalls after one delta so a cancel can land.
+            stalling_text_stream(&["wait"]),
+            // A concurrent run on session O completes while S is stalled.
+            complete(&["other"], usage(1, 1)),
+            // Session S's post-cancel run completes, proving reuse.
+            complete(&["resumed"], usage(2, 1)),
+        ]);
+        let engine = engine_with_fake(fake);
+
+        let s = create_session(&engine, "fake-s").await;
+        let o = create_session(&engine, "fake-o").await;
+        let mut events_s = engine.subscribe(Some(s));
+        let mut events_o = engine.subscribe(Some(o));
+
+        // Start the long run and wait until it is actually streaming.
+        let run_s = engine
+            .send_message(s, UserInput::text("go"))
+            .await
+            .expect("send to session s");
+        assert!(matches!(
+            next_event(&mut events_s).await,
+            ServiceEvent::RunStarted { id, run_id } if id == s && run_id == run_s
+        ));
+        assert_eq!(
+            next_event(&mut events_s).await,
+            ServiceEvent::TextDelta {
+                id: s,
+                text: "wait".to_owned(),
+            }
+        );
+
+        // Another session runs to completion while S is stalled: an in-flight run
+        // in one session does not affect another.
+        engine
+            .send_message(o, UserInput::text("hi"))
+            .await
+            .expect("send to session o");
+        let o_events = collect_run(&mut events_o).await;
+        assert!(matches!(
+            o_events.last().expect("session o produced events"),
+            ServiceEvent::RunFinished { id, .. } if *id == o
+        ));
+
+        // Cancel the stalled run: it terminates cleanly with a cancellation error
+        // and never emits a RunFinished.
+        engine.cancel(s).await.expect("cancel session s");
+        let cancelled = next_event(&mut events_s).await;
+        assert!(
+            matches!(
+                &cancelled,
+                ServiceEvent::RunError { id, message } if *id == s && message == "run cancelled"
+            ),
+            "expected cancellation error, got {cancelled:?}",
+        );
+
+        // The session is still usable: a fresh message runs to completion.
+        let run_s2 = engine
+            .send_message(s, UserInput::text("again"))
+            .await
+            .expect("resend to session s");
+        let resumed = collect_run(&mut events_s).await;
+        assert_run_ok(&resumed, s, run_s2);
+        assert!(
+            resumed.iter().any(|event| matches!(
+                event,
+                ServiceEvent::TextDelta { text, .. } if text == "resumed"
+            )),
+            "resumed run should stream its scripted follow-up text: {resumed:?}",
+        );
     }
 }
