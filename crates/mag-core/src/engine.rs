@@ -21,6 +21,8 @@ use uuid::Uuid;
 
 use crate::{EventBus, session::SessionManager};
 
+pub(crate) mod approval;
+
 /// Transport-neutral service engine implementing [`MagService`].
 ///
 /// The engine stores session configuration in memory, emits neutral
@@ -130,8 +132,8 @@ impl MagService for Engine {
     async fn respond_interaction(
         &self,
         id: SessionId,
-        _request_id: RequestId,
-        _response: InteractionResponseWire,
+        request_id: RequestId,
+        response: InteractionResponseWire,
     ) -> Result<(), ServiceError> {
         {
             let sessions = self.inner.sessions.lock().await;
@@ -139,7 +141,10 @@ impl MagService for Engine {
                 return Err(ServiceError::SessionNotFound { id });
             }
         }
-        self.inner.manager.respond_interaction(id).await
+        self.inner
+            .manager
+            .respond_interaction(id, request_id, response)
+            .await
     }
 
     fn subscribe(&self, id: Option<SessionId>) -> BoxStream<'static, ServiceEvent> {
@@ -332,20 +337,6 @@ mod skeleton {
             })
         );
         assert_eq!(
-            engine
-                .respond_interaction(
-                    id,
-                    RequestId::new(Uuid::from_u128(9)),
-                    InteractionResponseWire::Answer {
-                        text: "ok".to_owned(),
-                    },
-                )
-                .await,
-            Err(ServiceError::Unsupported {
-                operation: "respond_interaction".to_owned(),
-            })
-        );
-        assert_eq!(
             engine.list_sources().await,
             Err(ServiceError::Unsupported {
                 operation: "list_sources".to_owned(),
@@ -356,6 +347,32 @@ mod skeleton {
             Err(ServiceError::Unsupported {
                 operation: "probe_local_agents".to_owned(),
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn respond_interaction_without_pending_reports_interaction_not_found() {
+        // A clientless engine spawns no session actor, so there is never a
+        // pending interaction to resolve; `respond_interaction` reports the
+        // request id as unknown rather than the retired `Unsupported`.
+        let engine = Engine::new();
+        let id = engine
+            .create_session(config("model-a"))
+            .await
+            .expect("create session");
+        let request_id = RequestId::new(Uuid::from_u128(9));
+
+        assert_eq!(
+            engine
+                .respond_interaction(
+                    id,
+                    request_id,
+                    InteractionResponseWire::Answer {
+                        text: "ok".to_owned(),
+                    },
+                )
+                .await,
+            Err(ServiceError::InteractionNotFound { request_id })
         );
     }
 

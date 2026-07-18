@@ -26,14 +26,20 @@ use std::{
 };
 
 use agent_lib::{client::LlmClient, facade::FacadeError};
-use mag_service::{Event, RunId, ServiceError, SessionConfig, SessionId};
+use mag_service::{
+    Event, InteractionResponseWire, RequestId, RunId, ServiceError, SessionConfig, SessionId,
+};
 use tokio::{
     runtime::Builder,
     sync::{Notify, mpsc, oneshot},
     task::LocalSet,
 };
 
-use crate::{EventBus, driver::SessionDriver};
+use crate::{
+    EventBus,
+    driver::SessionDriver,
+    engine::approval::{AskFrontendDecider, IpcApproval},
+};
 
 /// A cloneable, one-shot cancellation flag shared between a run task and the
 /// controllers that can cancel it.
@@ -56,7 +62,7 @@ struct CancelState {
 
 impl CancelToken {
     /// Marks the token cancelled and wakes any parked [`cancelled`](CancelToken::cancelled) waiter.
-    fn cancel(&self) {
+    pub(crate) fn cancel(&self) {
         self.inner.cancelled.store(true, Ordering::SeqCst);
         self.inner.notify.notify_waiters();
     }
@@ -97,9 +103,13 @@ enum SessionCommand {
     },
     /// Cancel the session's active run, if any (cancel-token side-channel).
     CancelRun,
-    /// Reserved hook for C3 interaction round-trips; replies `Unsupported` today.
+    /// Resolve a pending interaction request, waking the parked driver.
     RespondInteraction {
-        /// Channel used to acknowledge (currently rejects with `Unsupported`).
+        /// Request identity emitted by [`Event::InteractionRequested`].
+        request_id: RequestId,
+        /// Interface-supplied response to the pending interaction.
+        response: InteractionResponseWire,
+        /// Channel used to acknowledge delivery or report a failure.
         reply: oneshot::Sender<Result<(), ServiceError>>,
     },
 }
@@ -122,6 +132,9 @@ struct SessionActor {
     session_id: SessionId,
     events: EventBus,
     state: DriverState,
+    /// Shared approval handler: injected into the driver's agent and used here to
+    /// resolve `RespondInteraction` commands (`docs/DESIGN.md` §3.3).
+    approval: Arc<IpcApproval>,
     /// Cancel handle for the active run, present only while a run is in flight.
     cancel: Option<CancelToken>,
     /// Commands received while a run was active, replayed once it finishes.
@@ -138,6 +151,7 @@ impl SessionActor {
         session_id: SessionId,
         events: EventBus,
         driver: Result<SessionDriver, FacadeError>,
+        approval: Arc<IpcApproval>,
     ) -> Self {
         let (run_done_tx, run_done_rx) = mpsc::unbounded_channel();
         let state = match driver {
@@ -148,6 +162,7 @@ impl SessionActor {
             session_id,
             events,
             state,
+            approval,
             cancel: None,
             deferred: VecDeque::new(),
             run_done_tx,
@@ -200,10 +215,12 @@ impl SessionActor {
                     cancel.cancel();
                 }
             }
-            SessionCommand::RespondInteraction { reply } => {
-                let _ = reply.send(Err(ServiceError::Unsupported {
-                    operation: "respond_interaction".to_owned(),
-                }));
+            SessionCommand::RespondInteraction {
+                request_id,
+                response,
+                reply,
+            } => {
+                let _ = reply.send(self.approval.respond(request_id, response));
             }
         }
     }
@@ -243,6 +260,9 @@ impl SessionActor {
 
         let cancel = CancelToken::default();
         self.cancel = Some(cancel.clone());
+        // Arm the approval handler so cancelling this run also unblocks a driver
+        // parked on a pending approval (`docs/DESIGN.md` §3.3).
+        self.approval.arm_cancel(cancel.clone());
         let events = self.events.clone();
         let run_done = self.run_done_tx.clone();
         let session_id = self.session_id;
@@ -268,8 +288,15 @@ fn session_thread(
         .build()
         .expect("build mag session runtime");
     let local = LocalSet::new();
-    let driver = SessionDriver::new(&config, client);
-    let actor = SessionActor::new(session_id, event_bus, driver);
+    // Shared approval handler bridges the driver's paused interactions to the
+    // event bus and back through `RespondInteraction` (`docs/DESIGN.md` §3.3).
+    let approval = Arc::new(IpcApproval::new(
+        session_id,
+        event_bus.clone(),
+        Arc::new(AskFrontendDecider),
+    ));
+    let driver = SessionDriver::new(&config, client, approval.clone());
+    let actor = SessionActor::new(session_id, event_bus, driver, approval);
     local.block_on(&runtime, actor.run(commands));
 }
 
@@ -362,24 +389,30 @@ impl SessionManager {
         }
     }
 
-    /// Routes an interaction response to the session actor (reserved for C3).
+    /// Routes an interaction response to the session actor, which resolves the
+    /// matching pending approval (`docs/DESIGN.md` §3.3).
     ///
     /// # Errors
     ///
-    /// Returns [`ServiceError::Unsupported`] today (no interaction machinery yet)
-    /// or [`ServiceError::Backend`] when the actor stopped before replying.
+    /// Returns [`ServiceError::InteractionNotFound`] when no actor exists for the
+    /// session or the request id is unknown, or [`ServiceError::Backend`] when the
+    /// actor stopped before replying.
     pub(crate) async fn respond_interaction(
         &self,
         session_id: SessionId,
+        request_id: RequestId,
+        response: InteractionResponseWire,
     ) -> Result<(), ServiceError> {
         let Some(sender) = self.sender(session_id) else {
-            return Err(ServiceError::Unsupported {
-                operation: "respond_interaction".to_owned(),
-            });
+            return Err(ServiceError::InteractionNotFound { request_id });
         };
         let (reply, reply_rx) = oneshot::channel();
         sender
-            .send(SessionCommand::RespondInteraction { reply })
+            .send(SessionCommand::RespondInteraction {
+                request_id,
+                response,
+                reply,
+            })
             .map_err(|_| ServiceError::Backend {
                 message: "session actor stopped".to_owned(),
             })?;

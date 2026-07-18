@@ -15,13 +15,14 @@ use std::sync::{
 };
 
 use agent_lib::{
+    agent::InteractionHandler,
     client::LlmClient,
     facade::{Agent, FacadeError, UsageSummary, WireRunEvent, WireRunOutput},
 };
 use mag_service::{Event, RunId as WireRunId, RunOutput, SessionConfig, SessionId, UsageInfo};
 use uuid::Uuid;
 
-use crate::{EventBus, session::CancelToken};
+use crate::{EventBus, engine::approval::IpcApproval, session::CancelToken};
 
 const DEFAULT_MAX_TOKENS: u32 = 512;
 const DEFAULT_MAX_STEPS: u32 = 8;
@@ -46,12 +47,14 @@ impl SessionDriver {
     pub(crate) fn new(
         config: &SessionConfig,
         client: Arc<dyn LlmClient>,
+        approval: Arc<IpcApproval>,
     ) -> Result<Self, FacadeError> {
         let agent = Agent::builder()
             .client(client)
             .model(config.model.clone())
             .max_tokens(DEFAULT_MAX_TOKENS)
             .max_steps(DEFAULT_MAX_STEPS)
+            .interaction_handler(approval as Arc<dyn InteractionHandler>)
             .build()?;
 
         Ok(Self {

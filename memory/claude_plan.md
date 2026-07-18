@@ -335,3 +335,47 @@ run 失败/取消后会话状态一致；汇总缺口；跑完整验证序列 1�
 - [x] 完整验证 1–5 全绿（fmt/clippy 0 警告、workspace 46 测、doc 无警告）
 - [x] TODO.md 标 [DONE] + 完成记录
 - [ ] git 提交后停止
+
+---
+
+## 当前任务：C3-2 `IpcApproval`：跨传输异步审批暂停点（TODO.md 754 行）
+
+### 目标（TODO.md + DESIGN.md §3.3/§8.1/§9.1）
+- 实现 `IpcApproval`（`impl agent::InteractionHandler`）：pending map + emit `InteractionRequested` +
+  await oneshot（含 cancel select），经 `AgentBuilder::interaction_handler(Arc<..>)` 注入 driver 的 facade Agent。
+- `SessionActor` 接 `RespondInteraction { request_id, response }`：取 pending sender → send(core response) → 唤醒 driver。
+- `PermissionDecider` trait + 默认 `AskFrontendDecider`（Permission 分支：None=问前端 emit+await）。
+- 逐变体映射 `InteractionKind` → `InteractionKindWire`（请求出站）与 `InteractionResponseWire` → 核心
+  `InteractionResponse`（应答入站，用 pending Interaction 的 step_id/call_id/action_id 寻址 + wire 决策）。
+
+### 设计决策
+- 新模块 `crates/mag-core/src/engine/approval.rs`，engine.rs 声明 `pub(crate) mod approval;`（路径
+  `engine::approval`，聚焦测试 `cargo test -p mag-core engine::approval`）。
+- IpcApproval 字段：session_id / events(EventBus) / request_ids(AtomicU64→Uuid) /
+  pending: Mutex<HashMap<RequestId, Pending{interaction, responder}>> / decider: Arc<dyn PermissionDecider> /
+  cancel: Mutex<CancelToken>（actor 每 run arm）。
+- respond() 同步：pending.remove → interaction_response_from_wire（+ accepts_response 校验）→ responder.send。
+  未知 request_id → InteractionNotFound；awaiter 掉线 → Backend。
+- fulfill：Permission 先问 decider（Some→立即返回；None→emit+await）；其它 kind 直接 emit+await。
+  select! { rx => resp, cancel.cancelled() => remove_pending + cancelled_response(Deny/Cancel) }。
+- 会话集成：session_thread 建 ipc → SessionDriver::new 注入 → SessionActor 存 ipc；start_run arm cancel；
+  handle(RespondInteraction) → ipc.respond。Engine/Manager 透传 request_id+response。
+- 已有测试 `unimplemented_methods_return_unsupported` 内的 respond_interaction 断言需改：现已实现，clientless
+  会话无 pending → InteractionNotFound。
+
+### 测试（engine::approval::tests）
+- 核心暂停 3 路径（直接 agent.stream 夹具 + 测试工具 + auto_deny + 注入 ipc + EventBus 订阅取 request_id）：
+  approve→工具执行、deny→工具被拒回灌、cancel→干净解阻（pending 清理，无挂起）。
+- kind→wire 保真（Approval/Question/Choice/Permission）；wire response→core 保真（4 族）。
+- Permission 走默认 decider：emit InteractionRequested 且 await。
+- respond 未知 request_id → InteractionNotFound。
+
+### 验证序列 1–5
+fmt → clippy -D warnings → cargo test -p mag-core engine::approval → cargo test --workspace → cargo doc。
+
+### 进度
+- [x] approval.rs 模块 + IpcApproval/decider/映射
+- [x] 会话接线（driver/actor/manager/engine；`CancelToken::cancel` 提升 pub(crate)）
+- [x] 测试（11 approval 单测）+ 更新既有 `respond_interaction` 测试（Unsupported→InteractionNotFound）
+- [x] 完整验证 1–5 全绿（fmt / clippy 0 警告 / mag-core 28 + 全工作区 / doc 无警告）
+- [x] TODO.md [DONE] + 完成记录；待提交后停止

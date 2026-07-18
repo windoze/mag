@@ -751,7 +751,7 @@ Command/Event 归属 mag-service 且仍是 `ServiceEvent` 的投影。汇总缺�
   `Agent::builder().tool(..)`，并按 `permission()` 配 `ApprovalPolicy` 的 auto/ask gate；本任务只交付
   registry/plugin/工具与 `agent::ToolRegistry` 投影，未接 driver（符合 C3-1 边界）。
 
-### [TODO] C3-2 `IpcApproval`：跨传输异步审批暂停点
+### [DONE] C3-2 `IpcApproval`：跨传输异步审批暂停点
 
 **上下文**：
 
@@ -791,6 +791,39 @@ Command/Event 归属 mag-service 且仍是 `ServiceEvent` 的投影。汇总缺�
 - 单元测试：`Permission` 走默认 decider 时正确 emit `InteractionRequested` 且 await。
 - 聚焦：`cargo test -p mag-core engine::approval`。
 - 完整验证序列 1–5。
+
+**完成记录（2026-07-18）**：
+
+- **`IpcApproval`（新模块 `engine/approval.rs`，`impl agent::InteractionHandler`）**：`fulfill` 里
+  `Permission` 分支先问 `PermissionDecider`（命中即短路，不发前端）；否则 `emit_and_await` 注册
+  `pending: Mutex<HashMap<RequestId, Pending>>`（`Pending {interaction, responder: oneshot::Sender}`）→ 发
+  `Event::InteractionRequested{request_id, kind}` → `tokio::select!` 在 `oneshot` waiter 与 session cancel
+  token（`Mutex<CancelToken>`，`arm_cancel` 每 run 重置）之间 park。machine **真正停在 `.await`**，与 facade
+  同步 `FacadeApproval` 不同（DESIGN §3.3/§9.1）。cancel 命中时 `discard_pending` + 返回保守
+  `cancelled_response`（Approval→`ApprovalResponse::cancel`、Permission→`PermissionResponse::cancel`、
+  Question→空答、Choice→0）；machine 对 Deny/Cancel 一视同仁（跳过工具、回灌合成 `ToolResponse`、续跑）。
+- **`PermissionDecider` trait + 默认 `AskFrontendDecider`**（§8.1 seam）：默认「问前端」（返 `None`→emit+await）；
+  规则/LLM decider 留后续，本任务只落 trait 调用点 + 默认实现。
+- **逐变体 wire 映射**：`interaction_kind_to_wire`（Approval/Question/Choice/Permission → `InteractionKindWire`）与
+  `interaction_response_from_wire`（wire → core，用**存储的 `interaction` 复原 step_id/call_id/action_id**，
+  前端只需送 decision；再经 `interaction.accepts_response` 校验族匹配）。含
+  `approval_requirement`/`approval_decision`/`permission_decision`/`permission_category`/`permission_risk` 与
+  id 重包（wire `#[non_exhaustive]` decision 未知变体保守映射为 Cancel）。
+- **session 接线**：`SessionCommand::RespondInteraction{request_id, response, reply}` 由
+  `SessionActor.handle` 路由到 `ipc.respond`（复原 core→校验→`oneshot::send` 唤醒 parked driver）；
+  `session_thread` 建 `Arc<IpcApproval>` 传入 `SessionDriver::new`（`AgentBuilder::interaction_handler` 注入 facade
+  `Agent`）并存于 actor；`start_run` 每 run `arm_cancel`。`SessionManager::respond_interaction(id, request_id,
+  response)`、`Engine::respond_interaction` 一并透传（旧 `Unsupported` 退役 → 无 pending 时报
+  `InteractionNotFound{request_id}`）。`CancelToken::cancel` 提升 `pub(crate)` 供审批单测触发取消。
+- **验证（完整验证序列 1–5 全绿）**：`cargo fmt --all` ✓；`cargo clippy --all-targets -- -D warnings`
+  （0 警告）✓；`cargo test -p mag-core engine::approval`（11 单测：pause→approve 工具跑 1 次、pause→deny
+  工具 0 次回灌、park 中 cancel 干净终止且晚到 respond→`InteractionNotFound`、Permission 默认 decider
+  emit+await、自定义 decider 短路不 emit、四变体 kind↔wire 双向保真、族不匹配→`Backend`、未知
+  request_id→`InteractionNotFound`）✓；`cargo test --all --all-targets`（mag-core 28 / mag-service 10 /
+  mag-sources 1 / mag-tools 6+13）全绿 ✓；`cargo doc --no-deps --workspace`（无警告）✓。
+- **前向留位（非阻塞）**：*哪些*工具暂停由 `ApprovalPolicy`（C3-3 用 `ask_tool`/`auto_allow` 配置）决定，
+  `IpcApproval` 只负责应答；C3-3 将把工具/审批事件（`ToolCallStarted`/`ApprovalRequested` 等）接入完整 turn 并
+  在 driver 的 `map_wire_event` 投影这些变体（现只走纯对话路径）。
 
 ### [TODO] C3-3 工具事件 + 审批接入完整 turn
 
