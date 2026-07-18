@@ -381,6 +381,7 @@ mod skeleton {
             provider: "fake".to_owned(),
             model: model.to_owned(),
             tool_profile: None,
+            cwd: None,
             routing: RoutingMode::ModelRouted,
         }
     }
@@ -613,6 +614,7 @@ mod chat {
             provider: "fake".to_owned(),
             model: model.to_owned(),
             tool_profile: None,
+            cwd: None,
             routing: RoutingMode::ModelRouted,
         }
     }
@@ -871,6 +873,7 @@ mod session {
             provider: "fake".to_owned(),
             model: model.to_owned(),
             tool_profile: None,
+            cwd: None,
             routing: RoutingMode::ModelRouted,
         }
     }
@@ -1149,6 +1152,7 @@ mod tool_turn {
             provider: "fake".to_owned(),
             model: "fake-tool".to_owned(),
             tool_profile: None,
+            cwd: None,
             routing: RoutingMode::ModelRouted,
         }
     }
@@ -1449,6 +1453,7 @@ mod persist {
             provider: "fake".to_owned(),
             model: model.to_owned(),
             tool_profile: None,
+            cwd: None,
             routing: RoutingMode::ModelRouted,
         }
     }

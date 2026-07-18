@@ -22,7 +22,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{fmt, str::FromStr};
+use std::{fmt, path::PathBuf, str::FromStr};
 use uuid::Uuid;
 
 mod service;
@@ -281,6 +281,16 @@ pub struct SessionConfig {
     /// Named tool profile to attach to the session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_profile: Option<String>,
+    /// Session working root supplied by the interface (for ACP, the client's
+    /// absolute `cwd`).
+    ///
+    /// When present, the path becomes the facade agent's worktree, so the
+    /// built-in tools (`read_file`/`shell`/`grep`/`list_dir`) resolve relative
+    /// to it under `safe_join`. `None` keeps the agent's default `"."` root and,
+    /// because the field is `#[serde(default)]`, also lets snapshots persisted
+    /// before this field existed deserialize unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
     /// Routing strategy for future delegation support.
     #[serde(default)]
     pub routing: RoutingMode,
@@ -647,6 +657,7 @@ mod tests {
             provider: "openai".to_owned(),
             model: "gpt-5-codex".to_owned(),
             tool_profile: Some("default".to_owned()),
+            cwd: None,
             routing: RoutingMode::ModelRouted,
         }
     }
@@ -963,6 +974,41 @@ mod tests {
         .expect("config with default routing");
 
         assert_eq!(decoded.routing, RoutingMode::ModelRouted);
+    }
+
+    #[test]
+    fn session_config_round_trips_cwd() {
+        let config = SessionConfig {
+            provider: "openai".to_owned(),
+            model: "gpt-5-codex".to_owned(),
+            tool_profile: None,
+            cwd: Some(std::path::PathBuf::from("/work/session-root")),
+            routing: RoutingMode::ModelRouted,
+        };
+
+        let json = serde_json::to_value(&config).expect("serialize config");
+        assert_eq!(json["cwd"], Value::String("/work/session-root".to_owned()));
+
+        let decoded =
+            serde_json::from_value::<SessionConfig>(json).expect("deserialize config with cwd");
+        assert_eq!(decoded, config);
+    }
+
+    #[test]
+    fn session_config_without_cwd_is_backward_compatible() {
+        let decoded = serde_json::from_value::<SessionConfig>(json!({
+            "provider": "openai",
+            "model": "gpt-5-codex"
+        }))
+        .expect("legacy config without cwd key");
+
+        assert_eq!(decoded.cwd, None);
+
+        let json = serde_json::to_value(&decoded).expect("serialize config");
+        assert!(
+            json.get("cwd").is_none(),
+            "absent cwd must not round-trip a null key"
+        );
     }
 
     #[test]

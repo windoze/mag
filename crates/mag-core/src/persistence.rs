@@ -361,6 +361,7 @@ mod tests {
             provider: "fake".to_owned(),
             model: model.to_owned(),
             tool_profile: None,
+            cwd: None,
             routing: RoutingMode::ModelRouted,
         }
     }

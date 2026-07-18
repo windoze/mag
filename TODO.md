@@ -219,7 +219,7 @@
   `async-trait`/`futures`/`tokio` 仅 dev-dependencies，供 e2e 的 fake `Arc<dyn MagService>` 与运行时用）；
   无 `mag-core`/`agent-lib`/`tauri`/`axum`。
 
-### [TODO] M1-3 `SessionConfig.cwd` 承载 + 会话 worktree 落位（service 主干向后兼容加字段）
+### [DONE] M1-3 `SessionConfig.cwd` 承载 + 会话 worktree 落位（service 主干向后兼容加字段）
 
 **上下文**：
 
@@ -266,6 +266,41 @@
   `SessionConfig.cwd`。
 - **完成后同步**：更新 `PLAN.md` §`mag-service` 契约清单（约 line 105）把 `SessionConfig` 字段补上 `cwd`
   （该处是契约事实描述，随字段落地一并订正；这是契约字段变更，非阶段计划改写）。
+
+**完成记录（M1-3）**：
+
+- **`mag-service`（`crates/mag-service/src/lib.rs`）**：`SessionConfig` 新增
+  `pub cwd: Option<std::path::PathBuf>`，属性 `#[serde(default, skip_serializing_if = "Option::is_none")]`
+  （与 `tool_profile` 同风格），带 rustdoc（会话工作根 → agent worktree；`None` = 默认 `"."`，且
+  `#[serde(default)]` 保旧持久化兼容）。新增 `use std::path::PathBuf`。补齐本 crate 内 `SessionConfig` 字面量
+  （`lib.rs` 测试 `config()`、`service.rs` 测试 `config()`）的 `cwd: None`。
+- **`mag-core`**：
+  - `SessionDriver::new`（`crates/mag-core/src/driver.rs`）：`config.cwd` 为 `Some(path)` 时对
+    `Agent::builder()` 调 `.worktree(WorktreeRef::new(cwd.clone()))`（新 `use agent_lib::agent::WorktreeRef`）；
+    `None` 保持现状（facade 默认 `"."`）。`restore` 路径不动（worktree 已随快照烘入）。rustdoc 补 cwd→worktree
+    说明。
+  - 补齐 `mag-core` 全部 `SessionConfig` 字面量的 `cwd: None`：`engine.rs` ×5、`persistence.rs` ×1、
+    `tests/e2e_offline.rs` ×1（均为测试夹具，业务默认 `None`）。
+- **测试**：
+  - `mag-service`（`cargo test -p mag-service session_config`，3 passed）：`session_config_round_trips_cwd`
+    （`cwd: Some("/work/session-root")` serde round-trip 且 JSON 现 `cwd` 键）；
+    `session_config_without_cwd_is_backward_compatible`（旧 JSON 无 `cwd` 键 → `cwd: None`，且回序列化不写
+    `null` 键）；原 `session_config_defaults_to_model_routed` 仍绿。
+  - `mag-core`（`cargo test -p mag-core worktree`，2 passed）：`new_carries_config_cwd_into_agent_worktree`
+    经 `driver.agent.snapshot()` 序列化断言 `["agent_state"]["spec"]["worktree"] == "/work/session-root"`；
+    `new_without_cwd_keeps_default_worktree` 断言 worktree == `"."`。（快照可观测性已核实：`AgentSnapshot.agent_state`
+    透明包 `AgentStateRecord.spec: AgentSpec.worktree: WorktreeRef`（transparent path）。）
+- **锚点核对**（就地对 `../agent-lib`）：`agent_lib::agent::WorktreeRef`（`spec.rs:95`，`#[serde(transparent)]`
+  包 `PathBuf`，`WorktreeRef::new(impl Into<PathBuf>)`）经 `agent/mod.rs:92` 导出；
+  `Agent::builder().worktree(WorktreeRef)`（`facade/agent.rs:1086`）存在；默认回落 `WorktreeRef::new(".")`
+  （`facade/agent.rs:1295`）。与 `docs/DESIGN.md` §3.2 一致，**无需插 agent-lib 前置任务**。
+- **依赖边界**：只改 `mag-service` + `mag-core`；**未动** mag-acp（其依赖边界不变）。
+- **验证（全绿）**：1) `cargo fmt --all -- --check` OK；2) 聚焦 `mag-service session_config` 3 passed +
+  `mag-core worktree` 2 passed（均 <0.01s）；3) `cargo clippy --all-targets -- -D warnings` 无警告；
+  4) `cargo test --workspace` 全通过（0 failed）；5) `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
+  无缺 doc 警告。
+- **PLAN.md 同步**：§`mag-service` 契约清单（line 105）`SessionConfig` 补 `cwd:Option<PathBuf>`（契约字段订正，
+  非阶段计划改写）。M1-4 现可无损把 ACP `cwd` 映射进 `SessionConfig.cwd`。
 
 ### [TODO] M1-4 `session/new` handler → `create_session`（cwd → `SessionConfig.cwd`）
 

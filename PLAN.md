@@ -102,7 +102,7 @@
 - **wire 类型**（`lib.rs`）：`SessionId`/`RunId`/`RequestId`（`#[serde(transparent)]` 包 `Uuid`；
   `new(Uuid)`/`parse_str(&str)`/`as_uuid()`/`Display`/`FromStr`）；`UserInput{text:String,
   attachments:Vec<MessageAttachment>}`（`UserInput::text(impl Into<String>)`）；
-  `SessionConfig{provider:String, model:String, tool_profile:Option<String>, routing:RoutingMode}`；
+  `SessionConfig{provider:String, model:String, tool_profile:Option<String>, cwd:Option<PathBuf>, routing:RoutingMode}`；
   `RunOutput{text,usage:Option<UsageInfo>}`；`ToolTrace{run_id,call_id:ToolCallIdWire,name,input,output,
   status:ToolStatusWire,message}`、`ToolStatusWire::{Started,Finished,Denied,Cancelled,Failed}`；
   `InteractionKindWire{Approval{call_id:ToolCallIdWire,requirement:ApprovalRequirementWire},

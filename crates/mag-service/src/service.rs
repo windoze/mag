@@ -411,6 +411,7 @@ mod tests {
             provider: "openai".to_owned(),
             model: "gpt-5-codex".to_owned(),
             tool_profile: None,
+            cwd: None,
             routing: crate::RoutingMode::ModelRouted,
         }
     }

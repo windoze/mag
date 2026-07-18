@@ -27,6 +27,7 @@ use std::sync::{
 
 use agent_lib::{
     agent::InteractionHandler,
+    agent::WorktreeRef,
     client::LlmClient,
     facade::{
         Agent, AgentSnapshot, ApprovalPolicy, FacadeError, Tool, ToolContext, ToolResult,
@@ -68,6 +69,11 @@ impl SessionDriver {
     /// [`IpcApproval`] is injected as the interaction handler and stays the sole
     /// authority answering a paused tool call (`docs/DESIGN.md` §3.3).
     ///
+    /// When [`config.cwd`](SessionConfig::cwd) is set, that path becomes the
+    /// agent's [`WorktreeRef`] so the built-in tools resolve relative to the
+    /// interface-supplied session root (for ACP, the client's `cwd`,
+    /// `docs/ACP.md` §3.2/§6); a `None` cwd keeps the facade default `"."`.
+    ///
     /// # Errors
     ///
     /// Returns any [`FacadeError`] raised while assembling the agent (for
@@ -85,6 +91,9 @@ impl SessionDriver {
             .max_tokens(DEFAULT_MAX_TOKENS)
             .max_steps(DEFAULT_MAX_STEPS)
             .interaction_handler(approval as Arc<dyn InteractionHandler>);
+        if let Some(cwd) = &config.cwd {
+            builder = builder.worktree(WorktreeRef::new(cwd.clone()));
+        }
         for tool in facade_tools {
             builder = builder.tool(tool);
         }
@@ -536,5 +545,50 @@ mod tests {
         let mut final_output = None;
         assert!(map_wire_event(session_id(), wire, &mut final_output).is_none());
         assert!(final_output.is_none());
+    }
+
+    /// Builds a driver for `cwd` and returns the worktree path recorded in its
+    /// committed snapshot, proving `SessionConfig.cwd` reached the facade agent's
+    /// [`WorktreeRef`](agent_lib::agent::WorktreeRef).
+    fn worktree_for_cwd(cwd: Option<std::path::PathBuf>) -> serde_json::Value {
+        use crate::EventBus;
+        use crate::engine::approval::{AskFrontendDecider, IpcApproval};
+        use crate::test_support::FakeLlmClient;
+
+        let config = mag_service::SessionConfig {
+            provider: "fake".to_owned(),
+            model: "fake-model".to_owned(),
+            tool_profile: None,
+            cwd,
+            routing: mag_service::RoutingMode::ModelRouted,
+        };
+        let approval = std::sync::Arc::new(IpcApproval::new(
+            session_id(),
+            EventBus::new(),
+            std::sync::Arc::new(AskFrontendDecider),
+        ));
+        let driver = super::SessionDriver::new(
+            &config,
+            FakeLlmClient::scripted(Vec::new()),
+            &mag_tools::ToolRegistry::new(),
+            approval,
+        )
+        .expect("build session driver");
+
+        let snapshot = driver.agent.snapshot().expect("committed snapshot");
+        let json = serde_json::to_value(&snapshot).expect("serialize snapshot");
+        json["agent_state"]["spec"]["worktree"].clone()
+    }
+
+    #[test]
+    fn new_carries_config_cwd_into_agent_worktree() {
+        let worktree = worktree_for_cwd(Some(std::path::PathBuf::from("/work/session-root")));
+        assert_eq!(worktree, serde_json::json!("/work/session-root"));
+    }
+
+    #[test]
+    fn new_without_cwd_keeps_default_worktree() {
+        let worktree = worktree_for_cwd(None);
+        assert_eq!(worktree, serde_json::json!("."));
     }
 }

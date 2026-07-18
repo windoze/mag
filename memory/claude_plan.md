@@ -43,3 +43,37 @@ M1-1 / M1-2 均已 `[DONE]` 且提交，工作区干净。
 - 不动 mag-acp（依赖边界保持）。本次仅编辑 TODO.md + memory；无代码改动，故不跑测试套件。
 - PLAN.md 不改：line 37 已预置“回主干加字段 + TODO 插前置任务”流程，无阶段计划变更；
   §mag-service 契约清单（line ~105）待 M1-3 真正落地字段时一并订正。
+
+---
+
+# 更新（本次调用）：实现 M1-3 trunk 修复
+
+前一次调用已把 M1-3 作为前置任务插入 `TODO.md`（当前首个未完成任务）。本次**真正落地**：
+
+## 已核实锚点
+- `agent_lib::agent::WorktreeRef`（`spec.rs:95`，`#[serde(transparent)]` 包 `PathBuf`）经
+  `agent/mod.rs:92` 导出；`Agent::builder().worktree(WorktreeRef)`（`facade/agent.rs:1086`）存在。
+- 快照可观测：`agent.snapshot()` → `AgentSnapshot{ agent_state: AgentStateSnapshot(transparent Value) }`；
+  `AgentStateRecord.spec: AgentSpec`，`AgentSpec.worktree`（直接字段）→ JSON 路径
+  `snapshot["agent_state"]["spec"]["worktree"]` = path 字符串。`WorktreeRef` transparent→纯字符串。
+- 默认回落 `WorktreeRef::new(".")`（`facade/agent.rs:1295`）。
+
+## 落地步骤
+1. `mag-service/src/lib.rs`：`SessionConfig` 加 `pub cwd: Option<PathBuf>`
+   （`#[serde(default, skip_serializing_if="Option::is_none")]`，rustdoc）。补 `config()` 测试字面量。
+2. `mag-service/src/service.rs:410` `config()` 字面量补 `cwd: None`。
+3. `mag-core/src/driver.rs`：`SessionDriver::new` 在 `config.cwd = Some(p)` 时
+   `.worktree(WorktreeRef::new(p.clone()))`；导入 `agent_lib::agent::WorktreeRef`。
+4. 补 `mag-core` 全部 `SessionConfig{..}` 字面量（engine.rs ×5、persistence.rs、tests/e2e_offline.rs）`cwd: None`。
+5. 测试：
+   - `mag-service`：serde round-trip 含 `cwd: Some(path)`；旧 JSON 无 cwd 键 → `None`（向后兼容）。
+   - `mag-core` driver：`new(cwd=Some(p))` 快照 worktree==p；`cwd=None` → worktree=="."。
+6. `PLAN.md` §mag-service 契约清单补 `cwd`。
+7. 验证序列 1–5，提交，停止。
+
+## 完成状态：M1-3 已 [DONE]（本次）
+- 代码：`SessionConfig.cwd` 落地 + `SessionDriver::new` worktree 落位 + 全部字面量补 `cwd`。
+- 测试：mag-service session_config 3 passed；mag-core worktree 2 passed。
+- 验证序列 1–5 全绿（fmt / focused / clippy -D warnings / workspace / doc）。
+- PLAN.md 契约清单已补 cwd；TODO.md M1-3 标题改 [DONE] + 完成记录。
+- 下一个未完成任务：M1-4（`session/new` handler → create_session，依赖 M1-3，已就绪）。
