@@ -3,6 +3,14 @@ name = "mag-sources"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+# Enables the OS keyring-backed `CredentialStore`. Kept out of `default` so the
+# offline unit tests, `clippy`, and `doc` never compile or link a real platform
+# keyring backend (`docs/DESIGN.md` §3.5). Downstream binaries additionally pick
+# a platform backend, e.g. `keyring/apple-native`.
+os-keyring = ["dep:keyring"]
+
 [dependencies]
 agent-lib.workspace = true
-keyring.workspace = true
+keyring = { workspace = true, optional = true }

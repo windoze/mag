@@ -1015,7 +1015,7 @@ worktree/cancel 约束生效；`PermissionDecider` 钩子留位正确（§8.1）
   10 / mag-sources 1 / mag-tools 6 + builtin_tools 13）；`cargo doc --no-deps --workspace` 通过。README「Usage」
   更新为反映 `Engine::with_persistence` 耐久用法。
 
-### [TODO] C4-2 凭据存储（`mag-sources`）
+### [DONE] C4-2 凭据存储（`mag-sources`）
 
 **上下文**：
 
@@ -1037,6 +1037,30 @@ worktree/cancel 约束生效；`PermissionDecider` 钩子留位正确（§8.1）
 - 单元测试：source registry 列出已注册 LLM 来源；本地 agent 槽存在但明确未实现。
 - 聚焦：`cargo test -p mag-sources`。
 - 完整验证序列 1–5。
+
+**完成记录**：
+
+- 落地 `mag-sources` 三个模块（原为空壳 crate）：
+  - `secret.rs`：`Secret` 包装——redacted `Debug`（输出 `Secret(<redacted>)`）、**不实现** `Serialize`/
+    `Deserialize`/`Display`，仅 `expose()` 显式取原文，确保凭据绝不进 snapshot / 不被日志泄露（§3.5/§9.5）。
+  - `credentials.rs`：`Credentials{api_key}` 凭据组；`CredentialStore` trait（`get`/`set`/`delete`，`Send+Sync`）；
+    `MemoryCredentialStore`（`Mutex<HashMap>`，离线测试用）；`KeyringCredentialStore`（生产，keyring v3
+    `Entry`，`NoEntry`→`None`/delete 幂等）。`CredentialError`（消息不含 secret）。
+  - `registry.rs`：`SourceRegistry`——`register_llm`/`llm_sources`/`llm_source`；`provider_config(source_id,
+    creds) -> agent-lib ProviderConfig`（按 `ProviderId` 走 `ProviderConfig::anthropic()/openai()` builder，
+    非机密的 base_url/version 来自 `LlmSource`，api_key 来自 `Credentials`）；本地 agent 预留位
+    `register_local_agent`/`local_agents`/`LocalAgentSlot`/`LocalAgentKind` + 预留 trait 槽 `LocalAgentBackend`，
+    `connect_local_agent(..)` 一律返回 `SourceError::LocalAgentUnsupported`（明确未实现，§10 I2 / PLAN R-C）。
+- **keyring 隔离**：`keyring` 改为 `optional`，新增非默认 feature `os-keyring = ["dep:keyring"]`；默认
+  `test`/`clippy`/`doc` 不编译/不链接任何平台 keyring，彻底满足「测试不依赖真 keyring」。平台 backend 由下游
+  二进制自选（如 `keyring/apple-native`）。
+- 单测 10 个：`Secret` redacted/expose；`MemoryCredentialStore` 存取/覆盖/删除幂等；`Credentials` Debug 不泄密；
+  registry 列出已注册 LLM 来源（排序）；`provider_config` 从凭据组构造且 Debug 不含 secret；未知来源报错；本地
+  agent 槽存在但 `connect_local_agent` 明确未实现；未知本地 agent 报 `UnknownSource`。
+- 验证序列全绿：`fmt --check` 干净；`cargo test -p mag-sources` 10/10；`clippy --all-targets -D warnings`
+  （默认）+ 额外 `-p mag-sources --features os-keyring` 均零告警；`cargo test --workspace`（mag-core 46 /
+  mag-service 10 / mag-sources 10 / mag-tools 6 + builtin_tools 13，全绿）；`cargo doc --no-deps --workspace`
+  + 额外 `-p mag-sources --features os-keyring`（均带 `-D warnings`）通过。README crate 列表补充说明。
 
 ### [TODO] C4-R Review：持久化与凭据安全
 

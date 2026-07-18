@@ -11,7 +11,11 @@ workspace skeleton for the engine and its direct support crates.
 - `mag-core`: engine entry point, session management, event bus, persistence,
   and driver integration.
 - `mag-tools`: tool registry and built-in tool integration points.
-- `mag-sources`: AI source and credential integration points.
+- `mag-sources`: AI source registry and credential storage. Hosts the
+  `CredentialStore` trait (in-memory backend for tests; OS keyring backend behind
+  the non-default `os-keyring` feature so tests never touch a real keyring), the
+  `SourceRegistry` that projects hosted LLM sources to an agent-lib
+  `ProviderConfig`, and a reserved slot for future local-agent integration.
 
 Frontend and transport crates are intentionally out of scope for this workspace
 stage.
