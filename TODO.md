@@ -38,7 +38,7 @@
 目标：建 workspace，落地传输无关的 `mag-protocol`（`Command`/`Event` + payload，全 serde），以及一个空壳
 `Engine` + 内存事件总线 + id source。此后所有测试可直接喂 `Command`、断言 `Event`。
 
-### [TODO] C0-1 建 workspace 骨架 + crate 划分
+### [DONE] C0-1 建 workspace 骨架 + crate 划分
 
 **上下文**：
 
@@ -60,6 +60,15 @@
 - `cargo build --workspace` 与 `cargo test --workspace` 绿（空套件）。
 - 依赖图正确：`cargo tree -p mag-protocol` 不含 agent-lib。
 - 完整验证序列 1、3、4、5（无聚焦测试）。
+
+**完成记录（2026-07-18）**：
+
+- 建立 root Cargo workspace，使用 `resolver = "3"` 与 edition 2024。
+- 新建 `crates/mag-protocol`、`crates/mag-core`、`crates/mag-tools`、`crates/mag-sources` 四个库 crate。
+- 四个 crate 的 `src/lib.rs` 均开启 `#![warn(missing_docs)]` 并提供模块级 rustdoc；每个 crate 含一个占位单元测试，确保 workspace 测试可跑通。
+- 依赖边界按 `DESIGN.md` §2 落地：`mag-protocol` 只依赖 `serde`；`mag-core` 依赖 `agent-lib` 与三个本地 crate；`mag-tools` 依赖 `agent-lib`；`mag-sources` 依赖 `agent-lib` 与 `keyring`。
+- 补充根 `README.md`，记录当前 workspace 结构、setup 与基础验证命令。
+- 验证通过：`cargo fmt --all`、`cargo fmt --all -- --check`、`cargo build --workspace`、`cargo tree -p mag-protocol`（无 `agent-lib`）、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`（30 分钟上限包装，4 个单元测试 + doctest 全绿）、`cargo doc --no-deps --workspace`。
 
 ### [TODO] C0-2 `mag-protocol`：`Command` / `Event` + payload（全 serde）
 

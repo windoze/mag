@@ -1,0 +1,8 @@
+[package]
+name = "mag-sources"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agent-lib.workspace = true
+keyring.workspace = true

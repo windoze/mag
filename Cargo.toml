@@ -1,0 +1,17 @@
+[workspace]
+members = [
+    "crates/mag-core",
+    "crates/mag-protocol",
+    "crates/mag-sources",
+    "crates/mag-tools",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+agent-lib = { path = "../agent-lib" }
+keyring = "3"
+serde = { version = "1", features = ["derive"] }

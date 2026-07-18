@@ -1,0 +1,10 @@
+[package]
+name = "mag-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agent-lib.workspace = true
+mag-protocol = { path = "../mag-protocol" }
+mag-sources = { path = "../mag-sources" }
+mag-tools = { path = "../mag-tools" }
