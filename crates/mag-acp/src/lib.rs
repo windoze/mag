@@ -10,15 +10,17 @@
 //! The design of record is [`docs/ACP.md`](../docs/ACP.md); the phase plan lives
 //! in [`PLAN.md`](../PLAN.md) and the task list in [`TODO.md`](../TODO.md).
 //!
-//! This milestone (M2-2) adds the `session/prompt` request handler on top of the
-//! M1 `initialize` / `session/new` handlers: it assembles the ACP `Agent`
-//! builder, registers the `initialize`, `session/new`, `session/prompt`, and
-//! placeholder `authenticate` request handlers, and runs the connection over a
-//! caller-supplied transport. The `session/prompt` handler runs the *pump* that
-//! bridges ACP's request/response prompt turn to mag's asynchronous event stream
-//! (`docs/ACP.md` §3.4). The single point that wires a concrete
-//! `mag-core::Engine` into `serve` is the top-level `mag` binary, which keeps
-//! this library's dependency boundary intact.
+//! This milestone (M3-2) adds the approval bridge on top of the M1
+//! `initialize` / `session/new` and M2 `session/prompt` handlers: it assembles
+//! the ACP `Agent` builder, registers the `initialize`, `session/new`,
+//! `session/prompt`, and placeholder `authenticate` request handlers, and runs
+//! the connection over a caller-supplied transport. The `session/prompt` handler
+//! spawns the *pump* that bridges ACP's request/response prompt turn to mag's
+//! asynchronous event stream (`docs/ACP.md` §3.4); on an approval the pump pauses
+//! and translates mag's `InteractionRequested` / `respond_interaction` round-trip
+//! to ACP `session/request_permission` (`docs/ACP.md` §5). The single point that
+//! wires a concrete `mag-core::Engine` into `serve` is the top-level `mag`
+//! binary, which keeps this library's dependency boundary intact.
 
 use std::sync::Arc;
 

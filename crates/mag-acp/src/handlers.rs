@@ -15,7 +15,7 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::{Client, ConnectionTo, Responder};
 use futures::StreamExt;
-use mag_service::{MagService, ServiceEvent};
+use mag_service::{InteractionKindWire, MagService, RequestId, ServiceEvent, SessionId};
 
 use crate::map;
 
@@ -69,13 +69,17 @@ pub(crate) async fn session_new(
 /// Handles the ACP `session/prompt` request (`docs/ACP.md` §3.4).
 ///
 /// This is the core bridge between ACP's *request/response* prompt turn and mag's
-/// *asynchronous event stream*. ACP requires the handler to run until the turn
-/// terminates and then reply with a [`PromptResponse`] carrying the turn's
+/// *asynchronous event stream*. ACP requires the turn to run until it terminates
+/// and then reply with a [`PromptResponse`] carrying the turn's
 /// [`StopReason`]; mag drives the turn through
 /// [`send_message`](MagService::send_message) and streams its progress through
-/// [`subscribe`](MagService::subscribe). The handler therefore runs a *pump* that
-/// translates each [`ServiceEvent`] into an outbound `session/update`
-/// notification until a terminal event decides the stop reason.
+/// [`subscribe`](MagService::subscribe). The turn therefore runs a *pump*
+/// ([`run_prompt_pump`]) that translates each [`ServiceEvent`] into an outbound
+/// `session/update` notification until a terminal event decides the stop reason.
+///
+/// The handler validates the session id, then **spawns** the pump off the
+/// connection's event loop (see [`run_prompt_pump`] for why) and returns; the
+/// pump answers the prompt through the moved-in `responder` when the turn ends.
 ///
 /// The pump follows `docs/ACP.md` §3.4 precisely:
 ///
@@ -96,9 +100,11 @@ pub(crate) async fn session_new(
 /// Because `subscribe(Some(sid))` filters by session, concurrent prompts for
 /// different sessions each pump their own stream without interference.
 ///
-/// [`InteractionRequested`](ServiceEvent::InteractionRequested) is a placeholder
-/// in this milestone: it is left pending (the run stays paused on the service
-/// side) and will be bridged to `session/request_permission` in M3.
+/// [`InteractionRequested`](ServiceEvent::InteractionRequested) is bridged to
+/// `session/request_permission` by [`bridge_permission`]: the pump pauses,
+/// asks the client to decide, and feeds the decision back into the service with
+/// [`respond_interaction`](MagService::respond_interaction) before resuming
+/// (`docs/ACP.md` §5).
 ///
 /// An invalid session id, or a [`ServiceError`](mag_service::ServiceError) from
 /// [`send_message`](MagService::send_message), is surfaced to the client as an
@@ -116,6 +122,35 @@ pub(crate) async fn session_prompt(
                 .respond_with_error(agent_client_protocol::Error::into_internal_error(error));
         }
     };
+
+    // The pump is spawned *off* the connection's event loop. Handler callbacks run
+    // on that single-task loop and block it until they return, so a pump that ran
+    // inline could never receive the inbound `session/request_permission` response
+    // it awaits mid-turn — the loop that must deliver that response would be the
+    // very loop the pump is blocking (deadlock; see `agent-client-protocol`
+    // `SentRequest::block_task`). Spawning frees the loop to serve inbound
+    // messages while the pump runs and answers the prompt via `responder` when the
+    // turn ends (a deferred response).
+    let pump_connection = connection.clone();
+    connection.spawn(async move {
+        run_prompt_pump(service, request, session_id, responder, pump_connection).await
+    })
+}
+
+/// Runs the `session/prompt` pump for one turn (spawned by [`session_prompt`]).
+///
+/// This translates mag's asynchronous [`ServiceEvent`] stream into ACP
+/// `session/update` notifications and, on
+/// [`InteractionRequested`](ServiceEvent::InteractionRequested), pauses to bridge
+/// the approval ([`bridge_permission`]) before resuming. It answers the prompt
+/// through `responder` with the resolved [`StopReason`] once the turn terminates.
+async fn run_prompt_pump(
+    service: Arc<dyn MagService>,
+    request: PromptRequest,
+    session_id: SessionId,
+    responder: Responder<PromptResponse>,
+    connection: ConnectionTo<Client>,
+) -> Result<(), agent_client_protocol::Error> {
     let input = map::content_blocks_to_user_input(&request.prompt);
 
     // Subscribe *before* sending so the run cannot emit an event before the pump
@@ -138,10 +173,27 @@ pub(crate) async fn session_prompt(
             break stop_reason;
         }
 
-        // Approvals are bridged to `session/request_permission` in M3; until then
-        // the interaction is left pending and the pump keeps waiting.
-        if let ServiceEvent::InteractionRequested { .. } = event {
-            // TODO(M3): bridge_permission(&service, &connection, session_id, ..).
+        // Approvals are an asynchronous pause point: the pump bridges the
+        // interaction to `session/request_permission`, awaits the client's
+        // decision, and feeds it back into the service before resuming
+        // (`docs/ACP.md` §5). The service-side driver stays paused until then, so
+        // no further event can arrive while the bridge is in flight.
+        if let ServiceEvent::InteractionRequested {
+            request_id, kind, ..
+        } = event
+        {
+            if let Err(error) = bridge_permission(
+                &service,
+                &connection,
+                session_id,
+                &request.session_id,
+                request_id,
+                kind,
+            )
+            .await
+            {
+                return responder.respond_with_error(error);
+            }
             continue;
         }
 
@@ -154,6 +206,55 @@ pub(crate) async fn session_prompt(
     };
 
     responder.respond(PromptResponse::new(stop_reason))
+}
+
+/// Bridges one mag approval round-trip to ACP `session/request_permission`
+/// (`docs/ACP.md` §5).
+///
+/// This is the *asynchronous pause point* of the prompt pump. When the service
+/// emits an [`InteractionRequested`](ServiceEvent::InteractionRequested), the
+/// pump calls this to:
+///
+/// 1. map the mag [`InteractionKindWire`] into a
+///    [`RequestPermissionRequest`](agent_client_protocol::schema::v1::RequestPermissionRequest)
+///    ([`map::interaction_to_permission_request`]);
+/// 2. send it to the client and **await** the user's decision
+///    (`send_request(..).block_task()`) — the pump does not advance and the
+///    service-side driver stays paused until the outcome arrives;
+/// 3. translate the [`RequestPermissionOutcome`](agent_client_protocol::schema::v1::RequestPermissionOutcome)
+///    back into a mag [`InteractionResponseWire`]
+///    ([`map::outcome_to_interaction_response`]);
+/// 4. deliver it with [`respond_interaction`](MagService::respond_interaction),
+///    which wakes the paused driver.
+///
+/// Tool [`Approval`](InteractionKindWire::Approval) and privileged-action
+/// [`Permission`](InteractionKindWire::Permission) both flow through this single
+/// channel (`docs/ACP.md` §5/§6): mag-acp never bypasses the gate.
+///
+/// # Errors
+///
+/// Returns an [`agent_client_protocol::Error`] if the outbound
+/// `session/request_permission` request fails, or if
+/// [`respond_interaction`](MagService::respond_interaction) returns a
+/// [`ServiceError`](mag_service::ServiceError) (surfaced as an internal
+/// JSON-RPC error).
+async fn bridge_permission(
+    service: &Arc<dyn MagService>,
+    connection: &ConnectionTo<Client>,
+    session_id: SessionId,
+    acp_session_id: &agent_client_protocol::schema::v1::SessionId,
+    request_id: RequestId,
+    kind: InteractionKindWire,
+) -> Result<(), agent_client_protocol::Error> {
+    let request = map::interaction_to_permission_request(acp_session_id, &kind);
+    // Await the client's decision — the anti-advance invariant of `docs/ACP.md`
+    // §5. The service-side driver stays paused until `respond_interaction` below.
+    let response = connection.send_request(request).block_task().await?;
+    let mag_response = map::outcome_to_interaction_response(&kind, response.outcome);
+    service
+        .respond_interaction(session_id, request_id, mag_response)
+        .await
+        .map_err(agent_client_protocol::Error::into_internal_error)
 }
 
 /// Handles the ACP `authenticate` request (`docs/ACP.md` §3.1).

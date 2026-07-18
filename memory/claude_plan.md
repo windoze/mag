@@ -346,3 +346,50 @@ M2 实现与 §3.4/§4 一致，无未调度失败测试、无 workaround、无�
    Selected(approve/deny)/Cancelled 回译，覆盖两 kind）。
 2. 验证序列：fmt → 聚焦 `cargo test -p mag-acp map::` / `permission` → clippy → `cargo test --workspace` → doc。
 3. TODO.md：M3-1 标 `[DONE]` + 完成记录。提交并停止。PLAN.md 不改（无阶段计划变更）。
+
+---
+
+# 更新（本次调用）：实现 M3-2 `bridge_permission` 接入泵
+
+## 定位
+`TODO.md` 首个未完成任务 = **M3-2**（line 737，`[TODO]`）。前置 M3-1（纯函数映射）已 `[DONE]`。
+工作区干净，HEAD=0474c84（M3-1）。
+
+## 就地核实（可行性）
+- 泵在 `handlers.rs::session_prompt`：`InteractionRequested` 分支当前是占位 `continue`（line 143-146）。
+- M3-1 已提供 `map::interaction_to_permission_request(&acp::SessionId,&InteractionKindWire)->RequestPermissionRequest`
+  与 `map::outcome_to_interaction_response(&InteractionKindWire, RequestPermissionOutcome)->InteractionResponseWire`。
+- acp API：`connection.send_request(req).block_task().await? -> RequestPermissionResponse`（schema v1
+  `client.rs:792`，字段 `pub outcome: RequestPermissionOutcome`）。`ConnectionTo<Client>` 有 `send_request`
+  （`jsonrpc.rs:2286`）与 `send_notification`。
+- `ServiceEvent::InteractionRequested{id,request_id:RequestId,kind:InteractionKindWire}`。
+- `MagService::respond_interaction(SessionId,RequestId,InteractionResponseWire)->Result<(),ServiceError>`。
+- `request.session_id: acp::SessionId`（= `agent_client_protocol::schema::v1::SessionId`，与 map 的
+  `acp` 别名一致）。
+
+## 计划
+1. `handlers.rs`：新增 `async fn bridge_permission(service,&connection,session_id,acp_sid,request_id,kind)`
+   → 组 request → `send_request().block_task().await?` → `outcome_to_interaction_response` →
+   `respond_interaction`（ServiceError→internal_error）。
+2. 泵 `InteractionRequested` 分支：destructure `{request_id,kind,..}`，调用 bridge；失败则
+   `responder.respond_with_error` 并 return。成功 `continue`。
+3. 更新 handler rustdoc（去掉「M3 占位」措辞）。
+4. 新增 handler 级测试 `tests/permission_bridge.rs`：scripted service 中途产 `InteractionRequested`，
+   fake ACP client 收 `session/request_permission` 回 approve/deny/cancel 三路径；断言暂停语义
+   （client 未回 outcome 前 driver 不前进）+ outcome 正确回灌 `respond_interaction`。
+5. 验证：fmt → 聚焦 `cargo test -p mag-acp permission_bridge` → clippy -D warnings → `cargo test --workspace`
+   → doc。
+6. `TODO.md` M3-2 标 `[DONE]` + 完成记录；提交并停止。
+
+## 暂停语义测试思路
+scripted subscribe 流：先发若干可观测事件（如 TextDelta），再发 InteractionRequested，之后再发一个
+「哨兵」事件（如另一 TextDelta）与 RunFinished。fake client 在收到 request_permission 后先记录「driver
+尚未产出哨兵」（因泵阻塞在 await），再回 outcome。断言 respond_interaction 收到正确 wire response，且
+哨兵 update 在 outcome 回灌之后才出现（顺序断言）。
+
+## 结果（M3-2 完成）
+- 实现 `bridge_permission` + 泵接入；关键修复：`session_prompt` 把泵 `connection.spawn` 到 event loop
+  之外（handler 内联 `block_task` 会死锁），泵抽为 `run_prompt_pump`。
+- 新增 `tests/permission_bridge.rs` 3 条（approve/deny/cancel + 暂停语义），全绿。
+- 验证 1–5 全绿（workspace 121 tests，clippy/doc 无警告）。
+- TODO.md：M3-2 → [DONE] + 完成记录。下一个：M3-R。

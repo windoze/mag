@@ -734,7 +734,7 @@ cancel/load（M4）。M1-3→M1-4 依赖已在各自完成记录标注。
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无警告。
 - PLAN.md 不改（无阶段计划变更）。下一个未完成任务：M3-2（`bridge_permission` 接入泵）。
 
-### [TODO] M3-2 `bridge_permission` 接入泵
+### [DONE] M3-2 `bridge_permission` 接入泵
 
 **上下文**：
 
@@ -760,6 +760,38 @@ cancel/load（M4）。M1-3→M1-4 依赖已在各自完成记录标注。
 
 - 聚焦测试：`cargo test -p mag-acp permission_bridge`（approve/deny/cancel 三路径 + 暂停语义），1 分钟内绿。
 - 完整验证序列 1–5；clippy / doc 无警告。
+
+**完成记录**（本次调用）：
+
+- **实现**（`crates/mag-acp/src/handlers.rs`，均带 rustdoc）：
+  - `async fn bridge_permission(service,&connection,session_id,acp_sid,request_id,kind)`：按 `docs/ACP.md`
+    §5 伪码——`map::interaction_to_permission_request` 组请求 → `connection.send_request(req).block_task().await?`
+    **await** client 决定 → `map::outcome_to_interaction_response(&kind, resp.outcome)` 回译 →
+    `service.respond_interaction(sid, request_id, mag_resp).await`（`ServiceError`→internal_error）唤醒暂停 driver。
+  - 泵 `InteractionRequested` 分支：占位 `continue` 换为解构 `{request_id,kind,..}` 调 `bridge_permission`；
+    失败经 `responder.respond_with_error` 收尾。Approval/Permission 走**同一**通道（§5/§6），未在任何路径绕过审批。
+- **关键修复（阻塞并入本任务，非绕过）**：ACP handler 回调跑在**单任务 event loop** 上并阻塞其继续收报文
+  （acp `Builder` 文档 line 586；`SentRequest::block_task` 明确警告「在 handler 内直接用会死锁连接」）。M2-2
+  的 `session/prompt` 泵原是**内联**在 handler 里跑——只发 notification（fire-and-forget）时无碍，但审批需
+  **收**入站 `session/request_permission` 响应，内联 `block_task().await` 会死锁（event loop 被泵占住，无法投递
+  响应）。修复：`session_prompt` 校验 session id 后把整泵 `connection.spawn(..)` 到 event loop **之外**运行
+  （延迟经 `responder` 应答 prompt），泵抽出为 `run_prompt_pump`。这是审批往返正确落地的前提，故并入本任务而非
+  papering over；同时为 M4（prompt 期间收 `session/cancel`）预留了空闲 event loop。M2 三条 prompt 测试仍全绿，
+  证明行为兼容。
+- **handler 级测试**（`crates/mag-acp/tests/permission_bridge.rs`，3 条，multi_thread，<1s）：scripted
+  `BridgeService` 的 `subscribe` 先放「before」TextDelta + `InteractionRequested`，随后**阻塞**——post 事件
+  （「after」哨兵 + `RunFinished`）压在 sender 里，直到 `respond_interaction` 被调用才释放（忠实建模 mag 审批
+  异步暂停）。fake ACP client 注册 `session/request_permission` 请求 handler，回 `Selected{allow}` /
+  `Selected{reject}` / `Cancelled` 三路径。断言：**暂停语义**（收到权限请求时「after」哨兵尚未流出）、
+  `respond_interaction` 收到家族正确的 `InteractionResponseWire::Approval`（Approve/Deny/Cancel(带 message)、
+  call_id/request_id/session 对齐）、driver 被唤醒、turn 以 `EndTurn` 收尾且 before/after 更新最终都到达。
+- **依赖边界**：仅用现有 `mag-service` + `agent-client-protocol`(+futures)；未碰 mag-core/agent-lib/tauri/axum；
+  冻结 `MagService` 契约一字未改。
+- **验证序列 1–5 全绿**：`cargo fmt --all -- --check` 干净；`cargo test -p mag-acp permission_bridge` 3 passed；
+  `cargo clippy --all-targets -- -D warnings` 无警告；`cargo test --workspace` 全绿（121：mag-acp 22+2+3+3=30、
+  mag-core 48+2、mag-service 12、mag-sources 10、mag-tools 6+13，0 fail）；
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无警告。
+- PLAN.md 不改（无阶段计划变更）。下一个未完成任务：M3-R（Review：M3 审批桥接）。
 
 ### [TODO] M3-R Review：M3 审批桥接
 
