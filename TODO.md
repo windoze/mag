@@ -1173,7 +1173,7 @@ fake LLM，全程离线；真实 Zed 联调 `#[ignore]`。最后收官验收 mag
   --workspace` 无警告。
 - 下一个未完成任务：M5-R（Review：mag-acp 整体验收）。
 
-### [TODO] M5-R Review：mag-acp 整体验收
+### [DONE] M5-R Review：mag-acp 整体验收
 
 **上下文**：mag-acp interface 收官验收；对照 `docs/ACP.md` 全文逐节核对；真实任务，不得跳过。
 
@@ -1192,3 +1192,58 @@ fake LLM，全程离线；真实 Zed 联调 `#[ignore]`。最后收官验收 mag
 - 完整验证序列 1–5 全绿；`e2e_acp` 稳定通过；无未调度失败测试。
 - 逐节对照表 + `MagService` 映射对照表 + 依赖边界终检 + 缺口汇总写入完成记录。
 - 放行判据：M1–M5 全 `[DONE]`、验证序列全绿、`e2e_acp` 稳定通过。
+
+**完成记录（M5-R）**：
+
+**放行判据达成**：M1–M5 全部 `[DONE]`、验证序列 1–5 全绿、`e2e_acp` 稳定通过（3 passed + 1 ignored）。
+本任务为收官 review，未改编译产物。
+
+- **`docs/ACP.md` 逐节对照**：
+
+  | 节 | 要求 | 状态 | 证据 |
+  | --- | --- | --- | --- |
+  | §0 定位与边界 | agent(server) 角色、stdio JSON-RPC、纯翻译器、不经 Command/Event | ✓ | `serve` 仅 agent 端；bin 用 `Stdio`；mag-acp 只消费 `MagService`/`ServiceEvent` |
+  | §1 acp crate 形状 | role-marker + builder + typed-handler、`connect_to` run loop | ✓ | M1-R 就地核对记录 |
+  | §2 整体结构 | handlers / pump / permission bridge / map 分层 | ✓ | `src/{lib,handlers,map}.rs` 与图一致 |
+  | §3 请求映射 | initialize / new / load / prompt / cancel 五方法 | ✓ | 全部注册于 `serve`（M1–M4） |
+  | §4 类型映射 | SessionId / UserInput / ServiceEvent→SessionUpdate / stop reason 纯函数 | ✓ | `map.rs`（M2-R 全 13 变体核实；stop reason M4-0 升级为 kind 结构化） |
+  | §5 审批桥接 | 异步暂停点、outcome 回译、两家族同通道 | ✓ | M3-R 对照表 |
+  | §6 安全边界 | cwd→worktree、特权工具必过 gate、凭据不经 ACP | ✓ | M1-3 worktree 落位；审批无旁路；依赖边界无 CredentialStore |
+  | §7 能力协商 | 如实宣告、版本回传、不启 unstable v2 | ✓ | `agent_capabilities`（load_session 有恢复支撑）；`agent-client-protocol = "1"` 默认 features |
+  | §8 双向不冲突 | mag-acp 不涉 external-acp（client 方向） | ✓ | 依赖边界无 agent-lib |
+  | §9 测试策略 | 纯函数单测 + handler 级 + 协议级 e2e + Zed `#[ignore]` | ✓ | map 22、prompt 3、permission_bridge 3、cancel 3、e2e 3、e2e_acp 3、zed 1(ignored) |
+
+- **`MagService` 方法 vs ACP 映射对照表**：
+
+  | `MagService` 方法 | ACP 映射 | 状态 |
+  | --- | --- | --- |
+  | `create_session` | `session/new` | ✓ M1-4 |
+  | `resume_session` | `session/load` | ✓ M4-2 |
+  | `send_message` | `session/prompt` | ✓ M2-2 |
+  | `cancel` | `session/cancel` | ✓ M4-1 |
+  | `respond_interaction` | `session/request_permission` outcome | ✓ M3-2 |
+  | `subscribe` | prompt 泵 → `session/update` | ✓ M2-2 |
+  | `list_sessions` / `delete_session` / `list_sources` / `probe_local_agents` | **有意不映射** | 留待 GUI/web interface（ACP 无需） |
+
+- **依赖边界终检**：`crates/mag-acp/Cargo.toml` 常规依赖 = `mag-service` + `agent-client-protocol` +
+  `futures` + `serde_json` + `tokio(sync)`（全部在 PLAN.md 允许清单内）；无 `mag-core`/`agent-lib`/
+  tauri/axum；无 unstable feature。`mag` bin 是唯一同时见 mag-core 与 mag-acp 的装配点（`main.rs`）。
+  `MagService` 契约在冻结后仅经两次**向后兼容**扩展（M1-3 `cwd`、M4-0 `RunError.kind`/`SessionConfig.budget`，
+  均以显式前置任务留痕），无破坏性变更。
+
+- **缺口汇总 / 后续交接点**（均非阻塞、均有归属）：
+  1. `MaxTokens` stop reason 不产出（service 侧无独立 token 上限信号；token 预算耗尽归
+     `BudgetExhausted→Refusal`）——`PLAN.md` R-5 残留项。
+  2. 审批 `Approval` wire 只有 `call_id + requirement`，`tool_name`/`input` 富化待 agent-lib 上游 wire 演进
+     （M3-R 缺口 1）。
+  3. `session/load` 不回放历史消息（client 自行决定何时刷新）——后续可按需加历史回放。
+  4. 后续 interface 交接点：`list_sessions`/`delete_session`/`probe_local_agents` 等未映射方法留给 web /
+     Tauri；`mag --acp` 的 provider/model 装配随来源配置（mag-sources）接入。
+  5. 真实 Zed 联调为手动 `#[ignore]`（`zed_integration_manual_handshake`），需本机环境。
+
+- **验证序列 1–5 全绿**（收官复核）：`cargo fmt --all -- --check` 干净；`cargo clippy --all-targets --
+  -D warnings` 无警告；`cargo test --workspace` 130 passed / 0 failed / 1 ignored（mag-acp 37、mag-core 52、
+  mag-service 12、mag-sources 10、mag-tools 19）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
+  无警告；`cargo test -p mag-acp --test e2e_acp` 稳定通过。
+
+**mag-acp interface 收官：M1–M5 全部 `[DONE]`，放行判据全部达成。**
