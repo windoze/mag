@@ -1123,7 +1123,7 @@ cancel/load（M4）。M1-3→M1-4 依赖已在各自完成记录标注。
 目标：用 acp crate 自身 client 经内存管道驱动 mag-acp 跑全回合（含流式 + 权限 + cancel），service 侧注入
 fake LLM，全程离线；真实 Zed 联调 `#[ignore]`。最后收官验收 mag-acp interface。对应 `docs/ACP.md` §9。
 
-### [TODO] M5-1 协议级全回合 e2e（`initialize → session/new → session/prompt`（流式+权限）`→ session/cancel`）
+### [DONE] M5-1 协议级全回合 e2e（`initialize → session/new → session/prompt`（流式+权限）`→ session/cancel`）
 
 **上下文**：
 
@@ -1146,6 +1146,32 @@ fake LLM，全程离线；真实 Zed 联调 `#[ignore]`。最后收官验收 mag
 - 聚焦测试：`cargo test -p mag-acp --test e2e_acp`（全回合 + 边界），每个用例 1 分钟内绿，无卡死；`#[ignore]`
   的 Zed 测试默认跳过。
 - 完整验证序列 1–5；clippy / doc 无警告。
+
+**完成记录（M5-1）**：
+
+- **`tests/e2e_acp.rs`（新）**：真实 acp client 经 `Channel::duplex` 内存管道驱动 `mag_acp::serve`，service 侧
+  注入脚本化 `RoundService`（`initial` 事件立即流式、`on_respond` 事件在 `respond_interaction` 后释放、
+  `on_cancel` 事件在 `cancel` 后释放；全程记录 `create_session`/`respond_interaction`/`cancel`）。每个用例都
+  走完整 `initialize`（断言 `load_session` 宣告位）`→ session/new → session/prompt`：
+  - `full_round_streams_permission_and_completes`：TextDelta → `InteractionRequested` →（client 断言
+    `RequestPermissionRequest` 的 tool_call id 与 once-scoped allow/reject options 后 approve）→ TextDelta →
+    `RunFinished`；断言 stop=`EndTurn`、client 观测文本 `draft final`（权限暂停两侧的事件序正确）、
+    `respond_interaction` 收到 `Approve`、无 cancel。
+  - `plain_conversation_ends_with_end_turn`：纯对话边界——两条 TextDelta + `RunFinished`，stop=`EndTurn`，
+    无 interaction、无 cancel。
+  - `mid_prompt_cancel_ends_with_cancelled`：流一条后静默，client 收首条 update 即发 `session/cancel`；
+    断言 stop=`Cancelled`、`MagService::cancel` 以正确 sid 被调。
+  三个用例均 <0.01s，无卡死。
+- **Zed 联调骨架**：`zed_integration_manual_handshake`（`#[ignore]`）——spawn `mag --acp` 子进程，stdio 上发
+  `initialize` 并断言响应含 `agentCapabilities`；无 `mag` 二进制时干净跳过；rustdoc 注明手动运行方式
+  （`cargo test -p mag-acp --test e2e_acp zed_integration -- --ignored`）。tokio dev-deps 补 `process` /
+  `io-util` feature（仅 dev）。
+- **验证（全绿）**：1) `cargo fmt --all -- --check` 干净；2) `cargo test -p mag-acp --test e2e_acp`
+  3 passed + 1 ignored；3) `cargo clippy --all-targets -- -D warnings` 无警告（修掉一处 clone_on_copy）；
+  4) `cargo test --workspace` 全通过（130：mag-acp 22+3+3+3+3+3=37、mag-core 50+2、mag-service 12、
+  mag-sources 10、mag-tools 6+13，0 fail，1 ignored）；5) `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+  --workspace` 无警告。
+- 下一个未完成任务：M5-R（Review：mag-acp 整体验收）。
 
 ### [TODO] M5-R Review：mag-acp 整体验收
 
