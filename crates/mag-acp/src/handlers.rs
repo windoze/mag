@@ -6,18 +6,71 @@
 //! (rather than inline in `serve`) keeps the wiring readable as more methods are
 //! added in later milestones.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use agent_client_protocol::schema::v1::{
-    AuthenticateRequest, AuthenticateResponse, InitializeRequest, InitializeResponse,
-    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionNotification,
-    StopReason,
+    AuthenticateRequest, AuthenticateResponse, CancelNotification, InitializeRequest,
+    InitializeResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+    NewSessionResponse, PromptRequest, PromptResponse, RequestPermissionOutcome,
+    SessionNotification, StopReason,
 };
 use agent_client_protocol::{Client, ConnectionTo, Responder};
 use futures::StreamExt;
-use mag_service::{InteractionKindWire, MagService, RequestId, ServiceEvent, SessionId};
+use mag_service::{
+    InteractionKindWire, MagService, RequestId, ServiceError, ServiceEvent, SessionId,
+};
+use tokio::sync::watch;
 
 use crate::map;
+
+/// Locks `mutex`, recovering the guard from a poisoned lock instead of
+/// panicking (mirrors agent-lib's unified poison-recovery policy).
+fn lock_recovering<'a, T>(mutex: &'a Mutex<T>) -> MutexGuard<'a, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Tracks `session/cancel` notifications per session, so a prompt pump parked
+/// in [`bridge_permission`] can stop waiting for a client decision that may
+/// never arrive once the turn has been cancelled (`docs/ACP.md` §3.5/§5).
+///
+/// One [`watch`] channel per session: [`cancel`](CancelTracker::cancel) flips
+/// the value to `true` and wakes every parked bridge, while a bridge that
+/// starts waiting *after* the cancellation observes `true` immediately through
+/// [`watch::Receiver::borrow`]. Each new prompt turn
+/// [resets](CancelTracker::reset) the flag at pump start, so a stale
+/// cancellation never leaks into a later turn of the same session. Channels
+/// are kept for the process lifetime; the per-session footprint is one small
+/// channel.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CancelTracker {
+    sessions: Arc<Mutex<HashMap<SessionId, watch::Sender<bool>>>>,
+}
+
+impl CancelTracker {
+    /// Returns a receiver that observes `true` once `session_id` is cancelled.
+    fn subscribe(&self, session_id: SessionId) -> watch::Receiver<bool> {
+        lock_recovering(&self.sessions)
+            .entry(session_id)
+            .or_insert_with(|| watch::channel(false).0)
+            .subscribe()
+    }
+
+    /// Marks `session_id` cancelled, waking every bridge parked on it.
+    fn cancel(&self, session_id: SessionId) {
+        if let Some(sender) = lock_recovering(&self.sessions).get(&session_id) {
+            sender.send_replace(true);
+        }
+    }
+
+    /// Clears the cancelled flag as a new prompt turn begins, so a `cancel`
+    /// that landed with no run in flight does not poison the next turn.
+    fn reset(&self, session_id: SessionId) {
+        if let Some(sender) = lock_recovering(&self.sessions).get(&session_id) {
+            sender.send_replace(false);
+        }
+    }
+}
 
 /// Handles the ACP `initialize` request (`docs/ACP.md` §3.1).
 ///
@@ -60,6 +113,40 @@ pub(crate) async fn session_new(
             let acp_session_id = map::mag_session_id_to_acp(session_id);
             responder.respond(NewSessionResponse::new(acp_session_id))
         }
+        Err(error) => {
+            responder.respond_with_error(agent_client_protocol::Error::into_internal_error(error))
+        }
+    }
+}
+
+/// Handles the ACP `session/load` request (`docs/ACP.md` §3.3).
+///
+/// Registered only because [`agent_capabilities`](map::agent_capabilities)
+/// advertises `load_session`: mag-core's restore path (persisted config +
+/// committed snapshot, `docs/DESIGN.md` §3.6) is fully wired, so the handler
+/// maps the ACP session id back to a mag [`SessionId`], calls
+/// [`resume_session`](mag_service::MagService::resume_session), and replies
+/// with an empty [`LoadSessionResponse`] (mag has no session modes or config
+/// options to report). The request's `cwd`/`mcp_servers` are not re-applied:
+/// the session resumes with the configuration it was persisted with.
+///
+/// An unknown session or a persistence failure surfaces as an internal
+/// JSON-RPC error.
+pub(crate) async fn session_load(
+    service: Arc<dyn MagService>,
+    request: LoadSessionRequest,
+    responder: Responder<LoadSessionResponse>,
+    _connection: ConnectionTo<Client>,
+) -> Result<(), agent_client_protocol::Error> {
+    let session_id = match map::acp_session_id_to_mag(&request.session_id) {
+        Ok(session_id) => session_id,
+        Err(error) => {
+            return responder
+                .respond_with_error(agent_client_protocol::Error::into_internal_error(error));
+        }
+    };
+    match service.resume_session(session_id).await {
+        Ok(()) => responder.respond(LoadSessionResponse::new()),
         Err(error) => {
             responder.respond_with_error(agent_client_protocol::Error::into_internal_error(error))
         }
@@ -111,6 +198,7 @@ pub(crate) async fn session_new(
 /// internal JSON-RPC error.
 pub(crate) async fn session_prompt(
     service: Arc<dyn MagService>,
+    cancels: CancelTracker,
     request: PromptRequest,
     responder: Responder<PromptResponse>,
     connection: ConnectionTo<Client>,
@@ -133,7 +221,15 @@ pub(crate) async fn session_prompt(
     // turn ends (a deferred response).
     let pump_connection = connection.clone();
     connection.spawn(async move {
-        run_prompt_pump(service, request, session_id, responder, pump_connection).await
+        run_prompt_pump(
+            service,
+            request,
+            session_id,
+            responder,
+            pump_connection,
+            cancels,
+        )
+        .await
     })
 }
 
@@ -150,8 +246,14 @@ async fn run_prompt_pump(
     session_id: SessionId,
     responder: Responder<PromptResponse>,
     connection: ConnectionTo<Client>,
+    cancels: CancelTracker,
 ) -> Result<(), agent_client_protocol::Error> {
     let input = map::content_blocks_to_user_input(&request.prompt);
+
+    // A new turn starts uncancelled: clear any stale flag left by a `cancel`
+    // that arrived with no run in flight, so it cannot leak into this turn's
+    // approval bridge.
+    cancels.reset(session_id);
 
     // Subscribe *before* sending so the run cannot emit an event before the pump
     // is listening (`docs/ACP.md` §3.4).
@@ -189,6 +291,7 @@ async fn run_prompt_pump(
                 &request.session_id,
                 request_id,
                 kind,
+                cancels.subscribe(session_id),
             )
             .await
             {
@@ -245,16 +348,68 @@ async fn bridge_permission(
     acp_session_id: &agent_client_protocol::schema::v1::SessionId,
     request_id: RequestId,
     kind: InteractionKindWire,
+    mut cancel: watch::Receiver<bool>,
 ) -> Result<(), agent_client_protocol::Error> {
     let request = map::interaction_to_permission_request(acp_session_id, &kind);
     // Await the client's decision — the anti-advance invariant of `docs/ACP.md`
-    // §5. The service-side driver stays paused until `respond_interaction` below.
-    let response = connection.send_request(request).block_task().await?;
-    let mag_response = map::outcome_to_interaction_response(&kind, response.outcome);
-    service
+    // §5. The service-side driver stays paused until `respond_interaction`
+    // below. A `session/cancel` landing during the wait ends the turn: answer
+    // the parked interaction conservatively (cancel) instead of waiting for a
+    // decision that may never arrive (`docs/ACP.md` §3.5/§5).
+    let outcome = tokio::select! {
+        response = connection.send_request(request).block_task() => response?.outcome,
+        () = wait_for_cancel(&mut cancel) => RequestPermissionOutcome::Cancelled,
+    };
+    let mag_response = map::outcome_to_interaction_response(&kind, outcome);
+    match service
         .respond_interaction(session_id, request_id, mag_response)
         .await
-        .map_err(agent_client_protocol::Error::into_internal_error)
+    {
+        Ok(()) => Ok(()),
+        // A cancelled run may already have resolved the parked interaction
+        // itself (the service-side approval observes the run's cancellation
+        // token), so a late response legitimately finds nothing to wake.
+        Err(ServiceError::InteractionNotFound { .. }) => Ok(()),
+        Err(error) => Err(agent_client_protocol::Error::into_internal_error(error)),
+    }
+}
+
+/// Resolves once the tracked session is cancelled.
+///
+/// Returns immediately when the cancellation already landed before the bridge
+/// started waiting (`watch::Receiver::changed` only observes *future* flips).
+async fn wait_for_cancel(cancel: &mut watch::Receiver<bool>) {
+    if *cancel.borrow() {
+        return;
+    }
+    // `changed` only errs when every sender is dropped; the tracker owns one
+    // per session for the process lifetime, so this cannot happen.
+    let _ = cancel.changed().await;
+}
+
+/// Handles the ACP `session/cancel` notification (`docs/ACP.md` §3.5).
+///
+/// Cancellation is a *notification* (no response). The handler marks the
+/// session cancelled in the [`CancelTracker`] first — waking any pump parked
+/// in [`bridge_permission`] so it answers the interaction conservatively —
+/// then asks the service to end the session's active run. The run's terminal
+/// event carries `RunErrorKind::Cancelled`, which the pump maps to
+/// [`StopReason::Cancelled`] as the ACP spec mandates after `session/cancel`.
+///
+/// An invalid session id or a service-side failure is swallowed deliberately:
+/// a notification has no error channel, and cancel is best-effort.
+pub(crate) async fn session_cancel(
+    service: Arc<dyn MagService>,
+    cancels: CancelTracker,
+    notification: CancelNotification,
+    _connection: ConnectionTo<Client>,
+) -> Result<(), agent_client_protocol::Error> {
+    let Ok(session_id) = map::acp_session_id_to_mag(&notification.session_id) else {
+        return Ok(());
+    };
+    cancels.cancel(session_id);
+    let _ = service.cancel(session_id).await;
+    Ok(())
 }
 
 /// Handles the ACP `authenticate` request (`docs/ACP.md` §3.1).

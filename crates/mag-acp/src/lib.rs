@@ -10,21 +10,24 @@
 //! The design of record is [`docs/ACP.md`](../docs/ACP.md); the phase plan lives
 //! in [`PLAN.md`](../PLAN.md) and the task list in [`TODO.md`](../TODO.md).
 //!
-//! This milestone (M3-2) adds the approval bridge on top of the M1
-//! `initialize` / `session/new` and M2 `session/prompt` handlers: it assembles
-//! the ACP `Agent` builder, registers the `initialize`, `session/new`,
-//! `session/prompt`, and placeholder `authenticate` request handlers, and runs
-//! the connection over a caller-supplied transport. The `session/prompt` handler
-//! spawns the *pump* that bridges ACP's request/response prompt turn to mag's
-//! asynchronous event stream (`docs/ACP.md` §3.4); on an approval the pump pauses
-//! and translates mag's `InteractionRequested` / `respond_interaction` round-trip
-//! to ACP `session/request_permission` (`docs/ACP.md` §5). The single point that
-//! wires a concrete `mag-core::Engine` into `serve` is the top-level `mag`
-//! binary, which keeps this library's dependency boundary intact.
+//! It assembles the ACP `Agent` builder, registers the `initialize`,
+//! `session/new`, `session/load`, `session/prompt` request handlers, the
+//! `session/cancel` notification handler (`docs/ACP.md` §3.5), and a
+//! placeholder `authenticate`, and runs the connection over a caller-supplied
+//! transport. The
+//! `session/prompt` handler spawns the *pump* that bridges ACP's
+//! request/response prompt turn to mag's asynchronous event stream
+//! (`docs/ACP.md` §3.4); on an approval the pump pauses and translates mag's
+//! `InteractionRequested` / `respond_interaction` round-trip to ACP
+//! `session/request_permission` (`docs/ACP.md` §5), and a shared cancellation
+//! tracker lets `session/cancel` wake a pump parked on that bridge so the turn
+//! always ends with `StopReason::Cancelled`. The single point that wires a
+//! concrete `mag-core::Engine` into `serve` is the top-level `mag` binary,
+//! which keeps this library's dependency boundary intact.
 
 use std::sync::Arc;
 
-use agent_client_protocol::{Agent, ConnectTo, on_receive_request};
+use agent_client_protocol::{Agent, ConnectTo, on_receive_notification, on_receive_request};
 use mag_service::MagService;
 
 mod handlers;
@@ -55,12 +58,19 @@ pub async fn serve<T>(
 where
     T: ConnectTo<Agent> + 'static,
 {
-    // `service` is captured by the `session/new` and `session/prompt` handler
-    // closures (and later handlers as more ACP methods are implemented). Each
-    // async closure moves its own `Arc` clone in and re-`Arc::clone`s it per
-    // invocation so the handler can be called for every inbound request.
+    // `service` is captured by the `session/new`, `session/prompt`, and
+    // `session/cancel` handler closures (and later handlers as more ACP methods
+    // are implemented). Each async closure moves its own `Arc` clone in and
+    // re-`Arc::clone`s it per invocation so the handler can be called for every
+    // inbound request. The shared `CancelTracker` lets a `session/cancel`
+    // notification wake a prompt pump parked on an approval bridge.
+    let cancels = handlers::CancelTracker::default();
     let service_for_new = Arc::clone(&service);
-    let service_for_prompt = service;
+    let service_for_load = Arc::clone(&service);
+    let service_for_prompt = Arc::clone(&service);
+    let service_for_cancel = service;
+    let cancels_for_prompt = cancels.clone();
+    let cancels_for_cancel = cancels;
     Agent
         .builder()
         .name("mag-acp")
@@ -79,8 +89,8 @@ where
         )
         .on_receive_request(
             async move |request, responder, connection| {
-                handlers::session_prompt(
-                    Arc::clone(&service_for_prompt),
+                handlers::session_load(
+                    Arc::clone(&service_for_load),
                     request,
                     responder,
                     connection,
@@ -88,6 +98,31 @@ where
                 .await
             },
             on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request, responder, connection| {
+                handlers::session_prompt(
+                    Arc::clone(&service_for_prompt),
+                    cancels_for_prompt.clone(),
+                    request,
+                    responder,
+                    connection,
+                )
+                .await
+            },
+            on_receive_request!(),
+        )
+        .on_receive_notification(
+            async move |notification, connection| {
+                handlers::session_cancel(
+                    Arc::clone(&service_for_cancel),
+                    cancels_for_cancel.clone(),
+                    notification,
+                    connection,
+                )
+                .await
+            },
+            on_receive_notification!(),
         )
         .on_receive_request(
             async move |request, responder, connection| {

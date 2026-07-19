@@ -112,12 +112,12 @@ pub fn new_session_request_to_config(req: &acp::NewSessionRequest) -> SessionCon
 /// Builds the [`AgentCapabilities`](acp::AgentCapabilities) mag advertises during
 /// `initialize`.
 ///
-/// Capabilities are declared honestly and conservatively (`docs/ACP.md`
-/// §3.1/§7): only bits mag actually supports are turned on. The first version is
-/// text-first and does not yet advertise session resumption:
+/// Capabilities are declared honestly (`docs/ACP.md` §3.1/§7): only bits mag
+/// actually supports are turned on.
 ///
-/// - `load_session = false` (revisited in M4-2 once mag-core restore readiness is
-///   confirmed);
+/// - `load_session = true`: mag-core's restore path (persisted config +
+///   committed snapshot, `docs/DESIGN.md` §3.6) is fully wired and covered by
+///   offline restart tests, so `session/load` is advertised and handled;
 /// - `prompt_capabilities.image` / `.audio` / `.embedded_context` all `false`
 ///   (multimodal input is out of scope for the first version);
 /// - `mcp_capabilities` / `session_capabilities` / `auth` are left at their
@@ -125,7 +125,7 @@ pub fn new_session_request_to_config(req: &acp::NewSessionRequest) -> SessionCon
 #[must_use]
 pub fn agent_capabilities() -> acp::AgentCapabilities {
     acp::AgentCapabilities::new()
-        .load_session(false)
+        .load_session(true)
         .prompt_capabilities(
             acp::PromptCapabilities::new()
                 .image(false)
@@ -726,9 +726,12 @@ mod tests {
     }
 
     #[test]
-    fn agent_capabilities_are_conservative() {
+    fn agent_capabilities_match_implementation() {
         let caps = agent_capabilities();
-        assert!(!caps.load_session, "load_session must start disabled");
+        assert!(
+            caps.load_session,
+            "load_session is advertised: mag-core restore is ready (M4-2)"
+        );
         assert!(!caps.prompt_capabilities.image, "image must be disabled");
         assert!(!caps.prompt_capabilities.audio, "audio must be disabled");
         assert!(

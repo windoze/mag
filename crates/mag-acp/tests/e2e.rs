@@ -38,6 +38,7 @@ const SESSION_UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
 #[derive(Default)]
 struct FakeService {
     recorded_config: Arc<Mutex<Option<SessionConfig>>>,
+    recorded_resume: Arc<Mutex<Option<SessionId>>>,
 }
 
 #[async_trait]
@@ -51,7 +52,8 @@ impl MagService for FakeService {
         Ok(Vec::new())
     }
 
-    async fn resume_session(&self, _id: SessionId) -> Result<(), ServiceError> {
+    async fn resume_session(&self, id: SessionId) -> Result<(), ServiceError> {
+        *self.recorded_resume.lock().expect("lock not poisoned") = Some(id);
         Ok(())
     }
 
@@ -127,8 +129,9 @@ async fn initialize_round_trips_over_in_memory_pipe() {
     // The capabilities the client observes must equal what the pure function
     // declares — proving the handshake carried them faithfully end to end.
     assert_eq!(negotiated, mag_acp::map::agent_capabilities());
-    // And they must stay conservative (M1-1 contract).
-    assert!(!negotiated.load_session);
+    // `load_session` is advertised (M4-2: mag-core restore is ready); the
+    // multimodal prompt bits stay off.
+    assert!(negotiated.load_session);
     assert!(!negotiated.prompt_capabilities.image);
 }
 
@@ -143,6 +146,7 @@ async fn session_new_round_trips_over_in_memory_pipe() {
     let recorded: Arc<Mutex<Option<SessionConfig>>> = Arc::new(Mutex::new(None));
     let service: Arc<dyn MagService> = Arc::new(FakeService {
         recorded_config: Arc::clone(&recorded),
+        ..FakeService::default()
     });
 
     let cwd = PathBuf::from("/abs/session/root");
@@ -186,5 +190,61 @@ async fn session_new_round_trips_over_in_memory_pipe() {
     assert_eq!(
         mag_id,
         SessionId::parse_str(SESSION_UUID).expect("valid uuid")
+    );
+}
+
+/// Drives `initialize` → `session/new` → `session/load` from the real ACP
+/// client over the in-memory pipe (`docs/ACP.md` §3.3), proving the advertised
+/// `load_session` capability is backed by a working handler: the fake service
+/// records a `resume_session` call for the exact mag `SessionId` the
+/// `session/new` round-trip produced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_load_round_trips_over_in_memory_pipe() {
+    use agent_client_protocol::schema::v1::LoadSessionRequest;
+
+    let recorded_resume: Arc<Mutex<Option<SessionId>>> = Arc::new(Mutex::new(None));
+    let service: Arc<dyn MagService> = Arc::new(FakeService {
+        recorded_resume: Arc::clone(&recorded_resume),
+        ..FakeService::default()
+    });
+
+    let cwd = PathBuf::from("/abs/session/root");
+    let (agent_transport, client_transport) = Channel::duplex();
+    let server = tokio::spawn(async move { mag_acp::serve(service, agent_transport).await });
+
+    let client = Client
+        .builder()
+        .connect_with(client_transport, async move |cx| {
+            // Handshake: `load_session` must be advertised for a client to
+            // call `session/load` at all (`docs/ACP.md` §3.3/§7).
+            let initialize = cx
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let created = cx
+                .send_request(NewSessionRequest::new(cwd.clone()))
+                .block_task()
+                .await?;
+            cx.send_request(LoadSessionRequest::new(created.session_id, cwd))
+                .block_task()
+                .await?;
+            Ok(initialize.agent_capabilities.load_session)
+        });
+
+    let load_session_advertised = tokio::time::timeout(Duration::from_secs(10), client)
+        .await
+        .expect("session/load round-trip must not hang")
+        .expect("session/load round-trip must succeed");
+
+    server.abort();
+
+    assert!(
+        load_session_advertised,
+        "load_session must be advertised for clients to call session/load",
+    );
+    assert_eq!(
+        *recorded_resume.lock().expect("lock not poisoned"),
+        Some(SessionId::parse_str(SESSION_UUID).expect("valid uuid")),
+        "session/load must reach MagService::resume_session for the created session",
     );
 }

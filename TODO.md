@@ -929,7 +929,7 @@ cancel/load（M4）。M1-3→M1-4 依赖已在各自完成记录标注。
   mag-tools 6+13，0 fail）。
 - 下一个未完成任务：M4-1（`session/cancel` notification + 挂起权限的 cancel 收尾）。
 
-### [TODO] M4-1 `session/cancel` notification + 挂起权限的 cancel 收尾
+### [DONE] M4-1 `session/cancel` notification + 挂起权限的 cancel 收尾
 
 **依赖**：M4-0（`RunErrorKind::Cancelled` 结构化分类 + 官方取消入口，已 `[DONE]`）。
 
@@ -966,7 +966,45 @@ cancel/load（M4）。M1-3→M1-4 依赖已在各自完成记录标注。
   无卡死。
 - 完整验证序列 1–5；clippy / doc 无警告。
 
-### [TODO] M4-2 `session/load` → `resume_session` + 能力宣告收口
+**完成记录（M4-1）**：
+
+- **`CancelTracker`（`crates/mag-acp/src/handlers.rs`）**：跨 handler 的取消信号共享状态——每会话一个
+  `tokio::sync::watch::Sender<bool>`；`cancel` 翻标志并唤醒所有挂起桥接，晚到的桥接经
+  `watch::Receiver::borrow` 立即观察到 `true`（`changed` 只看未来翻转）。`serve` 持一份，clone 分发给
+  `session/prompt` 与 `session/cancel` handler。
+- **`session/cancel` handler（`session_cancel`）**：经 `on_receive_notification` 注册（`CancelNotification`）；
+  解析 sid 失败静默忽略（notification 无错误通道），先翻 tracker（唤醒挂起桥接，让其在 driver 仍停着时
+  答出保守 cancel），再 `service.cancel(sid).await`（错误吞掉，cancel 是 best-effort）。M4-0 后 run 以
+  `RunError{kind: Cancelled}` 收尾，泵经 `run_terminal_to_stop_reason` 自然回 `StopReason::Cancelled`，
+  **未设任何本轮 cancel 标志**。
+- **挂起权限 cancel 收尾（`bridge_permission`）**：`tokio::select!` 竞速 client outcome vs
+  `wait_for_cancel`（tracker）；cancel 胜出时按 `RequestPermissionOutcome::Cancelled` 走既有
+  `outcome_to_interaction_response` 保守回译（Approval→Cancel 带 model-visible message）。
+  `respond_interaction` 遇 `ServiceError::InteractionNotFound` **静默容忍**（M4-0 后 service 侧挂起审批
+  可能已随 `ctx.cancellation()` 自行收尾，迟到响应合法地找不到目标），其余错误仍上报。
+- **依赖变化**：`tokio`（`sync` feature）由 dev-dependency 提升为常规依赖（`watch`/`select!`；在
+  PLAN.md 允许的依赖边界内）。`mag-acp` 仍不依赖 `mag-core`/`agent-lib`。
+- **测试（`crates/mag-acp/tests/cancel.rs`，2 条，均 <0.01s）**：
+  - `cancel_ends_prompt_turn_with_cancelled_stop_reason`：scripted service 流一条 TextDelta 后静默，
+    client 收首条 update 后发 `CancelNotification`；断言 stop=`Cancelled`、`MagService::cancel` 以正确
+    sid 被调、无 interaction 被误答。
+  - `cancel_during_pending_permission_wraps_up_both_sides`：service 发 `InteractionRequested` 后静默，
+    fake client 收 `session/request_permission` 后**永不应答**（responder 移到 event loop 外的 pending
+    task，避免阻塞 client loop 造成测试假死）；service 的 `respond_interaction` 故意回
+    `InteractionNotFound` 模拟 M4-0 后的自行收尾竞态。断言：stop=`Cancelled`（无悬挂、无误报）、
+    桥接仍尝试以 `ApprovalDecisionWire::Cancel` 答出保守响应、`cancel` 被调。
+- **文档**：crate 级 rustdoc 与 `serve` 注册清单更新为含 `session/cancel`；`handlers.rs` 相关 rustdoc
+  补齐（`CancelTracker`/`session_cancel`/`wait_for_cancel`/桥接的 cancel 分支）。
+- **验证（全绿）**：1) `cargo fmt --all -- --check` 干净；2) `cargo test -p mag-acp cancel` 2 passed；
+  3) `cargo clippy --all-targets -- -D warnings` 无警告；4) `cargo test --workspace` 全通过（125：
+  mag-acp 22+2+3+3+2=32、mag-core 50+2、mag-service 12、mag-sources 10、mag-tools 6+13，0 fail）；
+  5) `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无警告。
+- **未做的取舍**：tracker 的 watch channel 随会话常驻（每会话一个小 channel，无清理），注释已注明；
+  ACP 规范鼓励 client 在 cancel 时自行回 `Cancelled` outcome（该路径 M3 已覆盖），本任务覆盖的是
+  client 不应答的兜底。
+- 下一个未完成任务：M4-2（`session/load` → `resume_session` + 能力宣告收口）。
+
+### [DONE] M4-2 `session/load` → `resume_session` + 能力宣告收口
 
 **上下文**：
 
@@ -996,7 +1034,33 @@ cancel/load（M4）。M1-3→M1-4 依赖已在各自完成记录标注。
 - 聚焦测试：`cargo test -p mag-acp session_load`（能力位断言 + load 往返），1 分钟内绿。
 - 完整验证序列 1–5；clippy / doc 无警告。
 
-### [TODO] M4-R Review：M4 cancel + load + 能力宣告
+**完成记录（M4-2）**：
+
+- **恢复就绪度核实**：mag-core `resume_session`（`crates/mag-core/src/engine.rs:156`）完整实现——
+  从持久层读回 config + 最新 committed snapshot、幂等（已 live 则 no-op）、重建 session actor；
+  `tests/e2e_offline.rs` 有跨“进程重启”的恢复测试覆盖。判定就绪，按 `docs/ACP.md` §3.3/§7 宣告
+  `load_session = true`，**无需插主干前置任务**。
+- **能力宣告收口（`map::agent_capabilities`）**：`load_session` 翻为 `true`；其余位保持与实现一致的
+  最终值——`prompt_capabilities.image/audio/embedded_context` 全 `false`（多模态第一版不做）、
+  `mcp_capabilities`/`session_capabilities`/`auth` 保持未宣告默认、无 `auth_methods`。单测由
+  `agent_capabilities_are_conservative` 更名为 `agent_capabilities_match_implementation` 并翻转断言；
+  e2e `initialize_round_trips_over_in_memory_pipe` 同步断言 `load_session == true`。
+- **`session_load` handler（`handlers.rs`）**：`acp_session_id_to_mag` 解析（非法 id 回内部错误）→
+  `service.resume_session(sid).await` → 回空 `LoadSessionResponse::new()`（mag 无 session modes /
+  config options 可报）。请求的 `cwd`/`mcp_servers` 不重复应用——会话按持久化的配置恢复（rustdoc 注明）。
+  已在 `serve` 注册（`service_for_load` 一份 `Arc`）。
+- **e2e（`tests/e2e.rs`）**：`FakeService` 增加 `recorded_resume`；新增
+  `session_load_round_trips_over_in_memory_pipe`：真实 ACP client 走 `initialize`（断言宣告位）→
+  `session/new` → `session/load`，断言 fake service 以对创建的同一 mag `SessionId` 收到
+  `resume_session`（<0.01s）。
+- **验证（全绿）**：1) `cargo fmt --all -- --check` 干净；2) `cargo test -p mag-acp` 33 passed
+  （map 22、e2e 3、prompt 3、permission_bridge 3、cancel 2）；3) `cargo clippy --all-targets --
+  -D warnings` 无警告；4) `cargo test --workspace` 全通过（126：mag-acp 33、mag-core 50+2、
+  mag-service 12、mag-sources 10、mag-tools 6+13，0 fail）；5) `RUSTDOCFLAGS="-D warnings" cargo doc
+  --no-deps --workspace` 无警告。
+- 下一个未完成任务：M4-R（Review：M4 cancel + load + 能力宣告）。
+
+### [DONE] M4-R Review：M4 cancel + load + 能力宣告
 
 **上下文**：核对 M4 对 `docs/ACP.md` §3.5/§3.3/§7 的完整性；真实任务，不得跳过。
 
@@ -1008,6 +1072,49 @@ cancel/load（M4）。M1-3→M1-4 依赖已在各自完成记录标注。
 4. 确认无未调度失败测试；跑完整验证序列 1–5。
 
 **验证条件**：完整验证序列 1–5 全绿；review 结论 + 对照表 + 缺口汇总写入完成记录。
+
+**完成记录（M4-R）**：
+
+对照 `docs/ACP.md` §3.5/§3.3/§7 逐条核对 M4（M4-0 契约扩展、M4-1 cancel、M4-2 load）成果。
+**发现并修复 1 个真实缺陷**（见下「review 发现」），修复后全序列绿。
+
+- **§3.5 `session/cancel` 对照表**：
+
+  | §3.5 要求 | 实现 | 证据 |
+  | --- | --- | --- |
+  | notification（无响应），`on_receive_notification` 注册 | `serve` 注册 `CancelNotification` → `session_cancel` | `lib.rs` + `handlers.rs::session_cancel` |
+  | 收到后 `service.cancel(sid)`，令本轮干净终止 | 先翻 `CancelTracker` 再 `service.cancel`；无效 sid / service 错误静默（notification 无错误通道） | `handlers.rs::session_cancel` |
+  | 本轮终态 → `PromptResponse{stop_reason: Cancelled}`（规范强制） | 终态 `RunError{kind: RunErrorKind::Cancelled}`（M4-0）→ `run_terminal_to_stop_reason` → `Cancelled`，无需本轮 cancel 标志 | `map.rs` + 测试 `cancel_ends_prompt_turn_with_cancelled_stop_reason` |
+  | 挂起 `session/request_permission` 以 cancel 收尾 | `bridge_permission` `select!` 竞速 tracker；cancel 胜出按 `Cancelled` outcome 保守回译；`InteractionNotFound` 静默容忍（M4-0 后 service 侧可自行收尾） | `handlers.rs::bridge_permission` + 测试 `cancel_during_pending_permission_wraps_up_both_sides`（client 永不应答 + service 回 NotFound 双重刁难下仍 `Cancelled` 收尾） |
+
+- **§3.3 `session/load` 对照表**：
+
+  | §3.3 要求 | 实现 | 证据 |
+  | --- | --- | --- |
+  | 仅当宣告 `load_session` 才可用 | `agent_capabilities().load_session == true` 且 handler 已注册（两者同源同改，无“宣告了没接”或反之） | `map.rs` + `lib.rs` |
+  | 反查 mag `SessionId` → `resume_session` → `LoadSessionResponse` | `session_load`：解析失败 / service 错误回内部错误；成功回空响应（无 modes/config options） | `handlers.rs::session_load` |
+  | 宣告取决于 mag-core 恢复实际就绪度 | `engine.rs::resume_session` 完整实现（config+snapshot 恢复、幂等），`e2e_offline.rs` 跨重启恢复测试兜底 | M4-2 完成记录的就绪度核实 |
+
+- **§7 能力如实宣告对照**：`load_session=true`（有 handler + mag-core 恢复支撑）；多模态 prompt 位全
+  `false`（未实现）；`mcp/session/auth` 未宣告；`InitializeResponse` 回传协商版本（M1 既有）。无假装支持。
+
+- **review 发现（已修复，非绕过）**：`CancelTracker` 的 watch 标志**取消后不复位**——若某轮在审批挂起期间
+  被 cancel（channel 已建、标志已翻），同一会话下一轮 prompt 再遇审批时，`wait_for_cancel` 经
+  `borrow()` 立即读到残留的 `true`，桥接被“幻影取消”瞬时答出 Cancel，该轮卡死（无终态事件）。
+  修复：`run_prompt_pump` 启动时 `cancels.reset(session_id)`——新 turn 从未取消状态开始（语义对齐
+  mag-core“无活动 run 时 cancel 是 no-op”）。回归测试 `cancel_does_not_leak_into_the_next_turn`
+  （turn 1 审批挂起中被 cancel → turn 2 审批被 approve 须 `EndTurn` + `Approve`）：**已验证无修复时必红**
+  （临时注释 reset 后 10s 超时失败），修复后稳定绿。另注意初版回归测试曾因 turn 1 无审批（channel 未建）
+  而未真正复现——已修正为两轮都在审批挂起的场景。
+
+- **缺口汇总**：无未调度缺口。已知可接受取舍：tracker channel 随会话常驻（每会话一个小 channel，注释已
+  注明）；“cancel 恰好落在 turn 启动前”的窗口语义与 mag-core 一致（no-op）。
+
+- **验证序列 1–5 全绿**：`cargo fmt --all -- --check` 干净；`cargo test -p mag-acp cancel` 3 passed；
+  `cargo clippy --all-targets -- -D warnings` 无警告（修掉一处 collapsible_if）；`cargo test --workspace`
+  全通过（127：mag-acp 22+3+3+3+3=34、mag-core 50+2、mag-service 12、mag-sources 10、mag-tools 6+13，
+  0 fail）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无警告。
+- M4 里程碑全部 `[DONE]`。下一个未完成任务：M5-1（协议级全回合 e2e）。
 
 ---
 
