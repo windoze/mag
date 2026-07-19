@@ -19,7 +19,7 @@ use std::{error::Error, fmt};
 
 use crate::{
     DelegationMessageWire, DelegationTrace, Event, InteractionKindWire, InteractionResponseWire,
-    RequestId, RunId, RunOutput, SessionConfig, SessionId, SourceInfo, ToolTrace,
+    RequestId, RunErrorKind, RunId, RunOutput, SessionConfig, SessionId, SourceInfo, ToolTrace,
 };
 
 /// Transport-neutral service facade implemented by `mag-core::Engine`.
@@ -211,6 +211,11 @@ pub enum ServiceEvent {
         id: SessionId,
         /// Human-readable failure message.
         message: String,
+        /// Machine-readable failure classification; defaults to
+        /// [`RunErrorKind::Other`] so events serialized before this field
+        /// existed still deserialize.
+        #[serde(default)]
+        kind: RunErrorKind,
     },
     /// A streamed text delta was produced by the model.
     TextDelta {
@@ -317,7 +322,7 @@ impl From<Event> for ServiceEvent {
             Event::SessionCreated { id, config } => Self::SessionCreated { id, config },
             Event::RunStarted { id, run_id } => Self::RunStarted { id, run_id },
             Event::RunFinished { id, output } => Self::RunFinished { id, output },
-            Event::RunError { id, message } => Self::RunError { id, message },
+            Event::RunError { id, message, kind } => Self::RunError { id, message, kind },
             Event::TextDelta { id, text } => Self::TextDelta { id, text },
             Event::ToolStarted { id, trace } => Self::ToolStarted { id, trace },
             Event::ToolFinished { id, trace } => Self::ToolFinished { id, trace },
@@ -413,6 +418,7 @@ mod tests {
             tool_profile: None,
             cwd: None,
             routing: crate::RoutingMode::ModelRouted,
+            budget: None,
         }
     }
 
@@ -570,6 +576,7 @@ mod tests {
                 ServiceEvent::RunError {
                     id: session_id(),
                     message: "boom".to_owned(),
+                    kind: crate::RunErrorKind::default(),
                 },
                 "run_error",
             ),

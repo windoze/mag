@@ -95,14 +95,16 @@
   `probe_local_agents() -> Vec<SourceInfo>`。所有 async 方法返回 `Result<_, ServiceError>`。
 - **`ServiceEvent`**（`#[non_exhaustive]`，`#[serde(tag="type", rename_all="snake_case")]`）变体：
   `SessionCreated{id,config}`、`RunStarted{id,run_id}`、`RunFinished{id,output:RunOutput}`、
-  `RunError{id,message}`、`TextDelta{id,text}`、`ToolStarted{id,trace:ToolTrace}`、
+  `RunError{id,message,kind:RunErrorKind}`、`TextDelta{id,text}`、`ToolStarted{id,trace:ToolTrace}`、
   `ToolFinished{id,trace:ToolTrace}`、`InteractionRequested{id,request_id:RequestId,kind:InteractionKindWire}`、
   `DelegationStarted/Finished/Failed{id,trace:DelegationTrace}`、`DelegationMessage{id,message:DelegationMessageWire}`、
   `LocalAgentsProbed{available:Vec<SourceInfo>}`。`ServiceEvent::session_id() -> Option<SessionId>`。
 - **wire 类型**（`lib.rs`）：`SessionId`/`RunId`/`RequestId`（`#[serde(transparent)]` 包 `Uuid`；
   `new(Uuid)`/`parse_str(&str)`/`as_uuid()`/`Display`/`FromStr`）；`UserInput{text:String,
   attachments:Vec<MessageAttachment>}`（`UserInput::text(impl Into<String>)`）；
-  `SessionConfig{provider:String, model:String, tool_profile:Option<String>, cwd:Option<PathBuf>, routing:RoutingMode}`；
+  `SessionConfig{provider:String, model:String, tool_profile:Option<String>, cwd:Option<PathBuf>, routing:RoutingMode, budget:Option<SessionBudget>}`；
+  `SessionBudget{max_steps,max_tokens,max_cost_micros,max_wall_time_secs}`（全 `Option<u64>`，逐 run 预算）；
+  `RunErrorKind::{Other,Cancelled,LoopLimitExceeded,BudgetExhausted}`（`#[serde(default)]` 分类，`Other` 为缺省）；
   `RunOutput{text,usage:Option<UsageInfo>}`；`ToolTrace{run_id,call_id:ToolCallIdWire,name,input,output,
   status:ToolStatusWire,message}`、`ToolStatusWire::{Started,Finished,Denied,Cancelled,Failed}`；
   `InteractionKindWire{Approval{call_id:ToolCallIdWire,requirement:ApprovalRequirementWire},
@@ -182,6 +184,9 @@
   `docs/ACP.md` §3.3/§7、`docs/DESIGN.md` §3.6。
 - **R-4 delegation 映射语义**：`DelegationStarted/...` 映射为 `ToolCall`/`ToolCallUpdate` 还是 `Plan` 由
   `docs/ACP.md` §4 保守约定；第一版可先降级为文本或 `ToolCall`，M2-1 明确并单测，不臆造 `Plan` 语义。
-- **R-5 stop reason 精度**：`ServiceEvent` 目前用 `RunFinished`/`RunError` 收尾；`MaxTokens`/`MaxTurnRequests`
-  若无法从 `ServiceEvent` 区分，归 `EndTurn`/`Refusal`（`docs/ACP.md` §3.4）。若后续需精确区分，回主干加
-  `ServiceEvent` 字段（向后兼容），不在 mag-acp 侧猜。
+- **R-5 stop reason 精度**（**已大部消解**，2026-07-20 agent-lib 升级适配）：`RunError` 已带
+  `kind: RunErrorKind`（向后兼容 `#[serde(default)]` 字段，主干侧由 `FacadeError` 变体结构化映射）。
+  `Cancelled→StopReason::Cancelled`（满足 ACP 规范对 `session/cancel` 的强制要求）、
+  `LoopLimitExceeded→MaxTurnRequests`、`BudgetExhausted→Refusal`（ACP 无预算专用变体）已在
+  `map::run_terminal_to_stop_reason` 落地。**残留**：`MaxTokens` 仍不产出（service 侧无独立的
+  token 上限信号；token 预算耗尽归 `BudgetExhausted→Refusal`）。

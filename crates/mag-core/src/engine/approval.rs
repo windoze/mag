@@ -23,14 +23,14 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicU64, Ordering},
     },
 };
 
 use agent_lib::agent::{
-    AgentId, ApprovalDecision, ApprovalRequirement, ApprovalResponse, Interaction,
-    InteractionHandler, InteractionKind, InteractionResponse, PermissionCategory,
+    AgentId, ApprovalDecision, ApprovalRequirement, ApprovalResponse, CancellationToken,
+    Interaction, InteractionHandler, InteractionKind, InteractionResponse, PermissionCategory,
     PermissionDecision, PermissionRequest, PermissionResponse, PermissionRisk, RequirementResult,
     RunContext,
 };
@@ -44,7 +44,13 @@ use mag_service::{
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-use crate::{EventBus, session::CancelToken};
+use crate::EventBus;
+
+/// Locks `mutex`, recovering the guard from a poisoned lock instead of
+/// panicking (mirrors agent-lib's unified poison-recovery policy, M9-1).
+fn lock_recovering<'a, T>(mutex: &'a Mutex<T>) -> MutexGuard<'a, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Outcome a [`PermissionDecider`] can reach for an
 /// [`InteractionKind::Permission`] request.
@@ -109,8 +115,6 @@ pub(crate) struct IpcApproval {
     request_ids: RequestIdSource,
     pending: Mutex<HashMap<RequestId, Pending>>,
     decider: Arc<dyn PermissionDecider>,
-    /// Cancel handle for the active run; re-armed by the actor before each run.
-    cancel: Mutex<CancelToken>,
 }
 
 impl IpcApproval {
@@ -127,14 +131,7 @@ impl IpcApproval {
             request_ids: RequestIdSource::default(),
             pending: Mutex::new(HashMap::new()),
             decider,
-            cancel: Mutex::new(CancelToken::default()),
         }
-    }
-
-    /// Arms the cancel handle the next [`fulfill`](IpcApproval::fulfill) selects
-    /// against, so cancelling the active run unblocks a parked approval.
-    pub(crate) fn arm_cancel(&self, cancel: CancelToken) {
-        *self.cancel.lock().expect("approval cancel lock") = cancel;
     }
 
     /// Resolves the pending interaction identified by `request_id` with the
@@ -154,11 +151,7 @@ impl IpcApproval {
         request_id: RequestId,
         response: InteractionResponseWire,
     ) -> Result<(), ServiceError> {
-        let pending = self
-            .pending
-            .lock()
-            .expect("approval pending lock")
-            .remove(&request_id);
+        let pending = lock_recovering(&self.pending).remove(&request_id);
         let Some(pending) = pending else {
             return Err(ServiceError::InteractionNotFound { request_id });
         };
@@ -180,20 +173,26 @@ impl IpcApproval {
 
     /// Removes a still-pending entry (used when a parked request is cancelled).
     fn discard_pending(&self, request_id: RequestId) {
-        self.pending
-            .lock()
-            .expect("approval pending lock")
-            .remove(&request_id);
+        lock_recovering(&self.pending).remove(&request_id);
     }
 
     /// Registers a pending request, emits it to the interface, and parks until a
-    /// response arrives or the active run is cancelled.
-    async fn emit_and_await(&self, request: &Interaction) -> InteractionResponse {
+    /// response arrives or the run's `cancel` token fires.
+    ///
+    /// The token is propagated through the [`RunContext`] from the facade's
+    /// [`CancelHandle`](agent_lib::facade::CancelHandle), so cancelling the
+    /// active run wakes this park without any mag-side arming (`docs/DESIGN.md`
+    /// §3.3).
+    async fn emit_and_await(
+        &self,
+        request: &Interaction,
+        cancel: &CancellationToken,
+    ) -> InteractionResponse {
         let request_id = self.request_ids.next_id();
         let (responder, waiter) = oneshot::channel();
         let kind = interaction_kind_to_wire(request.kind());
 
-        self.pending.lock().expect("approval pending lock").insert(
+        lock_recovering(&self.pending).insert(
             request_id,
             Pending {
                 interaction: request.clone(),
@@ -207,9 +206,6 @@ impl IpcApproval {
             kind,
         });
 
-        // Snapshot the currently armed cancel handle so a cancel of the active
-        // run wakes this park without holding the lock across the await.
-        let cancel = self.cancel.lock().expect("approval cancel lock").clone();
         tokio::select! {
             resolved = waiter => resolved.unwrap_or_else(|_| cancelled_response(request)),
             () = cancel.cancelled() => {
@@ -222,7 +218,7 @@ impl IpcApproval {
 
 #[async_trait]
 impl InteractionHandler for IpcApproval {
-    async fn fulfill(&self, request: &Interaction, _ctx: &RunContext) -> RequirementResult {
+    async fn fulfill(&self, request: &Interaction, ctx: &RunContext) -> RequirementResult {
         // A permission request first consults the decider; a decided outcome
         // short-circuits the interface round-trip (the AI-permission seam, §8.1).
         if let InteractionKind::Permission {
@@ -233,7 +229,7 @@ impl InteractionHandler for IpcApproval {
             return RequirementResult::Interaction(InteractionResponse::Permission(decided));
         }
 
-        RequirementResult::Interaction(self.emit_and_await(request).await)
+        RequirementResult::Interaction(self.emit_and_await(request, ctx.cancellation()).await)
     }
 }
 
@@ -423,7 +419,7 @@ mod tests {
         },
         client::LlmClient,
         conversation::ToolCallId,
-        facade::{Agent, Approval, Tool, ToolContext},
+        facade::{Agent, Approval, CancelHandle, Tool, ToolContext},
         model::usage::Usage,
     };
     use async_trait::async_trait;
@@ -438,7 +434,6 @@ mod tests {
 
     use crate::{
         EventBus,
-        session::CancelToken,
         test_support::{FakeLlmClient, text_stream_with_usage, tool_use_stream},
     };
 
@@ -651,21 +646,38 @@ mod tests {
             events.clone(),
             Arc::new(AskFrontendDecider),
         ));
-        let cancel = CancelToken::default();
-        ipc.arm_cancel(cancel.clone());
         let counter = Arc::new(AtomicUsize::new(0));
         let mut agent = approval_agent(counter.clone(), ipc.clone());
         let mut subscriber = events.subscribe();
 
-        let mut stream = agent.stream("weather?".to_owned()).await.expect("stream");
+        let cancel = CancelHandle::new();
+        let mut stream = agent
+            .stream_with_cancel("weather?".to_owned(), cancel.clone())
+            .await
+            .expect("stream");
         let _request_id = drive_until_interaction(&mut stream, &mut subscriber).await;
         assert_eq!(counter.load(Ordering::SeqCst), 0);
 
-        // Cancelling the active run must unblock the parked approval and resolve
-        // it conservatively (the tool never runs).
+        // Cancelling the active run must unblock the parked approval (the
+        // facade propagates the cancel token through the fulfill `RunContext`)
+        // and resolve it conservatively (the tool never runs).
         cancel.cancel();
 
-        drain(&mut stream).await;
+        // The facade ends a cancelled run with a stream error rather than a
+        // terminal `Done`.
+        let mut saw_cancel_error = false;
+        for _ in 0..5000 {
+            match futures::poll!(futures::StreamExt::next(&mut stream)) {
+                Poll::Ready(Some(Ok(_))) => continue,
+                Poll::Ready(Some(Err(_))) => {
+                    saw_cancel_error = true;
+                    break;
+                }
+                Poll::Ready(None) => break,
+                Poll::Pending => tokio::task::yield_now().await,
+            }
+        }
+        assert!(saw_cancel_error, "a cancelled run ends with a stream error");
         assert_eq!(
             counter.load(Ordering::SeqCst),
             0,

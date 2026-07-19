@@ -21,9 +21,16 @@
 
 use std::{
     path::Path,
-    sync::Mutex,
+    sync::{Mutex, MutexGuard, PoisonError},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+/// Locks `mutex`, recovering the guard from a poisoned lock instead of
+/// panicking (mirrors agent-lib's unified poison-recovery policy, M9-1): a
+/// panicking session actor must not wedge the shared store for every session.
+fn lock_recovering<'a, T>(mutex: &'a Mutex<T>) -> MutexGuard<'a, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 use agent_lib::facade::AgentSnapshot;
 use mag_service::{SessionConfig, SessionId, SessionInfo};
@@ -173,7 +180,7 @@ impl Persistence {
         config: &SessionConfig,
     ) -> Result<(), PersistenceError> {
         let config_json = serde_json::to_string(config)?;
-        let connection = self.connection.lock().expect("persistence lock");
+        let connection = lock_recovering(&self.connection);
         connection.execute(
             "INSERT INTO sessions (id, config_json, created_at) VALUES (?1, ?2, ?3)
              ON CONFLICT (id) DO UPDATE SET config_json = excluded.config_json",
@@ -192,7 +199,7 @@ impl Persistence {
         &self,
         id: SessionId,
     ) -> Result<Option<SessionConfig>, PersistenceError> {
-        let connection = self.connection.lock().expect("persistence lock");
+        let connection = lock_recovering(&self.connection);
         let config_json: Option<String> = connection
             .query_row(
                 "SELECT config_json FROM sessions WHERE id = ?1",
@@ -213,7 +220,7 @@ impl Persistence {
     /// Returns [`PersistenceError`] when a row cannot be read or a stored id /
     /// config cannot be parsed.
     pub(crate) fn list_sessions(&self) -> Result<Vec<SessionInfo>, PersistenceError> {
-        let connection = self.connection.lock().expect("persistence lock");
+        let connection = lock_recovering(&self.connection);
         let mut statement =
             connection.prepare("SELECT id, config_json FROM sessions ORDER BY created_at, id")?;
         let rows = statement.query_map([], |row| {
@@ -239,7 +246,7 @@ impl Persistence {
     ///
     /// Returns [`PersistenceError`] when the delete cannot be executed.
     pub(crate) fn delete_session(&self, id: SessionId) -> Result<(), PersistenceError> {
-        let connection = self.connection.lock().expect("persistence lock");
+        let connection = lock_recovering(&self.connection);
         // `ON DELETE CASCADE` removes the paired snapshot row.
         connection.execute(
             "DELETE FROM sessions WHERE id = ?1",
@@ -264,7 +271,7 @@ impl Persistence {
         snapshot: &AgentSnapshot,
     ) -> Result<(), PersistenceError> {
         let snapshot_json = serde_json::to_string(snapshot)?;
-        let connection = self.connection.lock().expect("persistence lock");
+        let connection = lock_recovering(&self.connection);
         connection.execute(
             "INSERT INTO snapshots (session_id, agent_snapshot_json, committed_at)
              VALUES (?1, ?2, ?3)
@@ -286,7 +293,7 @@ impl Persistence {
         &self,
         id: SessionId,
     ) -> Result<Option<AgentSnapshot>, PersistenceError> {
-        let connection = self.connection.lock().expect("persistence lock");
+        let connection = lock_recovering(&self.connection);
         let snapshot_json: Option<String> = connection
             .query_row(
                 "SELECT agent_snapshot_json FROM snapshots WHERE session_id = ?1",
@@ -311,7 +318,7 @@ impl Persistence {
     /// Returns [`PersistenceError`] when a row cannot be read or a stored id
     /// cannot be parsed.
     pub(crate) fn max_session_id_value(&self) -> Result<Option<u128>, PersistenceError> {
-        let connection = self.connection.lock().expect("persistence lock");
+        let connection = lock_recovering(&self.connection);
         let mut statement = connection.prepare("SELECT id FROM sessions")?;
         let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
 
@@ -363,6 +370,7 @@ mod tests {
             tool_profile: None,
             cwd: None,
             routing: RoutingMode::ModelRouted,
+            budget: None,
         }
     }
 

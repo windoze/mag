@@ -205,6 +205,11 @@ pub enum Event {
         id: SessionId,
         /// Human-readable failure message.
         message: String,
+        /// Machine-readable failure classification; defaults to
+        /// [`RunErrorKind::Other`] so events serialized before this field
+        /// existed still deserialize.
+        #[serde(default)]
+        kind: RunErrorKind,
     },
     /// A streamed text delta was produced by the model.
     TextDelta {
@@ -271,6 +276,28 @@ pub enum Event {
     },
 }
 
+/// Machine-readable classification of a [`Event::RunError`].
+///
+/// Lets transports (for example the ACP bridge) map terminal failures onto
+/// protocol-level stop reasons without string-matching the human-readable
+/// `message`.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunErrorKind {
+    /// Unclassified failure; the `message` carries the details.
+    #[default]
+    Other,
+    /// The run was cancelled by the client.
+    Cancelled,
+    /// The agent loop hit its per-turn step / tool-round limit before the
+    /// model produced a final response (agent-lib `FacadeError::LoopLimitExceeded`).
+    LoopLimitExceeded,
+    /// The session's configured per-run [`SessionBudget`] was exhausted
+    /// (agent-lib `FacadeError::BudgetExhausted`).
+    BudgetExhausted,
+}
+
 /// Configuration used when creating or resuming a session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionConfig {
@@ -294,6 +321,35 @@ pub struct SessionConfig {
     /// Routing strategy for future delegation support.
     #[serde(default)]
     pub routing: RoutingMode,
+    /// Optional per-run budget limits enforced by agent-lib's budget ledger.
+    ///
+    /// `None` (the default) keeps the run unbounded, matching agent-lib's
+    /// `BudgetLimits::unbounded()`. When the ledger refuses further work the
+    /// run ends with a [`RunErrorKind::BudgetExhausted`] error. The budget
+    /// resets on every top-level run, so limits apply per turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<SessionBudget>,
+}
+
+/// Per-run budget limits configurable on a session.
+///
+/// Mirrors agent-lib's `BudgetLimits` with a wire-friendly shape (wall time in
+/// whole seconds). Every dimension is optional; an unset dimension is
+/// unbounded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionBudget {
+    /// Maximum agent steps per run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_steps: Option<u64>,
+    /// Maximum total tokens per run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    /// Maximum cost per run, in micro-units of the provider's currency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cost_micros: Option<u64>,
+    /// Maximum wall-clock time per run, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_wall_time_secs: Option<u64>,
 }
 
 /// Delegation routing mode reserved in the session configuration.
@@ -659,6 +715,7 @@ mod tests {
             tool_profile: Some("default".to_owned()),
             cwd: None,
             routing: RoutingMode::ModelRouted,
+            budget: None,
         }
     }
 
@@ -838,6 +895,7 @@ mod tests {
                 Event::RunError {
                     id: session_id(),
                     message: "failed".to_owned(),
+                    kind: RunErrorKind::default(),
                 },
                 "run_error",
             ),
@@ -984,6 +1042,7 @@ mod tests {
             tool_profile: None,
             cwd: Some(std::path::PathBuf::from("/work/session-root")),
             routing: RoutingMode::ModelRouted,
+            budget: None,
         };
 
         let json = serde_json::to_value(&config).expect("serialize config");

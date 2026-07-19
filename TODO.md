@@ -56,13 +56,16 @@
   async 方法返回 `Result<_,ServiceError>`。
 - **`ServiceEvent`**（`crates/mag-service/src/service.rs`，`#[serde(tag="type",rename_all="snake_case")]`）：
   `SessionCreated{id,config}`、`RunStarted{id,run_id}`、`RunFinished{id,output:RunOutput}`、
-  `RunError{id,message}`、`TextDelta{id,text}`、`ToolStarted{id,trace:ToolTrace}`、`ToolFinished{id,trace}`、
+  `RunError{id,message,kind:RunErrorKind}`、`TextDelta{id,text}`、`ToolStarted{id,trace:ToolTrace}`、`ToolFinished{id,trace}`、
   `InteractionRequested{id,request_id:RequestId,kind:InteractionKindWire}`、
   `DelegationStarted/Finished/Failed{id,trace:DelegationTrace}`、`DelegationMessage{id,message}`、
   `LocalAgentsProbed{available}`；`ServiceEvent::session_id()->Option<SessionId>`。
 - **wire 类型**（`crates/mag-service/src/lib.rs`）：`SessionId`/`RunId`/`RequestId`（`transparent` 包 `Uuid`；
   `new`/`parse_str`/`as_uuid`/`Display`/`FromStr`）；`UserInput{text,attachments}`（`UserInput::text(..)`）；
-  `SessionConfig{provider,model,tool_profile,routing:RoutingMode}`；`RunOutput{text,usage}`；
+  `SessionConfig{provider,model,tool_profile,cwd,routing:RoutingMode,budget:Option<SessionBudget>}`；
+  `SessionBudget{max_steps,max_tokens,max_cost_micros,max_wall_time_secs}`（全 `Option<u64>`）；
+  `RunErrorKind::{Other,Cancelled,LoopLimitExceeded,BudgetExhausted}`（`#[serde(default)]`，缺省 `Other`）；
+  `RunOutput{text,usage}`；
   `ToolTrace{run_id,call_id:ToolCallIdWire,name,input,output,status:ToolStatusWire,message}`；
   `InteractionKindWire{Approval{call_id,requirement},Question{prompt},Choice{prompt,options},
   Permission{action_id,actor,category,risk,summary,subject,reason}}`；
@@ -857,7 +860,78 @@ cancel/load（M4）。M1-3→M1-4 依赖已在各自完成记录标注。
 目标：接 `session/cancel` notification（含挂起权限的 cancel 收尾），接 `session/load` → `resume_session`，
 并按 mag-core 恢复能力实际就绪度收口 `load_session` / `prompt` 能力宣告。对应 `docs/ACP.md` §3.5 / §3.3 / §7。
 
+### [DONE] M4-0 agent-lib 升级适配：`RunErrorKind` / `SessionBudget` 契约扩展 + 官方取消入口（前置任务）
+
+**上下文**：
+
+- 这是 M4-1 的**前置契约扩展**任务（按通用规则回 service 主干**向后兼容**加字段，只加字段不改既有语义）。
+  agent-lib 一批修复性更新（M4–M9）带来了两项 mag-acp 需要的主干能力：
+  1. **stop reason 区分**（`PLAN.md` R-5）：`session/cancel` 后 ACP 规范**强制**返回 `StopReason::Cancelled`，
+     而冻结契约里 `RunError{id,message}` 无法区分 cancel / loop 上限 / 一般错误；
+  2. **per-run 预算**：agent-lib M6 暴露 `BudgetLimits`，mag 侧需要 wire 承载。
+- 同时把 mag 自建的取消通道（`CancelToken` + `arm_cancel`）切换为 agent-lib 官方
+  `facade::CancelHandle` / `Agent::stream_with_cancel`（M5-4），取消令牌经 `RunContext` 传播到
+  `IpcApproval::fulfill`，挂起审批在取消时以保守 deny 立即收尾。
+- **向后兼容硬约束**：`RunError.kind` 与 `SessionConfig.budget` 均带 `#[serde(default)]`，旧持久化/旧
+  客户端反序列化为缺省值（`RunErrorKind::Other` / `None`）。
+
+**做什么**：
+
+1. `mag-service`：`Event`/`ServiceEvent::RunError` 加 `kind: RunErrorKind`（`#[serde(default)]`，
+   `#[non_exhaustive]` 枚举 `{Other,Cancelled,LoopLimitExceeded,BudgetExhausted}`）；`SessionConfig` 加
+   `budget: Option<SessionBudget>`；新增 `SessionBudget{max_steps,max_tokens,max_cost_micros,
+   max_wall_time_secs}`（全 `Option<u64>`）。
+2. `mag-core`：`SessionDriver::new`/`restore` 把 `SessionBudget` 映射为 `BudgetLimits` 接线到 facade
+   `.budget(..)`；`run_turn` 改走 `stream_with_cancel`，从 `FacadeError` 变体映射 `RunErrorKind`；
+   删除自建 `CancelToken` 与 `IpcApproval::arm_cancel`（改用 `ctx.cancellation()`）。
+3. `mag-core` mutex poison 策略对齐 agent-lib M9-1：`approval.rs`/`session.rs`/`persistence.rs` 的
+   `.lock().expect(..)` 统一改 `lock_recovering`（`PoisonError::into_inner`）。
+4. `mag-acp`：`run_terminal_to_stop_reason` 按 `kind` 映射（`Cancelled→Cancelled`、
+   `LoopLimitExceeded→MaxTurnRequests`、其余→`Refusal`）。
+5. 测试：budget 耗尽与 loop 上限各一条 engine 级测试断言结构化 `kind`；重写 `cancel_while_paused` 测试走
+   `stream_with_cancel`；ACP map 测试补齐四种 kind 的映射断言。
+
+**验证条件**：
+
+- 聚焦测试：`cargo test -p mag-core exhausted` + `cargo test -p mag-acp map::`（1 分钟内绿）。
+- 完整验证序列 1–5；clippy / doc 无警告。
+- 向后兼容：旧 JSON（无 `kind`/`budget` 键）反序列化为缺省值。
+
+**完成记录（M4-0）**：
+
+- **agent-lib 升级影响面复核**：全 workspace 仅 1 处编译错误（`ToolCall` 新增 `extra` 字段，
+  `mag-tools/tests/builtin_tools.rs` 已补 `extra: Default::default()`）；deny 语义收窄（M5-2）、取消契约
+  （M4-5）、解析容忍（M7）均与 mag 既有设计兼容。
+- **契约扩展（向后兼容）**：`mag-service` 新增 `RunErrorKind`（`#[non_exhaustive]`，serde default=`Other`）
+  并加到 `Event`/`ServiceEvent::RunError`；新增 `SessionBudget` 并加到 `SessionConfig.budget`。旧 JSON 无新键
+  反序列化为缺省值，已序列化数据不回写多余键。
+- **官方取消入口**：删除 mag 自建 `CancelToken`（约 50 行）与 `IpcApproval::arm_cancel`；session actor 持
+  `facade::CancelHandle`，`run_turn` 走 `stream_with_cancel`；facade 将取消令牌经 `RunContext` 传播到
+  `IpcApproval::fulfill`，挂起审批 select 在 `ctx.cancellation().cancelled()` 上，取消时以保守
+  deny/cancel 收尾、driver 不悬挂（M4-1 的 service 侧前提已就绪）。
+- **budget 接线**：`SessionBudget` → `BudgetLimits`（wall time 秒→`Duration`），`new`/`restore` 均接线；
+  预算逐顶层 run 重置，超限 → `FacadeError::BudgetExhausted` → `RunErrorKind::BudgetExhausted`。
+- **poison 策略**：14 处 `.lock().expect(..)` 改 `lock_recovering`（`approval.rs`×3（另有 `arm_cancel` 的
+  1 处随该机制删除）、`session.rs`×4、`persistence.rs`×7），对齐 agent-lib M9-1。
+- **ACP stop reason**：`run_terminal_to_stop_reason` 按 `kind` 映射——`Cancelled→StopReason::Cancelled`
+  （**修复了 ACP 规范违规**：`session/cancel` 此前误归 `Refusal`）、`LoopLimitExceeded→MaxTurnRequests`、
+  `BudgetExhausted→Refusal`（ACP 无预算变体）。**残留**：`MaxTokens` 仍不产出（无独立 token 上限信号）。
+- **测试**：新增 `engine::chat::exhausted_budget_surfaces_structured_run_error`（1-token 预算被首轮响应击穿）
+  与 `exhausted_loop_limit_surfaces_structured_run_error`（10 轮 tool-use 撞 per-turn 上限）；
+  `cancel_while_paused_resolves_without_running_the_tool` 重写为 `stream_with_cancel` 路径；
+  `stop_reason_maps_terminal_events_only` 补 `Cancelled`/`LoopLimitExceeded`/`BudgetExhausted` 三臂；
+  `engine.rs`/`e2e_offline.rs` 的 cancel 断言加强为 `kind == Cancelled`。
+- **文档同步**：`docs/ACP.md` §3.4 伪代码与 stop reason 映射表按 `RunErrorKind` 更新；`docs/DESIGN.md`
+  §3.3 审批伪代码的取消令牌来源改为 `ctx.cancellation()`；`PLAN.md` 契约清单（`ServiceEvent`/
+  `SessionConfig`/`RunErrorKind`/`SessionBudget`）与 R-5（标大部消解）已更新。
+- **验证（全绿）**：`cargo fmt --all` 干净；`cargo clippy --workspace --all-targets` 无警告；
+  `cargo test --workspace` 全通过（123：mag-acp 22+2+3+3、mag-core 50+2、mag-service 12、mag-sources 10、
+  mag-tools 6+13，0 fail）。
+- 下一个未完成任务：M4-1（`session/cancel` notification + 挂起权限的 cancel 收尾）。
+
 ### [TODO] M4-1 `session/cancel` notification + 挂起权限的 cancel 收尾
+
+**依赖**：M4-0（`RunErrorKind::Cancelled` 结构化分类 + 官方取消入口，已 `[DONE]`）。
 
 **上下文**：
 
@@ -865,21 +939,26 @@ cancel/load（M4）。M1-3→M1-4 依赖已在各自完成记录标注。
   on_receive_notification!())`，请求类型 `CancelNotification{session_id}`。收到后调
   `service.cancel(sid).await`，令该会话正在跑的一轮干净终止。
 - 效果沿 M2-2 的泵传导：`cancel` 使 service 侧结束本轮，泵收到终态后 `session/prompt` handler 返回
-  `PromptResponse{stop_reason: Cancelled}`（acp 规范要求 cancel 后必须返回 `Cancelled`）。这需要泵能把
-  "本轮因 cancel 结束"识别为 `Cancelled` 而非 `EndTurn`——用一个本轮 cancel 标志或从 `ServiceEvent` 区分。
+  `PromptResponse{stop_reason: Cancelled}`（acp 规范要求 cancel 后必须返回 `Cancelled`）。
+  **M4-0 已铺平识别路径**：被 cancel 的本轮以 `RunError{kind: RunErrorKind::Cancelled}` 收尾，
+  `run_terminal_to_stop_reason` 已将其映射为 `StopReason::Cancelled`——本任务**无需**再设本轮 cancel
+  标志，接上 notification handler 即可传导。
 - **挂起权限的 cancel 收尾**（`docs/ACP.md` §3.5/§5）：若 cancel 时有挂起的 `session/request_permission`
   （M3-2 的 `await` 中），需让其以 cancel 收尾——依赖 client 回 `Cancelled` outcome，或本地放弃并
-  `respond_interaction` 一个 deny/cancel，确保 service 侧 driver 不悬挂。
+  `respond_interaction` 一个 deny/cancel，确保 service 侧 driver 不悬挂。注意 M4-0 后 service 侧挂起审批
+  已能随取消自行收尾（`ctx.cancellation()`），mag-acp 侧只需保证自己的 `await` 不悬挂并避免迟到的
+  `respond_interaction` 误报（service 对未知 request_id 返回 `InteractionNotFound`，桥接应容忍）。
 
 **做什么**：
 
-1. handler：`session/cancel` notification handler → `service.cancel(sid).await`；设置本轮 cancel 标志供泵读。
-2. 泵：使被 cancel 结束的本轮返回 `StopReason::Cancelled`（更新 `run_terminal_to_stop_reason` 或在泵内按
-   cancel 标志覆盖）。
-3. 挂起权限 cancel 收尾：cancel 时若有挂起 `bridge_permission`，令其 `respond_interaction` 一个保守
-   deny/cancel（或依赖 client `Cancelled` outcome），driver 不悬挂。
-4. handler 级测试：scripted service，run 中途收 `session/cancel`，断言本轮以 `Cancelled` 收尾；再测
-   cancel 落在挂起权限期间时 driver 被干净唤醒（无悬挂、无死等）。
+1. handler：`session/cancel` notification handler → 解析 sid → `service.cancel(sid).await`（M4-0 后泵经
+   `RunErrorKind::Cancelled` 自然以 `Cancelled` 收尾，无需 cancel 标志）。
+2. 挂起权限 cancel 收尾：cancel 时若有挂起 `bridge_permission`，令其 `respond_interaction` 一个保守
+   deny/cancel（或依赖 client `Cancelled` outcome）；迟到的 respond 遇 `InteractionNotFound` 应静默容忍
+   （M4-0 后 service 侧可能已自行收尾）。
+3. handler 级测试：scripted service，run 中途收 `session/cancel`，断言本轮以 `Cancelled` 收尾（事件带
+   `kind: RunErrorKind::Cancelled`）；再测 cancel 落在挂起权限期间时两侧都干净收尾（无悬挂、无死等、
+   迟到 respond 不报错）。
 
 **验证条件**：
 

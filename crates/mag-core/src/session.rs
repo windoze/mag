@@ -12,22 +12,19 @@
 //! session**, each hosting a `current_thread` runtime plus a
 //! [`LocalSet`] (agent-lib's facade run stream is not `Send`, so a run is driven
 //! by a `spawn_local` task pinned to the session's thread). Cancellation flows
-//! through a lightweight [`CancelToken`]: the actor flips the token and the run
-//! task, selecting the token against the facade stream, drops the stream to
-//! abandon the in-flight turn (agent-lib keeps committed history intact).
+//! through agent-lib's [`CancelHandle`]: the actor cancels the handle and the
+//! facade cooperatively abandons the in-flight turn with bounded latency,
+//! leaving the machine parked on `Idle` with committed history intact.
 
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex, PoisonError},
     thread,
 };
 
 use agent_lib::{
     client::LlmClient,
-    facade::{AgentSnapshot, FacadeError},
+    facade::{AgentSnapshot, CancelHandle, FacadeError},
 };
 use mag_service::{
     Event, InteractionResponseWire, RequestId, RunId, ServiceError, SessionConfig, SessionId,
@@ -35,7 +32,7 @@ use mag_service::{
 use mag_tools::ToolRegistry;
 use tokio::{
     runtime::Builder,
-    sync::{Notify, mpsc, oneshot},
+    sync::{mpsc, oneshot},
     task::LocalSet,
 };
 
@@ -46,54 +43,14 @@ use crate::{
     persistence::Persistence,
 };
 
-/// A cloneable, one-shot cancellation flag shared between a run task and the
-/// controllers that can cancel it.
+/// Locks `mutex`, recovering the guard from a poisoned lock instead of
+/// panicking.
 ///
-/// Cancellation is terminal: once [`cancel`](CancelToken::cancel) is called the
-/// token stays cancelled. [`cancelled`](CancelToken::cancelled) resolves as soon
-/// as the flag is set, using a [`Notify`] to wake a parked waiter without a
-/// busy-loop. Only the flag and notifier are touched, so signalling never
-/// borrows the session's agent.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct CancelToken {
-    inner: Arc<CancelState>,
-}
-
-#[derive(Debug, Default)]
-struct CancelState {
-    cancelled: AtomicBool,
-    notify: Notify,
-}
-
-impl CancelToken {
-    /// Marks the token cancelled and wakes any parked [`cancelled`](CancelToken::cancelled) waiter.
-    pub(crate) fn cancel(&self) {
-        self.inner.cancelled.store(true, Ordering::SeqCst);
-        self.inner.notify.notify_waiters();
-    }
-
-    /// Returns whether the token has been cancelled.
-    fn is_cancelled(&self) -> bool {
-        self.inner.cancelled.load(Ordering::SeqCst)
-    }
-
-    /// Resolves once the token is cancelled.
-    ///
-    /// The waiter is registered before the second flag check so a
-    /// [`cancel`](CancelToken::cancel) racing between the check and the await
-    /// cannot be missed.
-    pub(crate) async fn cancelled(&self) {
-        if self.is_cancelled() {
-            return;
-        }
-        let notified = self.inner.notify.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        if self.is_cancelled() {
-            return;
-        }
-        notified.await;
-    }
+/// Mirrors agent-lib's unified poison-recovery policy (M9-1): a panicking
+/// neighbour task must not cascade into every session actor through a poisoned
+/// standard-library mutex.
+fn lock_recovering<'a, T>(mutex: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// A command delivered to a single session's actor.
@@ -106,7 +63,7 @@ enum SessionCommand {
         /// Channel used to report the started run identity or a start failure.
         reply: oneshot::Sender<Result<RunId, ServiceError>>,
     },
-    /// Cancel the session's active run, if any (cancel-token side-channel).
+    /// Cancel the session's active run, if any (cancel-handle side-channel).
     CancelRun,
     /// Resolve a pending interaction request, waking the parked driver.
     RespondInteraction {
@@ -144,7 +101,7 @@ struct SessionActor {
     /// §3.6).
     store: Arc<Persistence>,
     /// Cancel handle for the active run, present only while a run is in flight.
-    cancel: Option<CancelToken>,
+    cancel: Option<CancelHandle>,
     /// Commands received while a run was active, replayed once it finishes.
     deferred: VecDeque<SessionCommand>,
     /// Sender the run task uses to hand the driver back on completion.
@@ -268,11 +225,8 @@ impl SessionActor {
         // an in-flight run rather than block until it finishes.
         let _ = reply.send(Ok(run_id));
 
-        let cancel = CancelToken::default();
+        let cancel = CancelHandle::new();
         self.cancel = Some(cancel.clone());
-        // Arm the approval handler so cancelling this run also unblocks a driver
-        // parked on a pending approval (`docs/DESIGN.md` §3.3).
-        self.approval.arm_cancel(cancel.clone());
         let events = self.events.clone();
         let store = self.store.clone();
         let run_done = self.run_done_tx.clone();
@@ -318,7 +272,13 @@ fn session_thread(
         Arc::new(AskFrontendDecider),
     ));
     let driver = match restore {
-        Some(snapshot) => SessionDriver::restore(client, &tools, approval.clone(), snapshot),
+        Some(snapshot) => SessionDriver::restore(
+            client,
+            &tools,
+            approval.clone(),
+            snapshot,
+            config.budget.as_ref(),
+        ),
         None => SessionDriver::new(&config, client, &tools, approval.clone()),
     };
     let actor = SessionActor::new(session_id, event_bus, driver, approval, store);
@@ -427,7 +387,7 @@ impl SessionManager {
                 )
             })
             .expect("spawn mag session thread");
-        self.handles.lock().expect("session handles lock").insert(
+        lock_recovering(&self.handles).insert(
             session_id,
             SessionHandle {
                 commands: commands_tx,
@@ -507,11 +467,7 @@ impl SessionManager {
 
     /// Stops a session's actor thread and forgets it.
     pub(crate) fn delete_session(&self, session_id: SessionId) {
-        let handle = self
-            .handles
-            .lock()
-            .expect("session handles lock")
-            .remove(&session_id);
+        let handle = lock_recovering(&self.handles).remove(&session_id);
         if let Some(handle) = handle {
             // Dropping the sender closes the command channel so the actor loop
             // ends; joining reaps the thread (any in-flight run is abandoned).
@@ -522,9 +478,7 @@ impl SessionManager {
 
     /// Clones the command sender for `session_id`, if an actor exists.
     fn sender(&self, session_id: SessionId) -> Option<mpsc::UnboundedSender<SessionCommand>> {
-        self.handles
-            .lock()
-            .expect("session handles lock")
+        lock_recovering(&self.handles)
             .get(&session_id)
             .map(|handle| handle.commands.clone())
     }
@@ -532,7 +486,7 @@ impl SessionManager {
 
 impl Drop for SessionManager {
     fn drop(&mut self) {
-        let handles = std::mem::take(&mut *self.handles.lock().expect("session handles lock"));
+        let handles = std::mem::take(&mut *lock_recovering(&self.handles));
         for (_, handle) in handles {
             drop(handle.commands);
             let _ = handle.thread.join();

@@ -10,8 +10,8 @@ use std::fmt;
 use agent_client_protocol::schema::v1 as acp;
 use mag_service::{
     ApprovalDecisionWire, ApprovalRequirementWire, InteractionKindWire, InteractionResponseWire,
-    PermissionCategoryWire, PermissionDecisionWire, RoutingMode, ServiceEvent, SessionConfig,
-    StepIdWire, ToolCallIdWire, ToolStatusWire, ToolTrace, UserInput,
+    PermissionCategoryWire, PermissionDecisionWire, RoutingMode, RunErrorKind, ServiceEvent,
+    SessionConfig, StepIdWire, ToolCallIdWire, ToolStatusWire, ToolTrace, UserInput,
 };
 
 /// Default AI provider used for ACP-created sessions.
@@ -105,6 +105,7 @@ pub fn new_session_request_to_config(req: &acp::NewSessionRequest) -> SessionCon
         tool_profile: None,
         cwd: Some(req.cwd.clone()),
         routing: RoutingMode::default(),
+        budget: None,
     }
 }
 
@@ -330,17 +331,24 @@ pub fn content_blocks_to_user_input(blocks: &[acp::ContentBlock]) -> UserInput {
 /// [`ServiceEvent`], or [`None`] for non-terminal events (`docs/ACP.md` §3.4).
 ///
 /// A successful [`RunFinished`](ServiceEvent::RunFinished) ends the turn with
-/// [`EndTurn`](acp::StopReason::EndTurn); a [`RunError`](ServiceEvent::RunError)
-/// maps to [`Refusal`](acp::StopReason::Refusal). mag's event stream does not yet
-/// distinguish token/turn-limit exhaustion, so `MaxTokens`/`MaxTurnRequests` are
-/// not produced here (`PLAN.md` R-5); cancellation is handled by the
-/// `session/cancel` path (M4), not this mapping. Every other event returns
+/// [`EndTurn`](acp::StopReason::EndTurn). A [`RunError`](ServiceEvent::RunError)
+/// is classified by its [`RunErrorKind`]: a client-cancelled run maps to
+/// [`Cancelled`](acp::StopReason::Cancelled) (which the ACP spec mandates for
+/// `session/cancel`), an exhausted per-turn loop limit maps to
+/// [`MaxTurnRequests`](acp::StopReason::MaxTurnRequests), and every other
+/// failure — including an exhausted session budget, for which ACP has no
+/// dedicated variant — maps to [`Refusal`](acp::StopReason::Refusal) with the
+/// human-readable message carrying the detail. Every non-terminal event returns
 /// [`None`], signalling the prompt pump that the turn has not yet terminated.
 #[must_use]
 pub fn run_terminal_to_stop_reason(event: &ServiceEvent) -> Option<acp::StopReason> {
     match event {
         ServiceEvent::RunFinished { .. } => Some(acp::StopReason::EndTurn),
-        ServiceEvent::RunError { .. } => Some(acp::StopReason::Refusal),
+        ServiceEvent::RunError { kind, .. } => Some(match kind {
+            RunErrorKind::Cancelled => acp::StopReason::Cancelled,
+            RunErrorKind::LoopLimitExceeded => acp::StopReason::MaxTurnRequests,
+            _ => acp::StopReason::Refusal,
+        }),
         _ => None,
     }
 }
@@ -949,6 +957,7 @@ mod tests {
             ServiceEvent::RunError {
                 id: sample_session_id(),
                 message: "nope".to_owned(),
+                kind: RunErrorKind::Other,
             },
             ServiceEvent::RunStarted {
                 id: sample_session_id(),
@@ -1002,9 +1011,40 @@ mod tests {
         let errored = ServiceEvent::RunError {
             id: sample_session_id(),
             message: "bad".to_owned(),
+            kind: RunErrorKind::Other,
         };
         assert_eq!(
             run_terminal_to_stop_reason(&errored),
+            Some(acp::StopReason::Refusal)
+        );
+
+        let cancelled = ServiceEvent::RunError {
+            id: sample_session_id(),
+            message: "run cancelled".to_owned(),
+            kind: RunErrorKind::Cancelled,
+        };
+        assert_eq!(
+            run_terminal_to_stop_reason(&cancelled),
+            Some(acp::StopReason::Cancelled)
+        );
+
+        let loop_limited = ServiceEvent::RunError {
+            id: sample_session_id(),
+            message: "agent loop step or tool-round limit exceeded".to_owned(),
+            kind: RunErrorKind::LoopLimitExceeded,
+        };
+        assert_eq!(
+            run_terminal_to_stop_reason(&loop_limited),
+            Some(acp::StopReason::MaxTurnRequests)
+        );
+
+        let budget_exhausted = ServiceEvent::RunError {
+            id: sample_session_id(),
+            message: "agent run budget exhausted".to_owned(),
+            kind: RunErrorKind::BudgetExhausted,
+        };
+        assert_eq!(
+            run_terminal_to_stop_reason(&budget_exhausted),
             Some(acp::StopReason::Refusal)
         );
 

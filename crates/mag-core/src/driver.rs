@@ -25,26 +25,25 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
+use std::time::Duration;
+
 use agent_lib::{
-    agent::InteractionHandler,
-    agent::WorktreeRef,
+    agent::{BudgetLimits, InteractionHandler, WorktreeRef},
     client::LlmClient,
     facade::{
-        Agent, AgentSnapshot, ApprovalPolicy, FacadeError, Tool, ToolContext, ToolResult,
-        ToolTrace as FacadeToolTrace, UsageSummary, WireRunEvent, WireRunOutput,
+        Agent, AgentSnapshot, ApprovalPolicy, CancelHandle, FacadeError, Tool, ToolContext,
+        ToolResult, ToolTrace as FacadeToolTrace, UsageSummary, WireRunEvent, WireRunOutput,
     },
 };
 use mag_service::{
-    Event, RunId as WireRunId, RunOutput, SessionConfig, SessionId, ToolCallIdWire, ToolStatusWire,
-    ToolTrace, UsageInfo,
+    Event, RunErrorKind, RunId as WireRunId, RunOutput, SessionBudget, SessionConfig, SessionId,
+    ToolCallIdWire, ToolStatusWire, ToolTrace, UsageInfo,
 };
 use mag_tools::{ToolPlugin, ToolRegistry};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::{
-    EventBus, engine::approval::IpcApproval, persistence::Persistence, session::CancelToken,
-};
+use crate::{EventBus, engine::approval::IpcApproval, persistence::Persistence};
 
 const DEFAULT_MAX_TOKENS: u32 = 512;
 const DEFAULT_MAX_STEPS: u32 = 8;
@@ -94,6 +93,9 @@ impl SessionDriver {
         if let Some(cwd) = &config.cwd {
             builder = builder.worktree(WorktreeRef::new(cwd.clone()));
         }
+        if let Some(budget) = &config.budget {
+            builder = builder.budget(budget_limits(budget));
+        }
         for tool in facade_tools {
             builder = builder.tool(tool);
         }
@@ -118,6 +120,11 @@ impl SessionDriver {
     /// off. The gated-tool policy is re-derived from the same `tools` registry so
     /// a restored session pauses on the same tools it did before.
     ///
+    /// The session's configured per-run `budget` (if any) is re-applied exactly
+    /// as [`new`](Self::new) applies it: a snapshot is data-only and deliberately
+    /// omits the budget limits, so a restored session enforces the same
+    /// [`SessionBudget`] it was created with.
+    ///
     /// # Errors
     ///
     /// Returns any [`FacadeError`] raised while rebuilding the agent (for example
@@ -127,12 +134,16 @@ impl SessionDriver {
         tools: &ToolRegistry,
         approval: Arc<IpcApproval>,
         snapshot: AgentSnapshot,
+        budget: Option<&SessionBudget>,
     ) -> Result<Self, FacadeError> {
         let (facade_tools, policy) = tool_surface(tools);
         let mut builder = Agent::restore()
             .snapshot(snapshot)
             .client(client)
             .interaction_handler(approval as Arc<dyn InteractionHandler>);
+        if let Some(budget) = budget {
+            builder = builder.budget(budget_limits(budget));
+        }
         for tool in facade_tools {
             builder = builder.tool(tool);
         }
@@ -145,7 +156,7 @@ impl SessionDriver {
     }
 
     /// Drives one user message through the facade [`Agent`] under a
-    /// [`CancelToken`], emitting the run's streamed and terminal events.
+    /// [`CancelHandle`], emitting the run's streamed and terminal events.
     ///
     /// The caller (the session actor) mints the run identity and emits
     /// [`RunStarted`](Event::RunStarted) before invoking this; `run_turn` streams
@@ -155,14 +166,19 @@ impl SessionDriver {
     /// - [`Event::RunFinished`] when the facade stream reaches its terminal
     ///   `Done`.
     /// - [`Event::RunError`] when the facade stream yields a failure, or ends
-    ///   without a terminal `Done`.
-    /// - [`Event::RunError`] carrying `"run cancelled"` when `cancel` fires while
-    ///   the turn is in flight.
+    ///   without a terminal `Done`. The [`RunErrorKind`] classifies the failure:
+    ///   agent-lib's structured `LoopLimitExceeded` / `BudgetExhausted` variants
+    ///   map onto their wire counterparts so transports can pick a precise stop
+    ///   reason without string-matching.
+    /// - [`Event::RunError`] with [`RunErrorKind::Cancelled`] when `cancel` fires
+    ///   while the turn is in flight.
     ///
-    /// Cancellation and failure both drop the facade stream before the terminal
-    /// event is emitted; agent-lib abandons the in-flight turn on drop, so the
-    /// agent's committed history is unchanged and the driver stays reusable for
-    /// the next turn.
+    /// Cancellation is cooperative through agent-lib's [`CancelHandle`]: the
+    /// facade observes the token between fulfillment batches (bounded cancel
+    /// latency), abandons the in-flight turn, and ends the stream with a
+    /// cancellation error, which this driver reports as `"run cancelled"`.
+    /// agent-lib leaves the cancelled machine parked on `Idle` with committed
+    /// history intact, so the driver stays reusable for the next turn.
     ///
     /// A run that completes cleanly reaches a **committed consistency point**, the
     /// only point at which the agent can be snapshotted (`docs/DESIGN.md` §3.6).
@@ -177,15 +193,16 @@ impl SessionDriver {
         session_id: SessionId,
         text: String,
         events: &EventBus,
-        cancel: &CancelToken,
+        cancel: &CancelHandle,
         store: &Persistence,
     ) {
-        let mut stream = match self.agent.stream(text).await {
+        let mut stream = match self.agent.stream_with_cancel(text, cancel.clone()).await {
             Ok(stream) => stream,
             Err(error) => {
                 let _ = events.emit(Event::RunError {
                     id: session_id,
                     message: error.to_string(),
+                    kind: error_kind(&error),
                 });
                 return;
             }
@@ -193,25 +210,32 @@ impl SessionDriver {
 
         let mut final_output: Option<RunOutput> = None;
         let outcome = loop {
-            tokio::select! {
-                item = stream.next() => match item {
-                    Some(Ok(event)) => {
-                        if let Some(mag_event) =
-                            map_wire_event(session_id, event.to_wire(), &mut final_output)
-                        {
-                            let _ = events.emit(mag_event);
-                        }
+            match stream.next().await {
+                Some(Ok(event)) => {
+                    if let Some(mag_event) =
+                        map_wire_event(session_id, event.to_wire(), &mut final_output)
+                    {
+                        let _ = events.emit(mag_event);
                     }
-                    Some(Err(error)) => break TurnOutcome::Failed(error.to_string()),
-                    None => break TurnOutcome::Completed,
-                },
-                () = cancel.cancelled() => break TurnOutcome::Cancelled,
+                }
+                // A cancelled run surfaces from the facade as a stream error;
+                // report it through the dedicated cancellation outcome rather
+                // than leaking agent-lib's internal cursor detail.
+                Some(Err(_)) if cancel.is_cancelled() => break TurnOutcome::Cancelled,
+                Some(Err(error)) => {
+                    break TurnOutcome::Failed {
+                        kind: error_kind(&error),
+                        message: error.to_string(),
+                    };
+                }
+                None if cancel.is_cancelled() => break TurnOutcome::Cancelled,
+                None => break TurnOutcome::Completed,
             }
         };
 
         // Release the mutable agent borrow before emitting the terminal event; a
-        // cancelled or failed turn is abandoned on drop (committed history is
-        // left intact) so the next `run_turn` on this driver can proceed.
+        // cancelled or failed turn is abandoned (committed history is left
+        // intact) so the next `run_turn` on this driver can proceed.
         drop(stream);
 
         let terminal = match outcome {
@@ -227,15 +251,18 @@ impl SessionDriver {
                 None => Event::RunError {
                     id: session_id,
                     message: "agent stream ended without a terminal `Done` event".to_owned(),
+                    kind: RunErrorKind::Other,
                 },
             },
-            TurnOutcome::Failed(message) => Event::RunError {
+            TurnOutcome::Failed { kind, message } => Event::RunError {
                 id: session_id,
                 message,
+                kind,
             },
             TurnOutcome::Cancelled => Event::RunError {
                 id: session_id,
                 message: "run cancelled".to_owned(),
+                kind: RunErrorKind::Cancelled,
             },
         };
         let _ = events.emit(terminal);
@@ -270,9 +297,37 @@ enum TurnOutcome {
     /// The facade stream reached its terminal `Done`.
     Completed,
     /// The facade stream yielded a failure carrying this message.
-    Failed(String),
-    /// The [`CancelToken`] fired while the turn was in flight.
+    Failed {
+        /// Wire classification mapped from the [`FacadeError`] variant.
+        kind: RunErrorKind,
+        /// Human-readable failure message.
+        message: String,
+    },
+    /// The run's [`CancelHandle`] fired while the turn was in flight.
     Cancelled,
+}
+
+/// Maps a [`FacadeError`] onto its wire [`RunErrorKind`] classification.
+///
+/// Only the structured terminal variants a transport can act on get a dedicated
+/// kind; everything else stays [`RunErrorKind::Other`] with the message
+/// carrying the details.
+fn error_kind(error: &FacadeError) -> RunErrorKind {
+    match error {
+        FacadeError::LoopLimitExceeded => RunErrorKind::LoopLimitExceeded,
+        FacadeError::BudgetExhausted => RunErrorKind::BudgetExhausted,
+        _ => RunErrorKind::Other,
+    }
+}
+
+/// Projects a wire [`SessionBudget`] onto agent-lib's [`BudgetLimits`].
+fn budget_limits(budget: &SessionBudget) -> BudgetLimits {
+    BudgetLimits::new(
+        budget.max_steps,
+        budget.max_tokens,
+        budget.max_cost_micros,
+        budget.max_wall_time_secs.map(Duration::from_secs),
+    )
 }
 
 /// Maps one projected [`WireRunEvent`] into a mag [`Event`].
@@ -561,6 +616,7 @@ mod tests {
             tool_profile: None,
             cwd,
             routing: mag_service::RoutingMode::ModelRouted,
+            budget: None,
         };
         let approval = std::sync::Arc::new(IpcApproval::new(
             session_id(),

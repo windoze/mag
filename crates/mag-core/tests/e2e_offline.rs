@@ -342,6 +342,7 @@ fn config(model: &str) -> SessionConfig {
         tool_profile: None,
         cwd: None,
         routing: RoutingMode::ModelRouted,
+        budget: None,
     }
 }
 
@@ -579,7 +580,7 @@ async fn full_offline_backbone_through_service() {
     assert!(
         matches!(
             &cancelled,
-            ServiceEvent::RunError { id, message } if *id == session && message == "run cancelled"
+            ServiceEvent::RunError { id, message, kind } if *id == session && message == "run cancelled" && *kind == mag_service::RunErrorKind::Cancelled
         ),
         "cancel must surface a RunError: {cancelled:?}",
     );

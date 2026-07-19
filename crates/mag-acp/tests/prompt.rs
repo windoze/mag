@@ -288,6 +288,7 @@ async fn prompt_pump_maps_run_error_to_refusal() {
         ServiceEvent::RunError {
             id: session_id(),
             message: "model refused".to_owned(),
+            kind: mag_service::RunErrorKind::Other,
         },
     ];
     let service = Arc::new(ScriptedService::new(events));

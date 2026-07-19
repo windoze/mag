@@ -37,6 +37,7 @@ fn call(name: &str, input: serde_json::Value) -> ToolCall {
         id: "call-1".to_owned(),
         name: name.to_owned(),
         input,
+        extra: Default::default(),
     }
 }
 

@@ -259,9 +259,10 @@ async fn fulfill(&self, req: &Interaction, _ctx) -> RequirementResult {
     // 逐变体映射 Interaction.kind → InteractionKindWire，带 request_id
     self.event_tx.send(Event::InteractionRequested { session_id, request_id, kind });
     // 天然暂停点：machine 停在这里，直到 interface 送回决定
+    //（cancel 令牌由 agent-lib 经 fulfill 的 RunContext 传播，见 §3.1）
     select! {
         resp = rx => RequirementResult::Interaction(resp),
-        _ = cancel_token.cancelled() => RequirementResult::Interaction(deny_default()),
+        _ = ctx.cancellation().cancelled() => RequirementResult::Interaction(deny_default()),
     }
 }
 ```

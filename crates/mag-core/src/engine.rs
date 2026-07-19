@@ -383,6 +383,7 @@ mod skeleton {
             tool_profile: None,
             cwd: None,
             routing: RoutingMode::ModelRouted,
+            budget: None,
         }
     }
 
@@ -616,6 +617,7 @@ mod chat {
             tool_profile: None,
             cwd: None,
             routing: RoutingMode::ModelRouted,
+            budget: None,
         }
     }
 
@@ -770,6 +772,101 @@ mod chat {
     }
 
     #[tokio::test]
+    async fn exhausted_budget_surfaces_structured_run_error() {
+        // A session budget of 1 token is blown by the first scripted response
+        // (usage 9): agent-lib refuses the charge and the run ends with
+        // `FacadeError::BudgetExhausted`, which mag must classify structurally.
+        let fake = FakeLlmClient::scripted(vec![text_stream_with_usage(&["hi"], usage(7, 2))]);
+        let engine = engine_with_fake(fake);
+        let mut budgeted = config("fake-chat");
+        budgeted.budget = Some(mag_service::SessionBudget {
+            max_tokens: Some(1),
+            ..mag_service::SessionBudget::default()
+        });
+        let session = engine
+            .create_session(budgeted)
+            .await
+            .expect("create session");
+        let mut events = engine.subscribe(Some(session));
+
+        engine
+            .send_message(session, UserInput::text("hi"))
+            .await
+            .expect("send message");
+
+        let terminal = loop {
+            match next_event(&mut events).await {
+                ServiceEvent::RunFinished { .. } => {
+                    panic!("a budget-exhausted run must not finish successfully")
+                }
+                error @ ServiceEvent::RunError { .. } => break error,
+                _ => continue,
+            }
+        };
+        assert!(
+            matches!(
+                terminal,
+                ServiceEvent::RunError {
+                    kind: mag_service::RunErrorKind::BudgetExhausted,
+                    ..
+                }
+            ),
+            "expected a BudgetExhausted run error, got {terminal:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_loop_limit_surfaces_structured_run_error() {
+        // Ten scripted tool-use rounds blow the facade's per-turn loop guard
+        // (max_steps 8 / max_tool_rounds 4): the run ends with
+        // `FacadeError::LoopLimitExceeded`, classified structurally so the ACP
+        // bridge can report `MaxTurnRequests`.
+        let scripts = (0..10)
+            .map(|i| {
+                crate::test_support::tool_use_stream(
+                    "read_file",
+                    &format!("call-{i}"),
+                    serde_json::json!({ "path": "README.md" }),
+                )
+            })
+            .collect();
+        let fake = FakeLlmClient::scripted(scripts);
+        let client: Arc<dyn LlmClient> = fake;
+        let engine =
+            Engine::with_llm_client_and_tools(client, mag_tools::ToolRegistry::with_builtins());
+        let session = engine
+            .create_session(config("fake-chat"))
+            .await
+            .expect("create session");
+        let mut events = engine.subscribe(Some(session));
+
+        engine
+            .send_message(session, UserInput::text("loop"))
+            .await
+            .expect("send message");
+
+        let terminal = loop {
+            match next_event(&mut events).await {
+                ServiceEvent::RunFinished { .. } => {
+                    panic!("a loop-limited run must not finish successfully")
+                }
+                error @ ServiceEvent::RunError { .. } => break error,
+                _ => continue,
+            }
+        };
+        assert!(
+            matches!(
+                terminal,
+                ServiceEvent::RunError {
+                    kind: mag_service::RunErrorKind::LoopLimitExceeded,
+                    ..
+                }
+            ),
+            "expected a LoopLimitExceeded run error, got {terminal:?}",
+        );
+    }
+
+    #[tokio::test]
     async fn subscribe_filters_events_by_session() {
         let fake = FakeLlmClient::scripted(vec![
             text_stream_with_usage(&["ignored"], usage(1, 1)),
@@ -875,6 +972,7 @@ mod session {
             tool_profile: None,
             cwd: None,
             routing: RoutingMode::ModelRouted,
+            budget: None,
         }
     }
 
@@ -1046,7 +1144,7 @@ mod session {
         assert!(
             matches!(
                 &cancelled,
-                ServiceEvent::RunError { id, message } if *id == s && message == "run cancelled"
+                ServiceEvent::RunError { id, message, kind } if *id == s && message == "run cancelled" && *kind == mag_service::RunErrorKind::Cancelled
             ),
             "expected cancellation error, got {cancelled:?}",
         );
@@ -1154,6 +1252,7 @@ mod tool_turn {
             tool_profile: None,
             cwd: None,
             routing: RoutingMode::ModelRouted,
+            budget: None,
         }
     }
 
@@ -1455,6 +1554,7 @@ mod persist {
             tool_profile: None,
             cwd: None,
             routing: RoutingMode::ModelRouted,
+            budget: None,
         }
     }
 

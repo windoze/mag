@@ -140,7 +140,11 @@ on_receive_request(async move |req: PromptRequest, responder, cx| {
             Some(ServiceEvent::DelegationStarted { .. } | ..) =>
                 cx.send_notification(.. map_delegation(..) ..)?,   // plan / tool_call 语义
             Some(ServiceEvent::RunFinished { .. }) => break StopReason::EndTurn,
-            Some(ServiceEvent::RunError { .. })    => break StopReason::Refusal, // 或按错误分类
+            Some(ServiceEvent::RunError { kind, .. }) => break match kind {  // 按 RunErrorKind 分类
+                RunErrorKind::Cancelled         => StopReason::Cancelled,
+                RunErrorKind::LoopLimitExceeded => StopReason::MaxTurnRequests,
+                _                               => StopReason::Refusal,
+            },
             None => break StopReason::EndTurn,   // 流结束
         }
     };
@@ -152,8 +156,10 @@ on_receive_request(async move |req: PromptRequest, responder, cx| {
 - **先 `subscribe` 再 `send_message`**，防止竞态丢事件。`subscribe(Some(sid))` 按会话过滤。
 - 泵**只针对本轮**：靠 `RunFinished`（本轮终态）跳出，返回 stop reason。多个并发 prompt（不同会话）各自泵
   各自的流，互不干扰（`MagService` 天然多会话）。
-- **stop reason 映射**：正常结束→`EndTurn`；被 cancel→`Cancelled`（§3.5）；模型拒绝/错误→`Refusal`；
-  达 loop/token 上限→`MaxTokens`/`MaxTurnRequests`（若 `ServiceEvent` 能区分，否则归 `EndTurn`）。
+- **stop reason 映射**：正常结束→`EndTurn`；被 cancel→`Cancelled`（§3.5，`RunError` 带
+  `RunErrorKind::Cancelled`）；模型拒绝/错误→`Refusal`；达 per-turn loop 上限（agent-lib
+  `FacadeError::LoopLimitExceeded`）→`MaxTurnRequests`；session 预算耗尽（`BudgetExhausted`）无专用
+  ACP 变体，归 `Refusal`。区分依据是 `RunError.kind`（`RunErrorKind`），不做 message 字符串匹配。
 
 ### 3.5 `session/cancel`（notification）
 
