@@ -1012,6 +1012,90 @@ async fn web_protocol_e2e_drives_engine_over_http_and_sse() {
     );
 }
 
+/// Covers the REST routes the main e2e does not drive (`TODO.md` F-R): session
+/// resume, `PUT /api/config` (update_config), and session delete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn web_protocol_e2e_covers_resume_update_config_and_delete() {
+    let dir = TempDir::new("crud");
+    let fake = FakeLlmClient::scripted(vec![text_stream(&["hello"])]);
+    let engine = engine_with_config(&dir, CONFIG, fake.clone(), registry(Gate::new()));
+    let server = spawn_web_server(engine).await;
+    let mut sse = SseClient::connect(&server).await;
+
+    let session = create_session(&server).await;
+    post_message(&server, session, "first turn").await;
+    let finished = collect_until_terminal(&mut sse, session).await;
+    assert!(matches!(
+        finished.last(),
+        Some(ServiceEvent::RunFinished { output, .. }) if output.text == "hello"
+    ));
+
+    // Resuming the live session is a no-op success; history stays available.
+    let response = http_request(
+        &server,
+        "POST",
+        &format!("/api/sessions/{session}/resume"),
+        None,
+    )
+    .await;
+    assert_eq!(response.status, 204, "resume response");
+    let history = fetch_history(&server, session).await;
+    assert!(
+        history.iter().any(|entry| matches!(
+            entry,
+            HistoryEntry::UserMessage { text, .. } if text == "first turn"
+        )),
+        "history survives resume: {history:?}"
+    );
+
+    // PUT /api/config swaps the model, broadcasts config_changed, and writes
+    // through to the config file on disk.
+    let response = http_request(&server, "GET", "/api/config", None).await;
+    assert_eq!(response.status, 200, "config get response");
+    let mut config = response_json(&response);
+    config["agents"]["default"]["model"] = json!("model-web-updated");
+    let response = http_request(&server, "PUT", "/api/config", Some(config)).await;
+    assert_eq!(response.status, 204, "update config response");
+    wait_for_event(&mut sse, "config_changed after update", |event| {
+        matches!(event, ServiceEvent::ConfigChanged { .. })
+    })
+    .await;
+    let response = http_request(&server, "GET", "/api/config", None).await;
+    assert_eq!(
+        response_json(&response)["agents"]["default"]["model"],
+        "model-web-updated",
+        "GET /api/config reads back the updated model"
+    );
+    let on_disk = fs::read_to_string(dir.config_path()).expect("read config file");
+    assert!(
+        on_disk.contains("model-web-updated"),
+        "PUT /api/config writes through to disk: {on_disk}"
+    );
+
+    // Deleting the session removes it from the list and from history.
+    let response = http_request(&server, "DELETE", &format!("/api/sessions/{session}"), None).await;
+    assert_eq!(response.status, 204, "delete response");
+    let response = http_request(&server, "GET", "/api/sessions", None).await;
+    assert_eq!(response.status, 200, "list sessions response");
+    let sessions = response_json(&response);
+    assert!(
+        !sessions
+            .as_array()
+            .expect("sessions array")
+            .iter()
+            .any(|info| info["id"] == session.to_string()),
+        "deleted session leaves the list: {sessions}"
+    );
+    let response = http_request(
+        &server,
+        "GET",
+        &format!("/api/sessions/{session}/history"),
+        None,
+    )
+    .await;
+    assert_eq!(response.status, 404, "deleted session history is gone");
+}
+
 /// Creates a session through the REST API and returns its id.
 async fn create_session(server: &TestServer) -> SessionId {
     let response = http_request(

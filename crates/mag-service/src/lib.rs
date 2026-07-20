@@ -1536,4 +1536,98 @@ mod tests {
         assert_round_trip(request_id());
         assert_round_trip(run_id());
     }
+
+    #[test]
+    fn small_wire_enums_round_trip_every_variant() {
+        // §2.4 asks every wire type to be serde round-tripped at least once;
+        // keep the small enums covered variant-by-variant so a future rename
+        // or new variant cannot silently drift from the TS generated types.
+        for kind in [
+            RunErrorKind::Other,
+            RunErrorKind::Cancelled,
+            RunErrorKind::LoopLimitExceeded,
+            RunErrorKind::BudgetExhausted,
+        ] {
+            assert_round_trip(kind);
+        }
+        for mode in [RoutingMode::ModelRouted, RoutingMode::Dispatcher] {
+            assert_round_trip(mode);
+        }
+        for status in [
+            ToolStatusWire::Started,
+            ToolStatusWire::Finished,
+            ToolStatusWire::Denied,
+            ToolStatusWire::Cancelled,
+            ToolStatusWire::Failed,
+        ] {
+            assert_round_trip(status);
+        }
+        for status in [
+            DelegationStatusWire::Started,
+            DelegationStatusWire::Finished,
+            DelegationStatusWire::Failed,
+        ] {
+            assert_round_trip(status);
+        }
+        for decision in [
+            ApprovalDecisionWire::Approve,
+            ApprovalDecisionWire::Deny,
+            ApprovalDecisionWire::Timeout,
+            ApprovalDecisionWire::Cancel,
+        ] {
+            assert_round_trip(decision);
+        }
+        for decision in [
+            PermissionDecisionWire::Approve,
+            PermissionDecisionWire::Deny {
+                reason: Some("outside workspace".to_owned()),
+            },
+            PermissionDecisionWire::Cancel,
+        ] {
+            assert_round_trip(decision);
+        }
+        for kind in [
+            SourceKindWire::LlmProvider,
+            SourceKindWire::LocalAgent,
+            SourceKindWire::ToolRuntime,
+            SourceKindWire::Other,
+        ] {
+            assert_round_trip(kind);
+        }
+        for status in [
+            SessionStatusWire::Idle,
+            SessionStatusWire::Running,
+            SessionStatusWire::AwaitingInteraction,
+        ] {
+            assert_round_trip(status);
+        }
+    }
+
+    #[test]
+    fn service_error_round_trips_every_variant() {
+        for error in [
+            ServiceError::SessionNotFound { id: session_id() },
+            ServiceError::InteractionNotFound {
+                request_id: request_id(),
+            },
+            ServiceError::InvalidInput {
+                message: "bad input".to_owned(),
+            },
+            ServiceError::NotPivotable {
+                id: session_id(),
+                reason: "no running run".to_owned(),
+            },
+            ServiceError::Unsupported {
+                operation: "fly".to_owned(),
+            },
+            ServiceError::Config {
+                message: "invalid field".to_owned(),
+            },
+            ServiceError::Backend {
+                message: "engine down".to_owned(),
+            },
+        ] {
+            assert_round_trip(error);
+        }
+    }
 }

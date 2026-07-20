@@ -442,16 +442,6 @@ enabled = false
     );
 }
 
-/// Picks a currently free loopback port for the web smoke server.
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-        .expect("bind ephemeral port");
-    listener
-        .local_addr()
-        .expect("ephemeral listener has a local address")
-        .port()
-}
-
 /// Sends one HTTP/1.1 GET over a std loopback connection and reads the full
 /// response after the server closes it.
 fn http_get(port: u16, path: &str, token: Option<&str>) -> String {
@@ -495,13 +485,15 @@ model = "claude-sonnet-4-5"
     )
     .expect("write web smoke config");
 
-    let port = free_port();
+    // Bind on port 0 and read the actual port back from the startup line:
+    // pre-picking a free port races other parallel test processes that may
+    // grab it before the child binds (TOCTOU), so the child picks instead.
     let mut child = mag()
         .arg("--web")
         .arg("--host")
         .arg("127.0.0.1")
         .arg("--port")
-        .arg(port.to_string())
+        .arg("0")
         .arg("--token")
         .arg("web-smoke-token")
         .arg("--config")
@@ -513,24 +505,38 @@ model = "claude-sonnet-4-5"
         .spawn()
         .expect("spawn mag --web");
 
+    let stderr = child.stderr.take().expect("child stderr is piped");
+    let (lines_tx, lines_rx) = std::sync::mpsc::channel::<String>();
+    let reader = thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            if lines_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
     let deadline = Instant::now() + CHILD_TIMEOUT;
-    let listening = loop {
-        if std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).is_ok() {
-            break true;
+    let port = loop {
+        match lines_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                if let Some(rest) = line.strip_prefix("mag web listening on http://127.0.0.1:") {
+                    break rest
+                        .trim_end_matches('/')
+                        .parse::<u16>()
+                        .expect("listening URL carries a port");
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "mag --web did not print its listening URL"
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("mag --web exited before printing its listening URL");
+            }
         }
-        if Instant::now() >= deadline {
-            break false;
-        }
-        thread::sleep(Duration::from_millis(50));
     };
-    if !listening {
-        let output = child.wait_with_output().expect("collect web smoke output");
-        panic!(
-            "mag --web did not start listening: status {:?}, stderr: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
 
     let unauthorized = http_get(port, "/api/sessions", None);
     assert!(
@@ -555,4 +561,5 @@ model = "claude-sonnet-4-5"
 
     child.kill().expect("kill mag --web");
     let _ = child.wait();
+    let _ = reader.join();
 }

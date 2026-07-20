@@ -724,7 +724,7 @@ client 36 + ui 29 + app-web 11 全绿）、`pnpm -r build`、`build-storybook`�
   `cargo doc --no-deps --workspace`、`pnpm format`/`lint`/`-r test`（protocol 门禁 + client 36 +
   ui 30 + app-web 12 全绿）、`pnpm -r build`、`build-storybook`。
 
-### F-R [TODO] 全计划 review
+### F-R [DONE] 全计划 review
 
 - **实现要求**：全部里程碑完成后对整轮改动做一次完整 review（可分子代理分块）：对照
   `docs/WEB.md` 全节（决策 D1–D8）逐条核对；重点：冻结契约只加不改、REST 路由表与 §2.1 一致、
@@ -733,3 +733,76 @@ client 36 + ui 29 + app-web 11 全绿）、`pnpm -r build`、`build-storybook`�
   逐项达成。发现的问题直接修复并补测试。
 - **验证条件**：默认验证序列 + `pnpm -r test`/`pnpm -r build` 全绿；完成记录列出 review 发现与
   修复清单。
+
+**完成记录（2026-07-21）**：派 4 个并行 review 子代理分块核查（后端契约+ts-rs / mag-web+bin /
+前端 ui/ / §0 清单+D1–D8+横切），四块结论一致 **放行，无 bug 级发现**；汇总的建议级发现本轮
+全部闭环（修复 7 项，其余正式记录在案）。结论 **全计划 review 通过**。
+
+**重点项核查结论**（证据详见各块 review 过程）：
+
+- **冻结契约只加不改** ✅：W1–W5 全程 mag-acp/mag-cli 触碰仅两个 commit，均为编译适配（测试
+  构造补字段、fake 补 trait stub），语义冻结；mag-service 既有签名零修改，`DelegationTrace` 新
+  字段带 `#[serde(default)]` 兼容方向安全（有旧 JSON 兼容测试）。
+- **REST 路由表** ✅：§2.1 全 16 条逐条一致（方法/路径/body/204 空体/`{id,config}`/`{run_id}`）。
+- **SSE 可靠性** ✅：帧格式 `id:` 单调 + `event:` + `data:`；15s heartbeat comment；有界队列
+  （64）溢出断连记日志；断连清理订阅；多连接独立广播；无重放（§2.2 拍板）。e2e 覆盖重连对齐
+  exactly-once、双连接序列相等、长 run heartbeat 保活。
+- **auth 三态 + 非 loopback 强制** ✅：`/api/**`（含未知路径）全过 Bearer 中间件；静态资源免
+  auth；非 loopback 忽略 `--no-auth` 强制生成 + 警告；token 不进日志/query（外部 token 不回显，
+  有测试）。本轮把 loopback `--no-auth` 提示改为警告措辞（见修复 2）。
+- **ts-rs 无手写漂移** ✅：feature-gated（默认构建 `cargo tree` 0 引用实证）；重生成 `export_ts`
+  后 `git diff` 零漂移（实证）；protocol 46 文件全 ts-rs 生成物；`protocol:check` 门禁可用。
+- **依赖边界** ✅：`cargo tree -p mag-web` 恰为白名单（mag-service+axum+tokio+futures+serde+
+  rust-embed，无 mag-core/agent-lib/mag-config）；pnpm 方向 app-web→ui/client→protocol 单向
+  （package.json 声明与实际 import 双重核实）。
+- **secret 纪律** ✅：SecretRef 仅 `{env}`/`{keyring}` 引用形态（生成物同）；解析只在装配期；
+  全仓无解析后值输出路径；app/client 零 `console.*`、零 `process.env`。
+- **离线测试纪律** ✅：Rust 全 scripted/fake/内存/回环；前端 fixture 驱动；唯一 `#[ignore]`
+  为既有 ACP 手动测试（缺环境干净跳过）；真实浏览器联调为 ui/README.md 手动 7 步清单。
+- **rustdoc/TSDoc** ✅：各 crate `#![warn(missing_docs)]`，`cargo doc` 零警告；client/ui 公开
+  导出 TSDoc 抽查到位。
+- **§0 目标清单** ✅ 八项全部端到端接线核实（UI→client→REST→MagService→Engine 完整链路）；
+  D1–D8 逐条兑现（D7 slash↔GUI 映射对照 CLI.md 无遗漏；D1 的 Capabilities 对象见记录在案②）。
+
+**修复清单**（本轮全部补测试）：
+
+1. **`--acp --web` 互斥分支无单测**（W2-R 建议②）：main.rs 新增
+   `acp_and_web_are_mutually_exclusive`。
+2. **loopback `--no-auth` 提示非警告措辞**（W2-R 建议③，与 §4「打印警告」字面不符）：改为
+   `warning: mag web auth is disabled (--no-auth); any local process can call the API`，新增
+   `web_startup_warns_when_auth_is_disabled`。
+3. **小枚举变体级 roundtrip 缺口**（§2.4「每个 wire 类型至少一次」）：mag-service 新增
+   `small_wire_enums_round_trip_every_variant`（8 个小枚举全变体）与
+   `service_error_round_trips_every_variant`（全 7 变体）。
+4. **resume/delete/PUT config 缺协议级 e2e**（W2-R 建议④）：web_e2e 新增
+   `web_protocol_e2e_covers_resume_update_config_and_delete`（resume 204+history 存续、
+   PUT 204+`config_changed`+GET 回读+落盘 write-through、delete 204+列表消失+history 404）。
+5. **bin web smoke flaky**（review 实测 1/6 失败）：`free_port()` 先绑后放 TOCTOU，并行测试
+   进程可抢端口。改为 `--port 0` 由子进程自选端口、从 stderr 启动行解析实际端口（mpsc+超时），
+   竞态按构造消除。
+6. **docs/WEB.md spec 文本滞后三处**：§5.2 删「（+ always）」并注明 wire 无该变体（CLI/ACP
+   既有拍板）；§5.1「hover 菜单」改「hover 删除按钮」（与实现一致）；§2.3 补注请求体反序列化
+   失败走 axum 原生 400/422 体而非 `{kind,message}`（前端按 `http_<status>` 降级）。
+7. **根 README.md 滞后**：Workspace 清单补 mag-config/mag-cli/mag-acp/mag-web/mag bin 并去掉
+   「skeleton」措辞；Usage 补三 interface 用法（`mag` / `--acp` / `--web` 全部 flags 与 token
+   模型、debug 读 dist/release 嵌入）。
+
+**记录在案的偏差/限制（review 确认为首版可接受，正式立案）**：①`list_sessions` 标题投影对
+受损快照硬错误且为全量投影（仅外部破坏/引擎 bug 可触发，正常路径快照由引擎自写；W1-R 起在案，
+建议后续投影容错+commit 时物化 title）；②§6.4 显式 Capabilities 对象未预留——`ITransport.kind`
++ Command 编码同构已构成探测基础，web 壳当前无 capability 条件渲染需求，desktop 阶段第一批任务
+补对象定义与注入点；③delegation 消息不入 history——页面内 resume/重连由 store 重挂兜住，跨页面
+加载子线程消息丢失需 wire 扩展；④跨标签页应答的陈旧 pending 卡（wire 无 interaction-resolved
+事件；idle 校正防卡死、404 上浮已有缓解）；⑤pivot notices 在 history replace 后清空（轻量系统
+消息短暂性，pivot 文本本体经 history 存续）；⑥selector 浅拷贝共享可变 item（React 侧只读消费
+无实际风险）；⑦`get_session_history` 无默认 trait 实现（仓外实现者升级需补方法，契约演进备注）；
+⑧mag-web 库内诊断用 `eprintln` 而非 tracing（无功能影响）；⑨`POST /sessions` 响应 config 为
+请求体回显（受 service 签名所限，符合文档）；⑩ts-rs 漂移门禁无 CI 承载（`protocol:check` 本地
+可用，引入 CI 时列为第一批）；⑪Approval 无 always 按钮（wire 限制，§5.2 文本本轮已修订闭环）；
+⑫xl 断点以下右栏不可达（§0 非目标明确不做窄屏适配）。
+
+**验证通过**：`cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、聚焦
+（mag-service round_trip 15、mag bin 6、`cargo test -p mag --test web_e2e` 5/5、
+`cargo test -p mag --test cli web_binary`）、`cargo test --workspace` 全绿（唯一 ignored 为
+既有 ACP 手动骨架）、`cargo doc --no-deps --workspace` 零警告；`pnpm format`/`lint`/`-r test`
+（protocol 门禁 + client 36 + ui 30 + app-web 12 全绿）/`-r build`。

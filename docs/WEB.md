@@ -173,7 +173,9 @@ HTTP 状态码 + JSON 错误体 `{kind, message}`：
 
 `kind` 为变体 snake_case tag；message 原样（secret 纪律继承：永不含量化 secret）。前端按 kind 分支
 （如 `not_pivotable` → composer 自动回落 POST messages，§5.4）。非 `ServiceError` 的内部错误一律
-500 + 通用 message，不泄漏内部细节。
+500 + 通用 message，不泄漏内部细节。请求体反序列化失败（畸形 JSON、类型不符）由 axum 提取器直接
+拒绝，响应为其原生 400/422 错误体而非 `{kind,message}`——只会在客户端自身发出畸形请求时触发，
+前端按 `http_<status>` kind 降级处理，不影响上表的业务错误分支。
 
 ### 2.4 TS 类型同步纪律（决策 D3，Q3 拍板）
 
@@ -234,7 +236,7 @@ DTO）相关类型加 `#[derive(TS)]`（feature-gated 依赖），`cargo test -p
   模式），组内按最近活动排序；每项显示标题（§3 P4）、相对时间、状态徽标（running /
   awaiting-interaction / idle）。
 - 恢复即点击：`POST .../resume` → `GET .../history` 渲染 thread view（含 tool call 记录）。
-- 删除：条目 hover 菜单 `DELETE /api/sessions/{id}`，二次确认（不可逆操作）。
+- 删除：条目 hover 删除按钮触发 `DELETE /api/sessions/{id}`，二次确认（不可逆操作）。
 
 ### 5.2 主区 thread view
 
@@ -248,7 +250,8 @@ DTO）相关类型加 `#[derive(TS)]`（feature-gated 依赖），`cargo test -p
   delegate 的子线程视图。子线程内容由 origin 带 delegate 标注的事件汇聚（决策 D5 的 origin 归因在
   此兑现：交互卡与工具卡都标注 `[from <delegate>@depth<n>]`）。
 - **交互卡**（最高视觉优先级）：`interaction_requested` 渲染为内联阻塞卡——
-  - Approval：工具名 + 输入摘要 + risk/category（Permission 变体）+ 批准/拒绝（+ always）；
+  - Approval：工具名 + 输入摘要 + risk/category（Permission 变体）+ 批准/拒绝（无 always：
+    wire `ApprovalDecisionWire` 不含该变体，沿用 CLI/ACP 的既有拍板——mag 无持久 always 语义）；
   - Question：问题文本 + 输入框 → `Answer{text}`；
   - Choice：选项列表 → `Choice{index}`；
   - origin 非 root 时卡片顶部显示来源徽标。

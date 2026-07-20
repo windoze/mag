@@ -348,7 +348,10 @@ fn print_web_startup(
         }
         (None, _) => {
             let _ = writeln!(write, "mag web listening on {base_url}");
-            let _ = writeln!(write, "mag web auth is disabled");
+            let _ = writeln!(
+                write,
+                "warning: mag web auth is disabled (--no-auth); any local process can call the API"
+            );
         }
     }
 }
@@ -466,6 +469,13 @@ mod tests {
     }
 
     #[test]
+    fn acp_and_web_are_mutually_exclusive() {
+        let error = parse(&["--acp", "--web"]).expect_err("--acp with --web must fail");
+
+        assert!(error.contains("--acp and --web"));
+    }
+
+    #[test]
     fn token_and_no_auth_are_mutually_exclusive() {
         let error = parse(&["--web", "--token", "secret", "--no-auth"])
             .expect_err("conflicting auth flags must fail");
@@ -487,5 +497,15 @@ mod tests {
         assert!(external.contains("http://127.0.0.1:8080/"));
         assert!(!external.contains("external-token"));
         assert!(external.contains("externally supplied token"));
+    }
+
+    #[test]
+    fn web_startup_warns_when_auth_is_disabled() {
+        let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+        let mut output = Vec::new();
+        print_web_startup(address, None, false, &mut output);
+        let output = String::from_utf8(output).expect("utf-8 output");
+        assert!(output.contains("http://127.0.0.1:8080/"));
+        assert!(output.contains("warning: mag web auth is disabled"));
     }
 }
