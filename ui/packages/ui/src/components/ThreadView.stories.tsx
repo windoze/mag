@@ -107,6 +107,14 @@ export const PivotAndErrors: Story = {
       },
       {
         type: "run_error",
+        error: {
+          id: "loop",
+          kind: "loop_limit_exceeded",
+          message: "The agent hit the configured loop limit."
+        }
+      },
+      {
+        type: "run_error",
         error: { id: "other", kind: "other", message: "Unexpected backend error." }
       }
     ]

@@ -514,13 +514,36 @@ CI 承载（引入 CI 时列为第一批）；⑥tool 输出为 agent-lib Conten
   （git status 实证），`cargo test --workspace` 与 `cargo doc` 复用 W3-4（`0fe4985`）全绿结果，
   按规则跳过重跑。
 
-### W4-2 [TODO] pivot/cancel 完备 + run 状态
+### W4-2 [DONE] pivot/cancel 完备 + run 状态
 
 - **上下文**：`docs/WEB.md` §5.2/§5.4（决策 D6）。
 - **实现要求**：`pivot_queued/applied/dropped` 渲染为轻量系统消息；`run_error` 按 `RunErrorKind`
   分类渲染（cancelled/budget/loop 非错误色）；composer 状态机完备（idle/running/pending 交互三态
   文案与按钮）；多会话并行时右栏全局 running 列表。
 - **验证条件**：vitest + Storybook 新增态；`pnpm -r test`/`pnpm -r build` 绿。
+
+完成记录（2026-07-21）：
+
+- 现状核查：pivot 三态（`pivot_queued/applied/dropped` → store `PivotNotice` 去重 + ThreadView
+  轻量 `SystemNotice`）、`run_error` 按 `RunErrorKind` 分类渲染（`other`→destructive，
+  cancelled/budget/loop→muted 非错误色）、composer 三态（idle「Send」/running「Insert
+  pivot…」+ Cancel/pending 交互计数徽标不阻塞输入）在 W3 已落地；本任务补齐验证与缺口。
+- **缺口修复——全局 running 跨会话跳转**（§5.3）：右栏「Running sessions」从静态 div 改为
+  可点按钮，点击经 `openSession`（resume + history）跳转到对应会话；当前会话高亮；run 终态
+  自动移出列表。
+- 新增测试：`@mag/client` pivot 全生命周期（queued 连续重复去重/applied/dropped+reason/
+  thread 投影）+ `run_error` kind 保留（cancelled→error 态、后续 run budget_exhausted 恢复
+  覆盖）；`@mag/ui` 新增 `ThreadView.test.tsx`（pivot 四则文案、四种 RunErrorKind 标签与
+  tone 分类断言）与 `Composer.test.tsx`（idle 无 Cancel/running pivot 文案+Cancel 回调+
+  提交载荷/pending 单复数徽标+输入不阻塞）；app-web 壳级测试（两会话并行 running 列表、
+  点击跨会话跳转断言 resume+history、run_finished 后移出列表）。
+- Storybook：`Core/ThreadView` 的 PivotAndErrors 补 `loop_limit_exceeded`，四种
+  RunErrorKind 视觉态齐备；pivot queued/applied/dropped 与 Composer 四态此前已覆盖。
+- 验证通过：`pnpm format:write`、`pnpm format`、`pnpm lint`、`pnpm -r test`（protocol 门禁
+  + client 17 + ui 18 + app-web 5 全绿）、`pnpm -r build`、`build-storybook`、
+  `cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`。Rust 源码本轮
+  零改动（git status 实证），`cargo test --workspace` 与 `cargo doc` 复用 W3-4（`0fe4985`）
+  全绿结果，按规则跳过重跑。
 
 ### W4-3 [TODO] ConfigEditor（文本形态）+ Sources 页
 

@@ -193,6 +193,48 @@ describe("App", () => {
     await act(async () => rendered.root.unmount());
   });
 
+  it("lists globally running sessions in the right rail and jumps across sessions", async () => {
+    const transport = new ScriptedTransport();
+    const rendered = await renderApp(<App transport={transport} storage={new MemoryStorage()} />);
+
+    await waitFor(() => rendered.container.textContent?.includes("Inspect README") === true);
+    await click(getButton(rendered.container, "Inspect README"));
+    await waitFor(() => rendered.container.textContent?.includes("The README is short.") === true);
+
+    await act(async () => {
+      transport.emit({ type: "run_started", id: sessionId, run_id: "run-a" });
+      transport.emit({ type: "run_started", id: "session-new", run_id: "run-b" });
+    });
+
+    const rail = getByLabel(rendered.container, "Session progress rail");
+    await waitFor(() => rail.textContent?.includes("Running run-b") === true);
+    expect(rail.textContent).toContain("Running sessions");
+    expect(rail.textContent).toContain("New shell session");
+
+    // Clicking a running session in the rail jumps to it (resume + history).
+    await click(getButton(rail, "New shell session"));
+    await waitFor(() =>
+      transport.sent.some(
+        (command) => command.type === "resume_session" && command.id === "session-new"
+      )
+    );
+    expect(
+      transport.sent.some(
+        (command) => command.type === "get_session_history" && command.id === "session-new"
+      )
+    ).toBe(true);
+
+    // A finished run leaves the global running list.
+    transport.sent.length = 0;
+    await act(async () => {
+      transport.emit({ type: "run_finished", id: "session-new", output: { text: "done" } });
+    });
+    await waitFor(() => rail.textContent?.includes("Running run-b") === false);
+    expect(rail.textContent).toContain("Running run-a");
+
+    await act(async () => rendered.root.unmount());
+  });
+
   it("routes Sources and Config placeholders from the sidebar", async () => {
     const rendered = await renderApp(
       <App transport={new ScriptedTransport()} storage={new MemoryStorage()} />

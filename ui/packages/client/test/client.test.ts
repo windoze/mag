@@ -235,6 +235,60 @@ describe("@mag/client", () => {
     });
   });
 
+  it("records the full pivot lifecycle and classifies run errors by kind", () => {
+    const store = new SessionStore(new ScriptedTransport());
+
+    store.applyEvent({ type: "run_started", id: sessionId, run_id: "run-live" });
+    store.applyEvent({ type: "pivot_queued", id: sessionId });
+    // Consecutive duplicates collapse into a single notice.
+    store.applyEvent({ type: "pivot_queued", id: sessionId });
+    store.applyEvent({ type: "pivot_applied", id: sessionId });
+    store.applyEvent({ type: "pivot_dropped", id: sessionId, reason: "run already completed" });
+
+    let session = store.selectSession(sessionId)!;
+    expect(session.pivotNotices.map((notice) => [notice.status, notice.reason])).toEqual([
+      ["queued", undefined],
+      ["applied", undefined],
+      ["dropped", "run already completed"]
+    ]);
+    expect(
+      session.thread.filter((item) => item.type === "pivot").map((item) => item.notice.status)
+    ).toEqual(["queued", "applied", "dropped"]);
+
+    store.applyEvent({
+      type: "run_error",
+      id: sessionId,
+      message: "Run cancelled by user.",
+      kind: "cancelled"
+    });
+    session = store.selectSession(sessionId)!;
+    expect(session.run).toEqual({
+      state: "error",
+      message: "Run cancelled by user.",
+      kind: "cancelled"
+    });
+    expect(session.status).toBe("idle");
+    expect(session.thread.at(-1)).toMatchObject({
+      type: "run_error",
+      error: { kind: "cancelled", message: "Run cancelled by user." }
+    });
+
+    // A later run recovers and a different error kind is preserved verbatim.
+    store.applyEvent({ type: "run_started", id: sessionId, run_id: "run-next" });
+    store.applyEvent({
+      type: "run_error",
+      id: sessionId,
+      message: "Token budget reached.",
+      kind: "budget_exhausted"
+    });
+    session = store.selectSession(sessionId)!;
+    expect(session.run).toEqual({
+      state: "error",
+      message: "Token budget reached.",
+      kind: "budget_exhausted"
+    });
+  });
+
   it("groups two-level delegation messages and origin-attributed interactions per delegate", () => {
     const store = new SessionStore(new ScriptedTransport());
     const events = [

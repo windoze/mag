@@ -296,6 +296,9 @@ export function App(props: AppProps = {}): React.JSX.Element {
           );
         }}
         onSelectDelegate={openDelegateGroup}
+        onSelectSession={(sessionId) =>
+          void runAction("open-session", async () => openSession(sessionId))
+        }
       />
     </main>
   );
@@ -527,6 +530,7 @@ function RightRail({
   onCloseDelegate,
   onRespondInteraction,
   onSelectDelegate,
+  onSelectSession,
   selectedDelegate,
   sessions
 }: {
@@ -536,6 +540,7 @@ function RightRail({
   readonly onCloseDelegate: () => void;
   readonly onRespondInteraction: (requestId: string, response: InteractionResponseView) => void;
   readonly onSelectDelegate: (delegate: string) => void;
+  readonly onSelectSession: (sessionId: string) => void;
   readonly selectedDelegate?: string;
   readonly sessions: readonly SessionView[];
 }): React.JSX.Element {
@@ -622,10 +627,21 @@ function RightRail({
             </p>
           ) : (
             runningSessions.map((session) => (
-              <div className="rounded-lg border border-border p-3 text-sm" key={session.id}>
-                <p className="truncate font-medium">{session.info?.title ?? session.id}</p>
-                <p className="text-xs text-muted-foreground">{runSummary(session.run)}</p>
-              </div>
+              <button
+                className={`w-full rounded-lg border p-3 text-left text-sm transition hover:border-primary/40 ${
+                  session.id === activeSession?.id
+                    ? "border-primary/60 bg-primary/5"
+                    : "border-border"
+                }`}
+                key={session.id}
+                type="button"
+                onClick={() => onSelectSession(session.id)}
+              >
+                <span className="block truncate font-medium">
+                  {session.info?.title ?? session.id}
+                </span>
+                <span className="text-xs text-muted-foreground">{runSummary(session.run)}</span>
+              </button>
             ))
           )}
         </div>
