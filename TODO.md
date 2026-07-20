@@ -1351,12 +1351,57 @@ GUI/web/CLI 无需感知多个会话通道。
     `cargo clippy --all-targets -- -D warnings` ✅ 4) `cargo test --workspace` ✅（全绿，1 ignored 为既有 zed 联调
     测试）5) `cargo doc --no-deps --workspace` ✅（0 warning）。
 
-### M6-R [TODO] M6 review
+### M6-R [DONE] M6 review
 
 - **实现要求**：对照 `docs/CLI.md` §0 目标清单逐项核对验证覆盖：流式对话/工具权限/通用交互/多 agent
   编排（含 external ACP）/协作/持久化恢复/cancel/pivot/配置动态生效。检查依赖边界（`cargo tree -p
   mag-cli` 无 mag-core/agent-lib/mag-config）。发现问题直接修复并补测试。
 - **验证条件**：默认验证序列全过；完成记录逐项列出 §0 验证清单结论。
+
+  **完成记录**（2026-07-20）：
+  - review 范围：对照 `docs/CLI.md` §0 目标清单与 §1/§2/§3.3 关键 CLI 语义，复核 `crates/mag-cli`
+    实现与 scripted e2e、`crates/mag` bin smoke、真实 Engine+CLI e2e、M6-1..M6-5 当前 diff；并检查
+    `mag-cli` 依赖边界。
+  - 发现与修复（4 项，均已修并补测试）：
+    1. **后台会话 interaction 被丢弃**：`PromptCoordinator::enqueue` 原先对非当前会话只打印提示后返回，
+       `/resume` 回去后无法应答，可能让后台 run 永久 pending。修复为队列保留所有会话 interaction，
+       `prompt_next(current_session)` 只弹当前会话项；切换会话后立即恢复该会话 pending prompt；`/quit` 时取消
+       已排队交互，避免退出等待被 pending run 卡住。新增
+       `background_session_interaction_is_answered_after_resume`。
+    2. **delegation 事件未渲染**：`render_event` 原先吞掉 `DelegationStarted/Finished/Failed/Message`，与
+       §0「Delegation* 事件渲染」不符。新增一行摘要渲染（delegate/task/output/message），并顺手补
+       `ToolStarted/ToolFinished` 摘要，方便 CLI 观察工具执行面。新增 `delegation_events_are_rendered`。
+    3. **Interaction 四种 kind 覆盖不全**：scripted e2e 原先只覆盖 Approval/Question/Choice。扩展
+       `prompt_coordinator_answers_queued_interactions_in_order`，加入 Permission（含 delegate origin、category、risk、
+       subject、reason）并断言 `PermissionDecisionWire::Approve` 正确回灌。
+    4. **真实 Engine+CLI e2e 覆盖偏弱**：补强 `engine_cli.rs`：`/config reload` 后执行 `/config apply` 并断言
+       下一 turn 使用新 model；新增跨 Engine 持久化恢复测试，第二个 Engine `resume` 后继续对话且 LLM request
+       上下文包含重启前 user/assistant 历史；pivot 测试新增断言 pivot 文本进入后续 LLM request；local/external
+       delegation e2e 均断言 CLI 输出包含 delegation started/finished 与 delegate 名。
+  - §0 验证清单结论：
+    1. **基本 agent 对话 + 流式输出** ✅——scripted `mag-cli` e2e 覆盖 `send_message`、`TextDelta` 分块打印、
+       `RunFinished` usage 摘要；真实 Engine+CLI 对话路径继续覆盖。
+    2. **用户交互** ✅——Approval/Question/Choice/Permission 四类均经 CLI prompt 渲染并通过
+       `respond_interaction` 回灌；delegate origin 前缀与后台会话切换后应答均有 e2e。
+    3. **多 agent 编排** ✅——真实 Engine+CLI 覆盖 local `ask_researcher` 与 external ACP `ask_peer`；CLI 现在渲染
+       DelegationStarted/Finished/Failed/Message，其中 production 当前会发 started/finished，Message/Failed 渲染由
+       scripted service 覆盖事件族。
+    4. **agent 间协作** ✅——M4/M5 已验证 delegate 交互穿透到 root；M6 scripted e2e 验证 CLI 对带 origin 的
+       delegate interaction 逐项提示/应答，真实 Engine+CLI 覆盖 local/external 委派路径可见。
+    5. **会话持久化与恢复** ✅——bin smoke 覆盖 `--resume`；新增真实 Engine+CLI 跨 Engine restart 恢复，断言
+       恢复后继续对话时上下文包含重启前 committed 历史；`/sessions`/`/resume`/`/delete` scripted 命令面继续覆盖。
+    6. **cancel + pivot** ✅——scripted CLI 覆盖 run 中 pivot、`NotPivotable` 自动回落、Ctrl-C cancel；真实 Engine+CLI
+       覆盖 pivot queued/applied、pivot 文本进入下一次 LLM request、stalling run Ctrl-C 后 `RunError{cancelled}`。
+    7. **运行时配置系统** ✅——bin 路径覆盖启动读配置和缺失/损坏/secret 诊断；CLI `/config show|reload|apply`
+       scripted e2e 覆盖 service 方法与 `ConfigChanged` 渲染；真实 Engine+CLI 覆盖 reload 后显式 apply 到 live idle
+       session，下一 turn 使用新配置。
+  - 依赖边界：`cargo tree -p mag-cli -e normal --depth 1` 显示 direct normal 依赖仅为 `futures`、`mag-service`、
+    `rustyline`、`tokio`；源码/Cargo.toml 无直接 `mag-core`/`agent-lib`/`mag-config` 引用。完整 tree 中
+    `mag-config` 仅通过 `mag-service` 的契约 DTO re-export 传递出现（M3-4 决策），无 `mag-core`/`agent-lib`。
+  - 门禁结果：1) `cargo fmt --all -- --check` ✅ 2) 聚焦测试 ✅：`cargo test -p mag-cli`（10 passed）与
+    `cargo test -p mag --test engine_cli`（4 passed）3) `cargo clippy --all-targets -- -D warnings` ✅
+    4) `cargo test --workspace` ✅（全绿，1 ignored 为既有 zed 联调测试）5) `cargo doc --no-deps --workspace` ✅
+    （0 warning）。
 
 ---
 

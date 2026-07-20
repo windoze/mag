@@ -36,7 +36,7 @@ use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use mag_cli::{Cli, CliOptions};
 use mag_core::{ConfigService, Engine};
-use mag_service::{MagService, RoutingMode, SessionConfig};
+use mag_service::{MagService, RoutingMode, SessionConfig, SessionId};
 use mag_tools::{ToolPlugin, ToolRegistry};
 use serde_json::{Value, json};
 use tokio::{
@@ -358,11 +358,23 @@ fn spawn_cli(
     tokio::io::DuplexStream,
     JoinHandle<Result<(), mag_cli::CliError>>,
 ) {
+    spawn_cli_with_options(engine, cli_options())
+}
+
+/// Spawns the real CLI with caller-supplied options.
+fn spawn_cli_with_options(
+    engine: Engine,
+    options: CliOptions,
+) -> (
+    tokio::io::DuplexStream,
+    tokio::io::DuplexStream,
+    JoinHandle<Result<(), mag_cli::CliError>>,
+) {
     let (stdin_writer, stdin_reader) = tokio::io::duplex(2048);
     let (stdout_writer, stdout_reader) = tokio::io::duplex(16 * 1024);
     let service: Arc<dyn MagService> = Arc::new(engine);
     let run = tokio::spawn(async move {
-        Cli::run_with_io(service, cli_options(), stdin_reader, stdout_writer).await
+        Cli::run_with_io(service, options, stdin_reader, stdout_writer).await
     });
     (stdin_writer, stdout_reader, run)
 }
@@ -456,6 +468,7 @@ async fn engine_cli_runs_dialog_ask_user_local_delegate_and_config_reload() {
         tool_use_stream("ask_researcher", "del-1", json!({ "task": "research" })),
         text_stream(&["research summary"]),
         text_stream(&["local final"]),
+        text_stream(&["reloaded final"]),
     ]);
     let engine = engine_with_config(
         &dir,
@@ -496,6 +509,18 @@ async fn engine_cli_runs_dialog_ask_user_local_delegate_and_config_reload() {
     read_until(&mut stdout, &mut output, "[config reloaded]").await;
     read_until(&mut stdout, &mut output, "[config changed revision=1]").await;
 
+    stdin
+        .write_all(b"/config apply\n")
+        .await
+        .expect("apply reloaded config");
+    read_until(&mut stdout, &mut output, "next turn boundary").await;
+    stdin
+        .write_all(b"after apply\n")
+        .await
+        .expect("send after apply");
+    read_until(&mut stdout, &mut output, "reloaded final").await;
+    read_until_count(&mut stdout, &mut output, "[finished", 4).await;
+
     finish_cli(stdin, run).await;
 
     assert_eq!(fake.chat_requests().len(), 1, "local delegate ran once");
@@ -509,6 +534,79 @@ async fn engine_cli_runs_dialog_ask_user_local_delegate_and_config_reload() {
         first_tools.contains(&"ask_user") && first_tools.contains(&"ask_researcher"),
         "CLI drove an Engine with ask_user and local delegation tools: {first_tools:?}"
     );
+    assert!(
+        output.contains("[delegation started") && output.contains("delegate=researcher"),
+        "local delegation lifecycle is rendered: {output}"
+    );
+    assert!(
+        output.contains("[delegation finished") && output.contains("delegate=researcher"),
+        "local delegation finish is rendered: {output}"
+    );
+    assert_eq!(
+        stream_requests
+            .last()
+            .expect("request after /config apply")
+            .model,
+        "model-main-reloaded",
+        "/config apply should reconfigure the live idle session before the next turn"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engine_cli_resumes_persisted_session_after_engine_restart() {
+    let dir = TempDir::new("persisted-resume");
+    let db = dir.0.join("sessions.db");
+
+    let fake1 = FakeLlmClient::scripted(vec![text_stream(&["persisted first"])]);
+    let client1: Arc<dyn LlmClient> = fake1;
+    let engine1 = Engine::with_persistence(client1, ToolRegistry::with_builtins(), &db)
+        .expect("open first persisted engine");
+    let (mut stdin1, mut stdout1, run1) = spawn_cli(engine1);
+    let mut output1 = String::new();
+
+    read_until(&mut stdout1, &mut output1, "[session ").await;
+    let session_id = first_session_id(&output1);
+    stdin1
+        .write_all(b"remember me\n")
+        .await
+        .expect("send persisted turn");
+    read_until(&mut stdout1, &mut output1, "persisted first").await;
+    read_until_count(&mut stdout1, &mut output1, "[finished", 1).await;
+    finish_cli(stdin1, run1).await;
+
+    let fake2 = FakeLlmClient::scripted(vec![text_stream(&["after restart"])]);
+    let fake2_probe = fake2.clone();
+    let client2: Arc<dyn LlmClient> = fake2;
+    let engine2 = Engine::with_persistence(client2, ToolRegistry::with_builtins(), &db)
+        .expect("open restarted persisted engine");
+    let mut resumed_options = cli_options();
+    resumed_options.resume = Some(SessionId::parse_str(&session_id).expect("session id"));
+    let (mut stdin2, mut stdout2, run2) = spawn_cli_with_options(engine2, resumed_options);
+    let mut output2 = String::new();
+
+    read_until(
+        &mut stdout2,
+        &mut output2,
+        &format!("[session {session_id} resumed]"),
+    )
+    .await;
+    stdin2
+        .write_all(b"continue after restart\n")
+        .await
+        .expect("send resumed turn");
+    read_until(&mut stdout2, &mut output2, "after restart").await;
+    read_until_count(&mut stdout2, &mut output2, "[finished", 1).await;
+    finish_cli(stdin2, run2).await;
+
+    let requests = fake2_probe.stream_requests();
+    assert_eq!(requests.len(), 1, "resumed CLI should drive one new turn");
+    let restored_context = format!("{:?}", requests[0].messages);
+    for fragment in ["remember me", "persisted first", "continue after restart"] {
+        assert!(
+            restored_context.contains(fragment),
+            "restored CLI context is missing `{fragment}`: {restored_context}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -545,6 +643,12 @@ async fn engine_cli_pivots_and_cancels_real_engine_runs() {
     read_until(&mut stdout, &mut output, "[pivot applied").await;
     read_until(&mut stdout, &mut output, "pivot complete").await;
     read_until_count(&mut stdout, &mut output, "[finished", 1).await;
+    let pivot_requests = fake.stream_requests();
+    assert!(
+        format!("{:?}", pivot_requests[1].messages).contains("pivot update"),
+        "pivot text should enter the follow-up LLM request: {:?}",
+        pivot_requests[1].messages
+    );
 
     stdin
         .write_all(b"cancel target\n")
@@ -663,6 +767,14 @@ async fn engine_cli_runs_external_acp_delegate_and_resume_command() {
         .expect("send external delegation");
     read_until(&mut stdout, &mut output, "external final").await;
     read_until_count(&mut stdout, &mut output, "[finished", 1).await;
+    assert!(
+        output.contains("[delegation started") && output.contains("delegate=peer"),
+        "external delegation start is rendered: {output}"
+    );
+    assert!(
+        output.contains("[delegation finished") && output.contains("delegate=peer"),
+        "external delegation finish is rendered: {output}"
+    );
 
     let log_text = fs::read_to_string(&log).expect("fake ACP log");
     assert!(

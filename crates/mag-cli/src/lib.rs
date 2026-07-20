@@ -16,11 +16,11 @@ use std::sync::Arc;
 
 use futures::{Stream, StreamExt};
 use mag_service::{
-    ApprovalDecisionWire, ApprovalRequirementWire, ConfigDto, InteractionKindWire,
-    InteractionOrigin, InteractionResponseWire, MagService, PermissionCategoryWire,
-    PermissionDecisionWire, PermissionRiskWire, RequestId, RoutingMode, RunErrorKind, ServiceError,
-    ServiceEvent, SessionConfig, SessionId, SessionInfo, SourceInfo, SourceKindWire, StepIdWire,
-    ToolCallIdWire, UserInput,
+    ApprovalDecisionWire, ApprovalRequirementWire, ConfigDto, DelegationMessageWire,
+    DelegationTrace, InteractionKindWire, InteractionOrigin, InteractionResponseWire, MagService,
+    PermissionCategoryWire, PermissionDecisionWire, PermissionRiskWire, RequestId, RoutingMode,
+    RunErrorKind, ServiceError, ServiceEvent, SessionConfig, SessionId, SessionInfo, SourceInfo,
+    SourceKindWire, StepIdWire, ToolCallIdWire, ToolStatusWire, ToolTrace, UserInput,
 };
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, Stdout};
 use tokio::sync::{Mutex, mpsc};
@@ -210,20 +210,22 @@ impl PromptCoordinator {
     where
         W: AsyncWrite + Send + Unpin + 'static,
     {
-        if interaction.session_id != current_session {
+        let interaction_session = interaction.session_id;
+        self.queue.push_back(interaction);
+
+        if interaction_session != current_session {
             write_line(
                 output,
                 &format!(
                     "\n[interaction pending for session {}; switch sessions to answer it]\n",
-                    interaction.session_id
+                    interaction_session
                 ),
             )
             .await?;
             return Ok(());
         }
 
-        self.queue.push_back(interaction);
-        self.prompt_next(output).await
+        self.prompt_next(output, current_session).await
     }
 
     async fn answer<W>(
@@ -306,18 +308,28 @@ impl PromptCoordinator {
         let Some(active) = self.active.take() else {
             return Ok(());
         };
+        let session_id = active.session_id;
         service
             .respond_interaction(active.session_id, active.request_id, response)
             .await?;
-        self.prompt_next(output).await
+        self.prompt_next(output, session_id).await
     }
 
-    async fn prompt_next<W>(&mut self, output: &SharedOutput<W>) -> Result<(), CliError>
+    async fn prompt_next<W>(
+        &mut self,
+        output: &SharedOutput<W>,
+        current_session: SessionId,
+    ) -> Result<(), CliError>
     where
         W: AsyncWrite + Send + Unpin + 'static,
     {
-        if self.active.is_none() {
-            self.active = self.queue.pop_front();
+        if self.active.is_none()
+            && let Some(position) = self
+                .queue
+                .iter()
+                .position(|interaction| interaction.session_id == current_session)
+        {
+            self.active = self.queue.remove(position);
         }
         if let Some(active) = &self.active {
             write_interaction_prompt(output, active).await?;
@@ -404,7 +416,15 @@ where
                                     *skipped_terminals.entry(id).or_default() += 1;
                                 }
                             }
-                            LineOutcome::Quit => quitting = true,
+                            LineOutcome::Quit => {
+                                if prompts.has_pending() {
+                                    prompts.cancel_all(&service, &output).await?;
+                                }
+                                quitting = true;
+                            }
+                        }
+                        if !quitting {
+                            prompts.prompt_next(&output, session_id).await?;
                         }
                     }
                     Some(InputCommand::Interrupted) => {
@@ -1031,6 +1051,24 @@ where
             .await?;
             state.streamed_text = false;
         }
+        ServiceEvent::ToolStarted { id, trace } => {
+            write_line(output, &render_tool_trace("started", id, &trace)).await?;
+        }
+        ServiceEvent::ToolFinished { id, trace } => {
+            write_line(output, &render_tool_trace("finished", id, &trace)).await?;
+        }
+        ServiceEvent::DelegationStarted { id, trace } => {
+            write_line(output, &render_delegation_trace("started", id, &trace)).await?;
+        }
+        ServiceEvent::DelegationFinished { id, trace } => {
+            write_line(output, &render_delegation_trace("finished", id, &trace)).await?;
+        }
+        ServiceEvent::DelegationFailed { id, trace } => {
+            write_line(output, &render_delegation_trace("failed", id, &trace)).await?;
+        }
+        ServiceEvent::DelegationMessage { id, message } => {
+            write_line(output, &render_delegation_message(id, &message)).await?;
+        }
         ServiceEvent::PivotQueued { id } => {
             write_line(output, &format!("\n[pivot queued {id}]\n")).await?;
         }
@@ -1046,6 +1084,49 @@ where
         _ => {}
     }
     Ok(())
+}
+
+fn render_tool_trace(label: &str, id: SessionId, trace: &ToolTrace) -> String {
+    let mut line = format!(
+        "\n[tool {label} {id}] name={} call={} status={}",
+        trace.name,
+        trace.call_id,
+        tool_status(&trace.status)
+    );
+    if let Some(input) = &trace.input {
+        line.push_str(&format!(" input={}", single_line(&input.to_string())));
+    }
+    if let Some(output) = &trace.output {
+        line.push_str(&format!(" output={}", single_line(&output.to_string())));
+    }
+    if let Some(message) = &trace.message {
+        line.push_str(&format!(" message={}", single_line(message)));
+    }
+    line.push('\n');
+    line
+}
+
+fn render_delegation_trace(label: &str, id: SessionId, trace: &DelegationTrace) -> String {
+    let mut line = format!("\n[delegation {label} {id}] delegate={}", trace.delegate);
+    if let Some(task) = &trace.task {
+        line.push_str(&format!(" task={}", single_line(task)));
+    }
+    if let Some(output) = &trace.output {
+        line.push_str(&format!(" output={}", single_line(output)));
+    }
+    if let Some(message) = &trace.message {
+        line.push_str(&format!(" message={}", single_line(message)));
+    }
+    line.push('\n');
+    line
+}
+
+fn render_delegation_message(id: SessionId, message: &DelegationMessageWire) -> String {
+    format!(
+        "\n[delegation message {id}] delegate={} text={}\n",
+        message.delegate,
+        single_line(&message.text)
+    )
 }
 
 async fn write_interaction_prompt<W>(
@@ -1265,6 +1346,17 @@ fn run_error_kind(kind: &RunErrorKind) -> &'static str {
         RunErrorKind::Cancelled => "cancelled",
         RunErrorKind::LoopLimitExceeded => "loop_limit_exceeded",
         RunErrorKind::BudgetExhausted => "budget_exhausted",
+        _ => "unknown",
+    }
+}
+
+fn tool_status(status: &ToolStatusWire) -> &'static str {
+    match status {
+        ToolStatusWire::Started => "started",
+        ToolStatusWire::Finished => "finished",
+        ToolStatusWire::Denied => "denied",
+        ToolStatusWire::Cancelled => "cancelled",
+        ToolStatusWire::Failed => "failed",
         _ => "unknown",
     }
 }

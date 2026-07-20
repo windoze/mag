@@ -11,11 +11,13 @@ use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use mag_cli::{Cli, CliError, CliOptions};
 use mag_service::{
-    ApprovalDecisionWire, ApprovalRequirementWire, ConfigDto, InteractionKindWire,
-    InteractionOrigin, InteractionResponseWire, MagService, RequestId, RoutingMode, RunId,
-    RunOutput, ServiceError, ServiceEvent, SessionConfig, SessionId, SessionInfo, SourceInfo,
-    SourceKindWire, ToolCallIdWire, UsageInfo, UserInput,
+    AgentIdWire, ApprovalDecisionWire, ApprovalRequirementWire, ConfigDto, DelegationMessageWire,
+    DelegationTrace, InteractionKindWire, InteractionOrigin, InteractionResponseWire, MagService,
+    PermissionCategoryWire, PermissionDecisionWire, PermissionRiskWire, RequestId, RoutingMode,
+    RunId, RunOutput, ServiceError, ServiceEvent, SessionConfig, SessionId, SessionInfo,
+    SourceInfo, SourceKindWire, ToolCallIdWire, UsageInfo, UserInput,
 };
+use serde_json::json;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -27,7 +29,10 @@ const RUN_B: &str = "00000000-0000-0000-0000-000000000002";
 const REQ_APPROVAL: &str = "10000000-0000-0000-0000-000000000001";
 const REQ_QUESTION: &str = "10000000-0000-0000-0000-000000000002";
 const REQ_CHOICE: &str = "10000000-0000-0000-0000-000000000003";
+const REQ_PERMISSION: &str = "10000000-0000-0000-0000-000000000004";
+const REQ_BACKGROUND: &str = "10000000-0000-0000-0000-000000000005";
 const CALL_APPROVAL: &str = "20000000-0000-0000-0000-000000000001";
+const AGENT_PERMISSION: &str = "30000000-0000-0000-0000-000000000001";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SentMessage {
@@ -161,6 +166,76 @@ impl ScriptedService {
             },
             origin: InteractionOrigin::default(),
         });
+        let _ = self.events.send(ServiceEvent::InteractionRequested {
+            id,
+            request_id: RequestId::parse_str(REQ_PERMISSION).expect("valid request id"),
+            kind: InteractionKindWire::Permission {
+                action_id: "perm-shell-1".to_owned(),
+                actor: AgentIdWire::parse_str(AGENT_PERMISSION).expect("valid agent id"),
+                category: PermissionCategoryWire::Shell,
+                risk: PermissionRiskWire::High,
+                summary: "run privileged command".to_owned(),
+                subject: json!({ "command": "rm -rf target/tmp" }),
+                reason: Some("cleanup requested by model".to_owned()),
+            },
+            origin: InteractionOrigin {
+                delegate: Some("ops".to_owned()),
+                depth: 2,
+            },
+        });
+    }
+
+    fn emit_delegation_script(&self, id: SessionId) {
+        let run_id = Some(RunId::parse_str(RUN_A).expect("valid run id"));
+        let _ = self.events.send(ServiceEvent::DelegationStarted {
+            id,
+            trace: DelegationTrace {
+                run_id,
+                delegate: "researcher".to_owned(),
+                task: Some("summarize docs".to_owned()),
+                output: None,
+                message: None,
+            },
+        });
+        let _ = self.events.send(ServiceEvent::DelegationMessage {
+            id,
+            message: DelegationMessageWire {
+                run_id,
+                delegate: "researcher".to_owned(),
+                text: "working on summary".to_owned(),
+            },
+        });
+        let _ = self.events.send(ServiceEvent::DelegationFinished {
+            id,
+            trace: DelegationTrace {
+                run_id,
+                delegate: "researcher".to_owned(),
+                task: Some("summarize docs".to_owned()),
+                output: Some("summary ready".to_owned()),
+                message: None,
+            },
+        });
+        let _ = self.events.send(ServiceEvent::DelegationFailed {
+            id,
+            trace: DelegationTrace {
+                run_id,
+                delegate: "peer".to_owned(),
+                task: Some("check external".to_owned()),
+                output: None,
+                message: Some("external process exited".to_owned()),
+            },
+        });
+    }
+
+    fn emit_background_question(&self, id: SessionId) {
+        let _ = self.events.send(ServiceEvent::InteractionRequested {
+            id,
+            request_id: RequestId::parse_str(REQ_BACKGROUND).expect("valid request id"),
+            kind: InteractionKindWire::Question {
+                prompt: "Background question?".to_owned(),
+            },
+            origin: InteractionOrigin::default(),
+        });
     }
 }
 
@@ -243,6 +318,17 @@ impl MagService for ScriptedService {
             self.emit_interaction_script(id);
             return Ok(run_id);
         }
+        if input.text == "delegate events" {
+            self.emit_delegation_script(id);
+            let _ = self.events.send(ServiceEvent::RunFinished {
+                id,
+                output: RunOutput {
+                    text: "delegation script done".to_owned(),
+                    usage: None,
+                },
+            });
+            return Ok(run_id);
+        }
         let _ = self.events.send(ServiceEvent::TextDelta {
             id,
             text: format!("stream:{}", input.text),
@@ -323,7 +409,7 @@ impl MagService for ScriptedService {
             });
             replies.len()
         };
-        if reply_count == 3 {
+        if reply_count == 4 {
             let _ = self.events.send(ServiceEvent::RunFinished {
                 id,
                 output: RunOutput {
@@ -519,6 +605,73 @@ async fn slash_new_creates_and_switches_to_a_new_session() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_session_interaction_is_answered_after_resume() {
+    let service = Arc::new(ScriptedService::new());
+    let replies = service.replies();
+    let (mut stdin_writer, mut stdout_reader, run) = spawn_cli(service.clone());
+    let mut output = String::new();
+    let session_a = SessionId::parse_str(SESSION_A).unwrap();
+
+    read_until(&mut stdout_reader, &mut output, SESSION_A).await;
+    stdin_writer
+        .write_all(b"/new\n")
+        .await
+        .expect("create second session");
+    read_until(&mut stdout_reader, &mut output, SESSION_B).await;
+
+    service.emit_background_question(session_a);
+    read_until(
+        &mut stdout_reader,
+        &mut output,
+        &format!("[interaction pending for session {SESSION_A}"),
+    )
+    .await;
+
+    stdin_writer
+        .write_all(format!("/resume {SESSION_A}\n").as_bytes())
+        .await
+        .expect("resume session with pending interaction");
+    read_until(
+        &mut stdout_reader,
+        &mut output,
+        &format!("[session {SESSION_A} resumed]"),
+    )
+    .await;
+    read_until(
+        &mut stdout_reader,
+        &mut output,
+        "[question] Background question?",
+    )
+    .await;
+    stdin_writer
+        .write_all(b"background answer\n")
+        .await
+        .expect("answer background interaction");
+    stdin_writer.write_all(b"/quit\n").await.expect("quit CLI");
+    stdin_writer.shutdown().await.expect("close scripted stdin");
+
+    let result = tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("CLI run must not hang")
+        .expect("CLI task must join");
+    result.expect("CLI run must succeed");
+
+    let replies = replies.lock().expect("lock").clone();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].session_id, session_a);
+    assert_eq!(
+        replies[0].request_id,
+        RequestId::parse_str(REQ_BACKGROUND).unwrap()
+    );
+    assert_eq!(
+        replies[0].response,
+        InteractionResponseWire::Answer {
+            text: "background answer".to_owned()
+        }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prompt_coordinator_answers_queued_interactions_in_order() {
     let service = Arc::new(ScriptedService::new());
     let replies = service.replies();
@@ -559,6 +712,20 @@ async fn prompt_coordinator_answers_queued_interactions_in_order() {
     assert!(output.contains("2. right"), "{output}");
     stdin_writer.write_all(b"2\n").await.expect("answer choice");
 
+    read_until(
+        &mut stdout_reader,
+        &mut output,
+        "[from ops@depth2] [permission] run privileged command",
+    )
+    .await;
+    assert!(output.contains("category=shell risk=high"), "{output}");
+    assert!(output.contains("action=perm-shell-1"), "{output}");
+    assert!(output.contains("cleanup requested by model"), "{output}");
+    stdin_writer
+        .write_all(b"allow\n")
+        .await
+        .expect("answer permission");
+
     read_until(&mut stdout_reader, &mut output, "interactions done").await;
     read_until(&mut stdout_reader, &mut output, "[finished]").await;
     stdin_writer.write_all(b"/quit\n").await.expect("quit CLI");
@@ -571,7 +738,7 @@ async fn prompt_coordinator_answers_queued_interactions_in_order() {
     result.expect("CLI run must succeed");
 
     let replies = replies.lock().expect("lock").clone();
-    assert_eq!(replies.len(), 3);
+    assert_eq!(replies.len(), 4);
     assert_eq!(
         replies[0].session_id,
         SessionId::parse_str(SESSION_A).unwrap()
@@ -603,6 +770,57 @@ async fn prompt_coordinator_answers_queued_interactions_in_order() {
     assert_eq!(
         replies[2].response,
         InteractionResponseWire::Choice { index: 1 }
+    );
+    assert_eq!(
+        replies[3].request_id,
+        RequestId::parse_str(REQ_PERMISSION).unwrap()
+    );
+    assert_eq!(
+        replies[3].response,
+        InteractionResponseWire::Permission {
+            action_id: "perm-shell-1".to_owned(),
+            decision: PermissionDecisionWire::Approve,
+        }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delegation_events_are_rendered() {
+    let service = Arc::new(ScriptedService::new());
+
+    let output = drive("delegate events\n/quit\n", service).await;
+
+    assert!(
+        output.contains("[delegation started"),
+        "delegation start is visible: {output}"
+    );
+    assert!(
+        output.contains("delegate=researcher task=summarize docs"),
+        "delegation trace carries delegate and task: {output}"
+    );
+    assert!(
+        output.contains("[delegation message"),
+        "delegation message is visible: {output}"
+    );
+    assert!(
+        output.contains("delegate=researcher text=working on summary"),
+        "delegation message carries text: {output}"
+    );
+    assert!(
+        output.contains("[delegation finished"),
+        "delegation finish is visible: {output}"
+    );
+    assert!(
+        output.contains("output=summary ready"),
+        "delegation finish carries output: {output}"
+    );
+    assert!(
+        output.contains("[delegation failed"),
+        "delegation failure is visible: {output}"
+    );
+    assert!(
+        output.contains("delegate=peer task=check external message=external process exited"),
+        "delegation failure carries message: {output}"
     );
 }
 
