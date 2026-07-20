@@ -31,7 +31,7 @@ export const RunningPivot: Story = {
 
 export const PendingInteraction: Story = {
   args: {
-    mode: "awaiting_interaction",
+    mode: "running",
     pendingInteractionCount: 2,
     value: "Continue after approval."
   }

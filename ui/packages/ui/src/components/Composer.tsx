@@ -5,7 +5,7 @@ import { cn } from "../lib/utils";
 import { Button } from "./Button";
 
 /** Composer mode derived from session run state. */
-export type ComposerMode = "idle" | "running" | "awaiting_interaction";
+export type ComposerMode = "idle" | "running";
 
 /** Props for the chat composer. */
 export interface ComposerProps {

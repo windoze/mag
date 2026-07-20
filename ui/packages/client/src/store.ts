@@ -199,7 +199,14 @@ interface MutableSession {
   delegationsById: Map<string, DelegationView>;
   interactionsById: Map<RequestId, InteractionView>;
   activeAssistant?: ConversationMessage;
-  completedRunIds: Set<RunId>;
+}
+
+/** Bookkeeping for an in-flight history refresh; see `SessionStore.historyRefreshes`. */
+interface HistoryRefresh {
+  /** Number of overlapping refreshes for the same session. */
+  depth: number;
+  /** Session events received while the refresh was in flight. */
+  buffer: Event[];
 }
 
 /** Transport-neutral session state authority used by web and future desktop shells. */
@@ -218,6 +225,13 @@ export class SessionStore {
   private reconnectHandle: ReturnType<typeof setTimeout> | undefined;
   private started = false;
   private sequence = 0;
+  /**
+   * In-flight history refreshes keyed by session. While a refresh is awaiting
+   * the server snapshot, live events for that session are buffered and
+   * replayed after the replace so the replace cannot wipe events that were
+   * emitted after the snapshot was taken.
+   */
+  private readonly historyRefreshes = new Map<SessionId, HistoryRefresh>();
 
   /** Creates a store over the provided transport. */
   constructor(transport: ITransport, options: SessionStoreOptions = {}) {
@@ -285,12 +299,14 @@ export class SessionStore {
 
   /** Returns the ordered thread projection for one session. */
   selectThread(id: SessionId): readonly ThreadItem[] {
-    return this.sessions.get(id)?.thread ?? [];
+    const thread = this.sessions.get(id)?.thread;
+    return thread === undefined ? [] : [...thread];
   }
 
   /** Returns pending interactions for one session in arrival order. */
   selectPendingInteractions(id: SessionId): readonly InteractionView[] {
-    return this.sessions.get(id)?.pendingInteractions ?? [];
+    const pending = this.sessions.get(id)?.pendingInteractions;
+    return pending === undefined ? [] : [...pending];
   }
 
   /** Sends `list_sessions` and syncs sidebar metadata. */
@@ -315,13 +331,48 @@ export class SessionStore {
 
   /** Fetches and installs authoritative history for one session. */
   async refreshHistory(id: SessionId): Promise<readonly HistoryEntry[]> {
-    const history = (await this.transport.send({
-      type: "get_session_history",
-      id
-    })) as HistoryEntry[];
-    this.replaceHistory(id, history);
-    this.notify();
-    return history;
+    const refresh = this.beginHistoryRefresh(id);
+    try {
+      const history = (await this.transport.send({
+        type: "get_session_history",
+        id
+      })) as HistoryEntry[];
+      this.replaceHistory(id, history);
+      this.notify();
+      return history;
+    } finally {
+      this.endHistoryRefresh(id, refresh);
+    }
+  }
+
+  /** Marks a history refresh as in flight so live events are buffered instead of applied. */
+  private beginHistoryRefresh(id: SessionId): HistoryRefresh {
+    const existing = this.historyRefreshes.get(id);
+    if (existing !== undefined) {
+      existing.depth += 1;
+      return existing;
+    }
+
+    const refresh: HistoryRefresh = { depth: 1, buffer: [] };
+    this.historyRefreshes.set(id, refresh);
+    return refresh;
+  }
+
+  /**
+   * Closes a history refresh; the last close replays buffered events in arrival
+   * order. Replay is dedup-safe: tool/delegation upserts are status-ranked,
+   * interactions dedup by request id, final assistant text dedups against
+   * history, and pivot notices dedup against the previous notice.
+   */
+  private endHistoryRefresh(id: SessionId, refresh: HistoryRefresh): void {
+    refresh.depth -= 1;
+    if (refresh.depth > 0) {
+      return;
+    }
+
+    this.historyRefreshes.delete(id);
+    const buffered = refresh.buffer.splice(0);
+    buffered.forEach((event) => this.applyEvent(event));
   }
 
   /** Replaces one session's committed history while preserving still-pending interactions. */
@@ -342,7 +393,6 @@ export class SessionStore {
     session.delegationsById = new Map();
     session.interactionsById = new Map();
     session.activeAssistant = undefined;
-    session.completedRunIds = new Set();
 
     history.forEach((entry, index) => this.applyHistoryEntry(session, entry, index));
     pendingInteractions.forEach((interaction) => this.installInteraction(session, interaction));
@@ -447,6 +497,15 @@ export class SessionStore {
 
   /** Applies one live event to the store. Exposed for scripted tests and desktop transports. */
   applyEvent(event: Event): void {
+    const sessionId = eventSessionId(event);
+    if (sessionId !== undefined) {
+      const refresh = this.historyRefreshes.get(sessionId);
+      if (refresh !== undefined) {
+        refresh.buffer.push(event);
+        return;
+      }
+    }
+
     switch (event.type) {
       case "session_created":
         this.applySessionCreated(event.id, event.config);
@@ -618,16 +677,6 @@ export class SessionStore {
 
   private applyRunFinished(id: SessionId, outputText: string): void {
     const session = this.ensureSession(id);
-    const runId =
-      session.run.state === "running" || session.run.state === "awaiting_interaction"
-        ? session.run.runId
-        : undefined;
-    if (runId !== undefined && session.completedRunIds.has(runId)) {
-      session.run = { state: "idle" };
-      session.status = "idle";
-      return;
-    }
-
     if (session.activeAssistant !== undefined) {
       session.activeAssistant.streaming = false;
       session.activeAssistant = undefined;
@@ -641,9 +690,6 @@ export class SessionStore {
       });
     }
 
-    if (runId !== undefined) {
-      session.completedRunIds.add(runId);
-    }
     session.run = { state: "idle" };
     session.status = "idle";
   }
@@ -706,7 +752,7 @@ export class SessionStore {
     const interaction = { requestId, kind, origin, status: "pending" } satisfies InteractionView;
     this.installInteraction(session, interaction);
     session.run =
-      session.run.state === "running"
+      session.run.state === "running" || session.run.state === "awaiting_interaction"
         ? { state: "awaiting_interaction", runId: session.run.runId }
         : { state: "awaiting_interaction" };
     session.status = "awaiting_interaction";
@@ -798,8 +844,7 @@ export class SessionStore {
       pivotNotices: [],
       toolCallsById: new Map(),
       delegationsById: new Map(),
-      interactionsById: new Map(),
-      completedRunIds: new Set()
+      interactionsById: new Map()
     };
     this.sessions.set(id, session);
     if (!this.sessionOrder.includes(id)) {
@@ -848,6 +893,11 @@ export class SessionStore {
 
 function delegationKey(runId: RunId | undefined, delegate: string): string {
   return `${runId ?? "global"}:${delegate}`;
+}
+
+/** Returns the session an event belongs to, or undefined for store-global events. */
+function eventSessionId(event: Event): SessionId | undefined {
+  return "id" in event ? event.id : undefined;
 }
 
 function toolStatusRank(status: ToolStatusWire): number {

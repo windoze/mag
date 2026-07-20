@@ -5,7 +5,9 @@ import type {
   InteractionResponseWire,
   SessionConfig,
   SessionId,
-  SessionInfo
+  SessionInfo,
+  ToolStatusWire,
+  ToolTrace
 } from "@mag/protocol";
 import { describe, expect, it, vi } from "vitest";
 
@@ -283,6 +285,175 @@ describe("@mag/client", () => {
     });
     store.stop();
   });
+
+  it("parses CRLF, multi-line data, and chunk-split SSE frames", async () => {
+    const textDelta = eventFixture.find((event) => event.type === "text_delta")!;
+    const payload = JSON.stringify(textDelta);
+    // Split at a comma so the "\n" inserted between data lines stays valid
+    // JSON whitespace.
+    const splitAt = payload.indexOf(",");
+    const frame = `id: 7\r\nevent: text_delta\r\ndata: ${payload.slice(0, splitAt)}\r\ndata: ${payload.slice(splitAt)}\r\n\r\n`;
+    const bytes = new TextEncoder().encode(frame);
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        // Deliver the frame split across two chunks, mid-line.
+        controller.enqueue(bytes.slice(0, 7));
+        controller.enqueue(bytes.slice(7));
+        controller.close();
+      }
+    });
+    const fetchMock: FetchLike = vi.fn(
+      async () =>
+        new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } })
+    );
+    const transport = new HttpSseTransport({ fetch: fetchMock });
+    const received: Event[] = [];
+
+    transport.subscribe((event) => received.push(event));
+
+    await waitFor(() => received.length === 1);
+    expect(received[0]).toEqual(textDelta);
+  });
+
+  it("buffers live events during a history refresh and replays them after the replace", async () => {
+    const transport = new DeferredHistoryTransport();
+    let releaseHistory!: () => void;
+    transport.historyGate = new Promise((resolve) => {
+      releaseHistory = resolve;
+    });
+    const store = new SessionStore(transport);
+    store.replaceHistory(sessionId, historyFixture);
+
+    const refresh = store.refreshHistory(sessionId);
+    store.applyEvent({ type: "text_delta", id: sessionId, text: "In-flight delta" });
+    store.applyEvent({ type: "config_changed", revision: 7 });
+
+    // Session events stay buffered while the refresh is in flight (the
+    // pending replace must not wipe them); store-global events still apply
+    // immediately.
+    expect(store.selectSession(sessionId)!.messages.map((message) => message.text)).not.toContain(
+      "In-flight delta"
+    );
+    expect(store.getSnapshot().configRevision).toBe(7);
+
+    releaseHistory();
+    await refresh;
+
+    const texts = store.selectSession(sessionId)!.messages.map((message) => message.text);
+    expect(texts).toContain("Inspect README");
+    expect(texts).toContain("In-flight delta");
+  });
+
+  it("queues pending interactions in arrival order and resolves them independently", async () => {
+    const store = new SessionStore(new ScriptedTransport());
+    await store.openSession(sessionId);
+    store.applyEvent({ type: "run_started", id: sessionId, run_id: "run-queue" });
+    store.applyEvent({
+      type: "interaction_requested",
+      id: sessionId,
+      request_id: "req-first",
+      kind: { kind: "question", prompt: "First?" },
+      origin: { depth: 0 }
+    });
+    store.applyEvent({
+      type: "interaction_requested",
+      id: sessionId,
+      request_id: "req-second",
+      kind: { kind: "question", prompt: "Second?" },
+      origin: { depth: 0 }
+    });
+
+    let session = store.selectSession(sessionId)!;
+    expect(session.pendingInteractions.map((interaction) => interaction.requestId)).toEqual([
+      "req-first",
+      "req-second"
+    ]);
+
+    await store.respondInteraction(sessionId, "req-first", { kind: "answer", text: "one" });
+
+    session = store.selectSession(sessionId)!;
+    expect(session.pendingInteractions.map((interaction) => interaction.requestId)).toEqual([
+      "req-second"
+    ]);
+    expect(session.run.state).toBe("awaiting_interaction");
+
+    await store.respondInteraction(sessionId, "req-second", { kind: "answer", text: "two" });
+
+    session = store.selectSession(sessionId)!;
+    expect(session.pendingInteractions).toHaveLength(0);
+    expect(session.run).toMatchObject({ state: "running", runId: "run-queue" });
+    const interactions = session.thread.flatMap((item) =>
+      item.type === "interaction" ? [[item.interaction.requestId, item.interaction.status]] : []
+    );
+    expect(interactions).toEqual([
+      ["req-first", "responded"],
+      ["req-second", "responded"]
+    ]);
+  });
+
+  it("keeps streaming text deltas isolated per session", () => {
+    const store = new SessionStore(new ScriptedTransport());
+
+    store.applyEvent({ type: "text_delta", id: "session-a", text: "A1" });
+    store.applyEvent({ type: "text_delta", id: "session-b", text: "B1" });
+    store.applyEvent({ type: "text_delta", id: "session-a", text: "A2" });
+
+    expect(store.selectSession("session-a")?.messages.map((message) => message.text)).toEqual([
+      "A1A2"
+    ]);
+    expect(store.selectSession("session-b")?.messages.map((message) => message.text)).toEqual([
+      "B1"
+    ]);
+  });
+
+  it("tracks every terminal tool state and never downgrades a terminal card", () => {
+    const store = new SessionStore(new ScriptedTransport());
+    const trace = (callId: string, status: ToolStatusWire): ToolTrace => ({
+      run_id: "run-tools",
+      call_id: callId,
+      name: "shell",
+      status
+    });
+
+    store.applyEvent({
+      type: "tool_finished",
+      id: sessionId,
+      trace: trace("t-finished", "finished")
+    });
+    store.applyEvent({ type: "tool_finished", id: sessionId, trace: trace("t-denied", "denied") });
+    store.applyEvent({
+      type: "tool_finished",
+      id: sessionId,
+      trace: trace("t-cancelled", "cancelled")
+    });
+    store.applyEvent({ type: "tool_finished", id: sessionId, trace: trace("t-failed", "failed") });
+    // A late started echo must not downgrade the terminal card.
+    store.applyEvent({ type: "tool_started", id: sessionId, trace: trace("t-failed", "started") });
+
+    const statuses = store
+      .selectSession(sessionId)!
+      .toolCalls.map((tool) => [tool.id, tool.trace.status]);
+    expect(statuses).toEqual([
+      ["t-finished", "finished"],
+      ["t-denied", "denied"],
+      ["t-cancelled", "cancelled"],
+      ["t-failed", "failed"]
+    ]);
+  });
+
+  it("never lists a session twice after events race with list_sessions", async () => {
+    const transport = new ScriptedTransport();
+    const store = new SessionStore(transport);
+
+    store.applyEvent({ type: "session_created", id: "session-new", config });
+    store.applyEvent({ type: "text_delta", id: "session-new", text: "hello" });
+    transport.sessions = [sessionInfo, { ...sessionInfo, id: "session-new" }];
+    await store.refreshSessions();
+
+    const ids = store.selectSessions().map((session) => session.id);
+    expect(ids.filter((id) => id === "session-new")).toHaveLength(1);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
 });
 
 class ScriptedTransport implements ITransport {
@@ -327,6 +498,17 @@ class ScriptedTransport implements ITransport {
 
   fail(error: unknown): void {
     this.subscribeOptions?.onError?.(error);
+  }
+}
+
+class DeferredHistoryTransport extends ScriptedTransport {
+  historyGate: Promise<void> = Promise.resolve();
+
+  override async send(command: Command): Promise<unknown> {
+    if (command.type === "get_session_history") {
+      await this.historyGate;
+    }
+    return super.send(command);
   }
 }
 

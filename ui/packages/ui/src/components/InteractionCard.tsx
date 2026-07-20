@@ -118,7 +118,9 @@ function ApprovalInteraction({
         <p className="text-sm text-muted-foreground">
           {kind.tool_name ?? "Tool"} is waiting for approval.
         </p>
-        {kind.requirement.type === "require_approval" && kind.requirement.reason !== undefined ? (
+        {kind.requirement.type === "require_approval" &&
+        kind.requirement.reason !== undefined &&
+        kind.requirement.reason !== null ? (
           <p className="rounded-md bg-card p-2 text-sm">Reason: {kind.requirement.reason}</p>
         ) : null}
         {kind.input !== undefined ? <JsonSummary label="Input" value={kind.input} /> : null}

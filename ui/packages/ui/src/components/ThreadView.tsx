@@ -159,12 +159,8 @@ function DelegationInlineCard({
   readonly delegation: DelegationItemView;
   readonly onOpen?: (delegationId: string) => void;
 }): React.JSX.Element {
-  return (
-    <button
-      className="flex w-full items-start gap-3 rounded-xl border border-border bg-card p-4 text-left shadow-sm transition hover:border-primary/40"
-      type="button"
-      onClick={() => onOpen?.(delegation.id)}
-    >
+  const body = (
+    <>
       <GitBranch className="mt-0.5 h-4 w-4 text-muted-foreground" />
       <div className="min-w-0 flex-1 space-y-1">
         <div className="flex flex-wrap items-center gap-2">
@@ -182,6 +178,23 @@ function DelegationInlineCard({
           <p className="text-xs text-muted-foreground">Usage: {formatUsage(delegation.usage)}</p>
         ) : null}
       </div>
+    </>
+  );
+  const cardClass =
+    "flex w-full items-start gap-3 rounded-xl border border-border bg-card p-4 text-left shadow-sm";
+
+  // Renders as a button only when a drill-down handler is wired; without one
+  // the card is static so it does not advertise a dead affordance.
+  if (onOpen === undefined) {
+    return <div className={cardClass}>{body}</div>;
+  }
+  return (
+    <button
+      className={cn(cardClass, "transition hover:border-primary/40")}
+      type="button"
+      onClick={() => onOpen(delegation.id)}
+    >
+      {body}
     </button>
   );
 }

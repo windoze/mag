@@ -108,6 +108,111 @@ describe("InteractionCard", () => {
       "req-permission"
     );
   });
+
+  it("submits approval deny and cancel decisions with wire-shaped messages", () => {
+    const onSubmit = vi.fn();
+    const host = render(
+      <InteractionCard
+        kind={{
+          kind: "approval",
+          call_id: "22222222-2222-2222-2222-222222222222",
+          requirement: { type: "require_approval" },
+          tool_name: "shell"
+        }}
+        requestId="req-approval-decisions"
+        onSubmit={onSubmit}
+      />
+    );
+
+    click(buttonByText(host, "Deny"));
+    expect(onSubmit).toHaveBeenLastCalledWith(
+      {
+        kind: "approval",
+        step_id: "22222222-2222-2222-2222-222222222222",
+        call_id: "22222222-2222-2222-2222-222222222222",
+        decision: "deny",
+        message: undefined
+      },
+      "req-approval-decisions"
+    );
+
+    click(buttonByText(host, "Cancel"));
+    expect(onSubmit).toHaveBeenLastCalledWith(
+      {
+        kind: "approval",
+        step_id: "22222222-2222-2222-2222-222222222222",
+        call_id: "22222222-2222-2222-2222-222222222222",
+        decision: "cancel",
+        message: "interaction cancelled"
+      },
+      "req-approval-decisions"
+    );
+  });
+
+  it("submits permission approve and cancel decisions", () => {
+    const onSubmit = vi.fn();
+    const host = render(
+      <InteractionCard
+        kind={{
+          kind: "permission",
+          action_id: "perm-2",
+          actor: "mag",
+          category: "file_write",
+          risk: "low",
+          summary: "Write file",
+          subject: { path: "/tmp/out.txt" }
+        }}
+        requestId="req-permission-decisions"
+        onSubmit={onSubmit}
+      />
+    );
+
+    click(buttonByText(host, "Allow"));
+    expect(onSubmit).toHaveBeenLastCalledWith(
+      { kind: "permission", action_id: "perm-2", decision: { type: "approve" } },
+      "req-permission-decisions"
+    );
+
+    click(buttonByText(host, "Cancel"));
+    expect(onSubmit).toHaveBeenLastCalledWith(
+      { kind: "permission", action_id: "perm-2", decision: { type: "cancel" } },
+      "req-permission-decisions"
+    );
+  });
+
+  it("does not render an empty reason panel when the approval reason is null", () => {
+    const host = render(
+      <InteractionCard
+        kind={{
+          kind: "approval",
+          call_id: "33333333-3333-3333-3333-333333333333",
+          requirement: { type: "require_approval", reason: null },
+          tool_name: "shell"
+        }}
+        requestId="req-null-reason"
+      />
+    );
+
+    expect(host.textContent).not.toContain("Reason:");
+  });
+
+  it("renders a resolved card as read-only with the submitted response", () => {
+    const onSubmit = vi.fn();
+    const host = render(
+      <InteractionCard
+        kind={{ kind: "question", prompt: "Proceed?" }}
+        requestId="req-resolved"
+        response={{ kind: "answer", text: "yes" }}
+        status="responded"
+        onSubmit={onSubmit}
+      />
+    );
+
+    expect(host.textContent).toContain("submitted");
+    expect(host.textContent).toContain('"text": "yes"');
+    expect(host.querySelector("textarea")).toBeNull();
+    expect(host.querySelectorAll("button")).toHaveLength(0);
+  });
 });
 
 function render(element: ReactElement): HTMLDivElement {

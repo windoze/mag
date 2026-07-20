@@ -408,11 +408,66 @@ CI 承载（引入 CI 时列为第一批）；⑥tool 输出为 agent-lib Conten
 - 新增 app-web 壳级 vitest（scripted mock transport）覆盖 token 捕获、会话列表/恢复/history、新建/删除、工具与审批卡渲染、审批响应提交、pivot 409 回落、cancel、Sources/Config 路由；`ui/README.md` 补充真实 W2 server 手动 web smoke 流程。
 - 验证通过：`cargo fmt --all`、`npx --yes pnpm@10.14.0 format:write`、`cargo fmt --all -- --check`、`npx --yes pnpm@10.14.0 --filter @mag/app-web test`、`npx --yes pnpm@10.14.0 --filter @mag/client test`、`cargo clippy --all-targets -- -D warnings`、`npx --yes pnpm@10.14.0 format`、`npx --yes pnpm@10.14.0 lint`、`npx --yes pnpm@10.14.0 --filter @mag/app-web build`、`cargo test --workspace`、`npx --yes pnpm@10.14.0 -r test`、`cargo doc --no-deps --workspace`、`npx --yes pnpm@10.14.0 -r build`。
 
-### W3-R [TODO] W3 review
+### W3-R [DONE] W3 review
 
 - **实现要求**：对照 `docs/WEB.md` §5/§6 检查：依赖方向（app→ui/client→protocol 单向）；组件不碰
   transport；store 合并逻辑无竞态；token 不进 URL query/日志；Storybook 覆盖度。发现问题直接修复。
 - **验证条件**：`pnpm -r test`/`pnpm -r build` 绿 + 默认验证序列；完成记录列出 review 结论。
+
+**完成记录（2026-07-21）**：通读 W3-1..W3-4 全部 diff（`351683f`/`7ab09f1`/`4c78c96`/`0fe4985`）
+并派三个 review 子代理分块核查（依赖+token / client store+transport / ui 组件+Storybook+壳），逐项
+结论如下；**发现 6 项问题全部当场修复并补测试**，修复后结论 **W3 放行进入 W4**：
+
+- **依赖方向** ✅：`package.json` 声明与实际 import 双重核实——`@mag/app-web` 仅依
+  `@mag/ui`+`@mag/client`（不直接依 `@mag/protocol`）；`@mag/client` 仅依 `@mag/protocol`；
+  `@mag/ui` 零 `@mag/*` 依赖、源码无 `fetch`/`EventSource`/store 引用；`@mag/protocol` 46 个生成
+  文件全部带 ts-rs 标记，零手写 wire 类型；`protocol:check` 漂移门禁在。
+- **token 纪律** ✅：`#t=` fragment 捕获后 `history.replaceState` 抹除（`token.ts:46-52`），存
+  sessionStorage（被禁用时退化为 tab 级内存，有注释说明）；仅经 `Authorization: Bearer` 头发送，
+  不进 URL query；`apps/web` 与 `client` 源码零 `console.*` 调用；SSE 为 fetch+ReadableStream，
+  全仓无 `EventSource`。
+- **store/transport** ✅（修复后）：Command→§2.1 全 15 条路由映射逐条对（含 DELETE、`encodeURIComponent`
+  转义）；`TransportError` 保留 status/kind（409 `not_pivotable` 可判别，非标准体降级
+  `http_<status>`）；SSE 解析器覆盖增量 chunk、多行 `data:`、CRLF、heartbeat 忽略、abort 清理；
+  history 全量替换+增量合并、tool call_id 去重（rank 防降级）、interaction request_id 去重、
+  delegation 分组、pivot 去重、重连 align 无双订阅——均有测试钉住。
+- **组件纯度与 Storybook** ✅：五个核心组件全 props+回调；InteractionCard 四形态载荷与 wire 同形
+  （choice 零基、approval `step_id=call_id`、deny/cancel message 语义）；ToolCallCard 五状态徽标；
+  Composer 文案/按钮状态机；SessionSidebar cwd 分组+三状态徽标；Storybook 覆盖 §6.3 要求的全部
+  视觉态（ConfigEditor 文本态属 W4 范围）。壳装配逐项核对：resume→history、删除二次确认、
+  pivot 409 精确回落（仅 `not_pivotable` 回落、其他错误上浮 banner）、cancel、pending 计数、
+  `config_changed` toast、Sources/Config 占位路由。
+- **修复清单**（全部补了回归测试）：
+  1. **store 竞态**：`refreshHistory` 窗口期到达的会话事件先被应用、随后被 `replaceHistory` 抹掉
+     （流式 delta 丢失不可恢复）。修复为窗口期按会话缓冲事件、replace 后按到达顺序重放（重放经既有
+     rank/request_id/文本去重保证幂等）；全局事件（`config_changed` 等）不缓冲。新增回归测试。
+  2. **store runId 丢失**：同会话第二个 `interaction_requested` 会把 `awaiting_interaction` 状态的
+     runId 丢掉，导致交互排空后 run 错误落 idle。修复为 awaiting 状态同样保留 runId（新增多 pending
+     队列测试捕获）。
+  3. **InteractionCard**：approval `reason: null` 渲染空 Reason 面板（permission 分支已正确判空，
+     approval 分支漏判 null）。已修，补 null-reason 回归测试。
+  4. **死代码**：`ComposerMode` 的 `"awaiting_interaction"` 变体壳层永不产生（壳将 awaiting 视为
+     running→pivot 优先，符合 §5.4），已删除并对齐 story；store 的 `completedRunIds` 为不可达死
+     代码，已删除。
+  5. **死交互**：无 drill-down 回调时 delegation 卡仍渲染为可点 button（W4 才实现右栏子线程），
+     改为无回调时渲染静态 div。
+  6. **selector 泄漏**：`selectThread`/`selectPendingInteractions` 返回内部活数组，改为返回拷贝
+     （与 `mutableSessionToView` 一致）。
+- **补测试**：client 侧 SSE 健壮性（CRLF/多行 data/跨 chunk 帧）、history-replace 竞态回归、多
+  pending 队列顺序与独立 resolve、跨会话 text_delta 隔离、四种工具终态+started 回声不降级、
+  sessionOrder 不重复；ui 侧 approval deny/cancel 载荷、permission approve/cancel 载荷、resolved
+  只读渲染、null reason 不渲染。
+- **记录在案的偏差（不阻塞）**：①§5.2「批准/拒绝（+ always）」与 wire 不符——
+  `ApprovalDecisionWire` 无 `always` 变体，且 mag-acp（`map.rs:415`）已明确记录「mag 无持久
+  always 语义」是既有拍板；web UI 与 wire 一致，视为 spec 文本滞后，随 F-R 复核是否修订文档。
+  ②重连窗口（断连期间服务端事件无重放，§2.2 拍板）仍靠 reconnect 后全量对齐兜底，属设计取舍。
+  ③跨标签页应答的 pending 交互在 history 中无状态，replace 后可能保留陈旧 pending 卡——wire
+  模型限制，单用户场景可接受。
+- **验证通过**：`pnpm format:write`+`pnpm format`、`pnpm lint`、`pnpm -r test`（25 测试全绿：
+  protocol 门禁 + client 13 + ui 9 + app-web 3）、`pnpm -r build`、`build-storybook`、
+  `cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`。Rust 源码本轮零
+  改动（git status 实证），`cargo test --workspace` 与 `cargo doc` 复用 W3-4（`0fe4985`）全绿
+  结果，按规则跳过重跑。
 
 ---
 
