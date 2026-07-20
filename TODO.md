@@ -201,7 +201,7 @@ CI 承载（引入 CI 时列为第一批）；⑥tool 输出为 agent-lib Conten
 
 目标：纯协议翻译器——REST 命令面 + SSE 事件面 + token auth + 静态资源 + bin 装配，协议级 e2e 全链路。
 
-### W2-1 [TODO] crate 骨架 + REST 路由 + 错误投影
+### W2-1 [DONE] crate 骨架 + REST 路由 + 错误投影
 
 - **上下文**：`docs/WEB.md` §2.1/§2.3；依赖边界见通用执行规则。
 - **实现要求**：
@@ -213,6 +213,15 @@ CI 承载（引入 CI 时列为第一批）；⑥tool 输出为 agent-lib Conten
     非 ServiceError 内部错误 500 通用体。
 - **验证条件**：聚焦测试：`tower::ServiceExt::oneshot` 内存请求驱动，scripted service 断言每路由的
   方法调用映射、成功响应体、五类错误投影。默认验证序列全过。
+
+完成记录（2026-07-21）：
+
+- 新增 `crates/mag-web` 并加入 workspace；crate 开启 `#![warn(missing_docs)]`，公开 `serve(Arc<dyn MagService>, ServeOptions)` 与 `router(Arc<dyn MagService>)`，保持仅依赖 `mag-service`、`axum`、`tokio`、`futures`、`serde`/`serde_json` 的运行时边界。
+- `ServeOptions` 预留 host/port/token 策略/静态资源路径；W2-1 仅使用 host/port 启动 axum server，auth/static/SSE 留给后续 W2-2/W2-3。
+- 实现 `docs/WEB.md` §2.1 除 `/api/events` 与静态资源外的全部 REST 命令路由：session list/create/resume/delete/history/messages/pivot/cancel/interactions，sources list/probe，config get/update/reload/apply；handler 仅做 JSON wire 翻译并调用注入的 `MagService`。
+- 错误投影按 §2.3：`SessionNotFound`/`InteractionNotFound`→404、`NotPivotable`→409、`InvalidInput`/`Config`→400、`Unsupported`→501、`Backend`→500；响应体 `{kind, message}` 使用 `ServiceError::kind()` 与 display message；非 `ServiceError` 内部错误投影为通用 500 body。
+- 聚焦测试使用 `tower::ServiceExt::oneshot` + scripted `MagService` 覆盖每条路由的方法调用映射、成功响应体、204 空响应、全部 `ServiceError` 变体投影与通用内部错误投影。
+- 验证通过：`cargo fmt --all`、`cargo test -p mag-web`、`cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`、`cargo doc --no-deps --workspace`。
 
 ### W2-2 [TODO] SSE 事件面
 
