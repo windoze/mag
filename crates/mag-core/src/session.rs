@@ -39,8 +39,12 @@ use tokio::{
 use crate::{
     EventBus,
     driver::{PivotQueue, SessionDriver, TurnOutcome},
-    engine::approval::{AskFrontendDecider, IpcApproval},
+    engine::{
+        ConfigApplyState,
+        approval::{AskFrontendDecider, IpcApproval},
+    },
     persistence::Persistence,
+    turn_complete::TurnCompleteHub,
 };
 
 /// Locks `mutex`, recovering the guard from a poisoned lock instead of
@@ -83,6 +87,16 @@ enum SessionCommand {
         /// Channel used to acknowledge delivery or report a failure.
         reply: oneshot::Sender<Result<(), ServiceError>>,
     },
+    /// Ask the actor to apply the current configuration snapshot when the
+    /// agent is at rest (`docs/CLI.md` §4.4): immediately when idle, or at the
+    /// next run terminal — the run-completion path re-checks the shared
+    /// generation counter, so a command that arrives mid-run is deferred
+    /// rather than lost. Carries the generation the request was sent for, so
+    /// an actor whose thread started after the bump still honors it.
+    ApplyConfig {
+        /// Apply-request generation this command was sent for.
+        generation: u64,
+    },
 }
 
 /// Lifecycle state of a session actor's driver.
@@ -120,16 +134,33 @@ struct SessionActor {
     run_done_tx: mpsc::UnboundedSender<(Box<SessionDriver>, TurnOutcome)>,
     /// Receiver that reclaims the driver once a run task finishes.
     run_done_rx: mpsc::UnboundedReceiver<(Box<SessionDriver>, TurnOutcome)>,
+    /// Shared config-apply plumbing (`docs/CLI.md` §4.4); `None` when the
+    /// engine has no configuration backend.
+    config_apply: Option<ConfigApplyState>,
+    /// Generation of the last config apply this actor performed. Starts at the
+    /// generation current when the actor spawns: a freshly created session is
+    /// assembled from the caller's own `SessionConfig` and counts as
+    /// up-to-date (the session↔snapshot binding becomes explicit with
+    /// `Engine::from_config`, M3-6).
+    applied_generation: u64,
 }
 
 impl SessionActor {
     /// Builds an actor from a freshly created (or failed) driver.
+    ///
+    /// `applied_generation` is the config-apply generation read synchronously
+    /// when the actor was spawned (`docs/CLI.md` §4.4): a session created
+    /// after an `apply_config` counts as up-to-date, while a session whose
+    /// spawn raced the bump still honors the `ApplyConfig` command carrying
+    /// that generation.
     fn new(
         session_id: SessionId,
         events: EventBus,
         driver: Result<SessionDriver, FacadeError>,
         approval: Arc<IpcApproval>,
         store: Arc<Persistence>,
+        config_apply: Option<ConfigApplyState>,
+        applied_generation: u64,
     ) -> Self {
         let (run_done_tx, run_done_rx) = mpsc::unbounded_channel();
         let state = match driver {
@@ -147,6 +178,8 @@ impl SessionActor {
             deferred: VecDeque::new(),
             run_done_tx,
             run_done_rx,
+            config_apply,
+            applied_generation,
         }
     }
 
@@ -185,6 +218,10 @@ impl SessionActor {
                     }
                     self.state = DriverState::Idle(driver);
                     self.cancel = None;
+                    // Turn boundary: land a pending config apply *before* any
+                    // deferred command starts the next run (`docs/CLI.md`
+                    // §4.4: the actor checks between runs).
+                    self.apply_pending_config();
                 }
             }
         }
@@ -234,7 +271,52 @@ impl SessionActor {
             } => {
                 let _ = reply.send(self.approval.respond(request_id, response));
             }
+            SessionCommand::ApplyConfig { generation } => self.apply_config_for(generation),
         }
+    }
+
+    /// Applies the current configuration snapshot when the shared generation
+    /// moved past this actor's last apply and the driver is at rest
+    /// (`docs/CLI.md` §4.4, decision D2).
+    ///
+    /// A no-op when no apply is owed (the generation did not move), when the
+    /// engine has no configuration backend, or when a run is in flight — in
+    /// the running case the run-completion path re-checks the generation at
+    /// the turn boundary, so the apply is deferred rather than lost
+    /// (agent-lib only admits reconfiguration between runs).
+    fn apply_pending_config(&mut self) {
+        let pending = self
+            .config_apply
+            .as_ref()
+            .map_or(self.applied_generation, ConfigApplyState::pending);
+        self.apply_config_for(pending);
+    }
+
+    /// Lands the current configuration snapshot on the idle driver when
+    /// `generation` is newer than this actor's last apply (`docs/CLI.md`
+    /// §4.4, decision D2).
+    ///
+    /// A no-op when the generation was already applied, when the engine has
+    /// no configuration backend, or when a run is in flight — in the running
+    /// case the run-completion path re-checks the pending generation at the
+    /// turn boundary, so the apply is deferred rather than lost (agent-lib
+    /// only admits reconfiguration between runs).
+    fn apply_config_for(&mut self, generation: u64) {
+        if generation <= self.applied_generation {
+            return;
+        }
+        let Some(config_apply) = &self.config_apply else {
+            return;
+        };
+        let DriverState::Idle(driver) = &mut self.state else {
+            return;
+        };
+        let snapshot = config_apply.service().current();
+        driver.apply_config(self.session_id, &snapshot);
+        // The generation is marked applied even when individual items were
+        // rejected: a rejection is permanent for this snapshot (warned and
+        // skipped inside the driver), never a retryable failure.
+        self.applied_generation = generation;
     }
 
     /// Starts a run for `text`, deferring or rejecting when a run cannot start.
@@ -304,6 +386,9 @@ fn session_thread(
     event_bus: EventBus,
     store: Arc<Persistence>,
     restore: Option<AgentSnapshot>,
+    config_apply: Option<ConfigApplyState>,
+    applied_generation: u64,
+    turn_complete: TurnCompleteHub,
     commands: mpsc::UnboundedReceiver<SessionCommand>,
 ) {
     let runtime = Builder::new_current_thread()
@@ -321,14 +406,23 @@ fn session_thread(
     let driver = match restore {
         Some(snapshot) => SessionDriver::restore(
             client,
-            &tools,
+            tools,
             approval.clone(),
             snapshot,
             config.budget.as_ref(),
+            turn_complete,
         ),
-        None => SessionDriver::new(&config, client, &tools, approval.clone()),
+        None => SessionDriver::new(&config, client, tools, approval.clone(), turn_complete),
     };
-    let actor = SessionActor::new(session_id, event_bus, driver, approval, store);
+    let actor = SessionActor::new(
+        session_id,
+        event_bus,
+        driver,
+        approval,
+        store,
+        config_apply,
+        applied_generation,
+    );
     local.block_on(&runtime, actor.run(commands));
 }
 
@@ -349,6 +443,8 @@ pub(crate) struct SessionManager {
     tools: Arc<ToolRegistry>,
     event_bus: EventBus,
     store: Arc<Persistence>,
+    config_apply: Option<ConfigApplyState>,
+    turn_complete: TurnCompleteHub,
     handles: Mutex<HashMap<SessionId, SessionHandle>>,
 }
 
@@ -356,18 +452,25 @@ impl SessionManager {
     /// Creates a manager bound to `event_bus`, spawning actors only when a
     /// `client` is present. Each spawned session assembles its agent with the
     /// shared `tools` registry (`docs/DESIGN.md` §3.2) and persists its committed
-    /// snapshots to `store` (`docs/DESIGN.md` §3.6).
+    /// snapshots to `store` (`docs/DESIGN.md` §3.6). `config_apply` (when the
+    /// engine has a configuration backend) lets actors land `apply_config` at
+    /// turn boundaries (`docs/CLI.md` §4.4), and `turn_complete` is the
+    /// engine-wide hook notified after every run terminal (`docs/CLI.md` §4.5).
     pub(crate) fn new(
         client: Option<Arc<dyn LlmClient>>,
         tools: Arc<ToolRegistry>,
         event_bus: EventBus,
         store: Arc<Persistence>,
+        config_apply: Option<ConfigApplyState>,
+        turn_complete: TurnCompleteHub,
     ) -> Self {
         Self {
             client,
             tools,
             event_bus,
             store,
+            config_apply,
+            turn_complete,
             handles: Mutex::new(HashMap::new()),
         }
     }
@@ -419,6 +522,14 @@ impl SessionManager {
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let event_bus = self.event_bus.clone();
         let store = self.store.clone();
+        let config_apply = self.config_apply.clone();
+        let turn_complete = self.turn_complete.clone();
+        // Read the apply generation synchronously *before* the handle is
+        // registered: a bump racing the spawn either lands before this read
+        // (the new session counts as up-to-date and never sees the command)
+        // or after it (the `ApplyConfig` command carries the newer
+        // generation and the actor applies it despite the stale baseline).
+        let applied_generation = config_apply.as_ref().map_or(0, ConfigApplyState::pending);
         let thread = thread::Builder::new()
             .name(format!("mag-session-{session_id}"))
             .spawn(move || {
@@ -430,6 +541,9 @@ impl SessionManager {
                     event_bus,
                     store,
                     restore,
+                    config_apply,
+                    applied_generation,
+                    turn_complete,
                     commands_rx,
                 )
             })
@@ -441,6 +555,24 @@ impl SessionManager {
                 thread,
             },
         );
+    }
+
+    /// Asks every live session actor to apply the current configuration
+    /// snapshot at its next opportunity (`docs/CLI.md` §4.4).
+    ///
+    /// The engine bumps the shared generation before calling this and hands
+    /// the new generation over; an idle actor applies immediately when it
+    /// services the command, while an actor with a run in flight applies at
+    /// the run's turn boundary instead (reconfiguration mid-turn is
+    /// impossible on agent-lib's admission rules). Actors that already
+    /// applied this generation no-op. A dead actor's send failure is
+    /// ignored — the session is being torn down.
+    pub(crate) fn apply_config(&self, generation: u64) {
+        for sender in lock_recovering(&self.handles).values() {
+            let _ = sender
+                .commands
+                .send(SessionCommand::ApplyConfig { generation });
+        }
     }
 
     /// Routes a user message to the session actor and awaits the started run id.

@@ -13,6 +13,7 @@ use std::{
 use agent_lib::client::LlmClient;
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
+use mag_config::ConfigError;
 use mag_service::{
     InteractionResponseWire, MagService, RequestId, RunId, ServiceError, ServiceEvent,
     SessionConfig, SessionId, SessionInfo, SourceInfo, UserInput,
@@ -23,8 +24,10 @@ use uuid::Uuid;
 
 use crate::{
     EventBus,
+    config::ConfigService,
     persistence::{Persistence, PersistenceError},
     session::SessionManager,
+    turn_complete::{TurnCompleteHub, TurnCompleteListener},
 };
 
 pub(crate) mod approval;
@@ -56,7 +59,7 @@ impl Engine {
     /// store that survives a restart.
     #[must_use]
     pub fn new() -> Self {
-        Self::assemble(None, Arc::new(ToolRegistry::new()), in_memory_store())
+        Self::assemble(None, Arc::new(ToolRegistry::new()), in_memory_store(), None)
     }
 
     /// Creates an engine that drives chat turns through `client`, exposing the
@@ -78,7 +81,54 @@ impl Engine {
     /// [`with_persistence`](Engine::with_persistence) for a durable store.
     #[must_use]
     pub fn with_llm_client_and_tools(client: Arc<dyn LlmClient>, tools: ToolRegistry) -> Self {
-        Self::assemble(Some(client), Arc::new(tools), in_memory_store())
+        Self::assemble(Some(client), Arc::new(tools), in_memory_store(), None)
+    }
+
+    /// Creates an engine backed by a runtime [`ConfigService`]
+    /// (`docs/CLI.md` §4.3–§4.5).
+    ///
+    /// This is the configuration injection point: with a config service
+    /// present, the engine implements the full `MagService` configuration
+    /// surface — [`get_config`](MagService::get_config) /
+    /// [`update_config`](MagService::update_config) /
+    /// [`reload_config`](MagService::reload_config) proxy the service
+    /// (emitting [`ServiceEvent::ConfigChanged`] on success), and
+    /// [`apply_config`](MagService::apply_config) rolls the current snapshot
+    /// onto live sessions at each session's next turn boundary through the
+    /// turn-complete mechanism (`docs/CLI.md` §4.4/§4.5); sessions without an
+    /// in-progress run apply immediately. Engines built by the other
+    /// constructors keep reporting those methods as
+    /// [`ServiceError::Unsupported`].
+    ///
+    /// Persistence is in-memory; see [`with_persistence`](Engine::with_persistence)
+    /// for a durable store. `Engine::from_config` (M3-6) will assemble the
+    /// client/tools/persistence from the snapshot itself and route here.
+    #[must_use]
+    pub fn with_config_service(
+        client: Arc<dyn LlmClient>,
+        tools: ToolRegistry,
+        config: Arc<ConfigService>,
+    ) -> Self {
+        Self::assemble(
+            Some(client),
+            Arc::new(tools),
+            in_memory_store(),
+            Some(config),
+        )
+    }
+
+    /// Registers a [`TurnCompleteListener`] invoked once after every run
+    /// terminal on every live session (`docs/CLI.md` §4.5).
+    ///
+    /// This is the registration seam for turn-complete consumers beyond the
+    /// built-in configuration apply — desktop notifications, usage accounting,
+    /// session-title generation. Listeners run synchronously on the session's
+    /// driver thread in registration order; a panicking listener is logged and
+    /// skipped without affecting the driver or later listeners. Registration
+    /// after sessions already exist is fine: the registry is shared, so later
+    /// terminals on those sessions still reach the new listener.
+    pub fn add_turn_complete_listener(&self, listener: Arc<dyn TurnCompleteListener>) {
+        self.inner.turn_complete.add_listener(listener);
     }
 
     /// Creates an engine whose sessions and committed snapshots are persisted to a
@@ -101,7 +151,7 @@ impl Engine {
         path: impl AsRef<Path>,
     ) -> Result<Self, PersistenceError> {
         let store = Arc::new(Persistence::open(path)?);
-        Ok(Self::assemble(Some(client), Arc::new(tools), store))
+        Ok(Self::assemble(Some(client), Arc::new(tools), store, None))
     }
 
     /// Assembles an engine over an already-opened persistence store.
@@ -109,9 +159,10 @@ impl Engine {
         client: Option<Arc<dyn LlmClient>>,
         tools: Arc<ToolRegistry>,
         store: Arc<Persistence>,
+        config: Option<Arc<ConfigService>>,
     ) -> Self {
         Self {
-            inner: Arc::new(EngineInner::new(client, tools, store)),
+            inner: Arc::new(EngineInner::new(client, tools, store, config)),
         }
     }
 }
@@ -283,33 +334,69 @@ impl MagService for Engine {
 
     // —— Runtime configuration ——
     //
-    // Placeholder until the `ConfigService` wiring lands: construction
-    // injection and the broadcast → `ServiceEvent::ConfigChanged` bridge are
-    // M3-5/M3-6 scope (`docs/CLI.md` §4.3–§4.5). Until then the engine reports
-    // the configuration surface as unsupported, matching the `list_sources`
-    // convention.
+    // Live when the engine was assembled with a `ConfigService`
+    // (`Engine::with_config_service`, `docs/CLI.md` §4.3–§4.5);
+    // otherwise the configuration surface reports `Unsupported`, matching the
+    // `list_sources` convention.
     async fn get_config(&self) -> Result<mag_service::ConfigDto, ServiceError> {
-        Err(ServiceError::Unsupported {
-            operation: "get_config".to_owned(),
-        })
+        let Some(config_apply) = &self.inner.config_apply else {
+            return Err(ServiceError::Unsupported {
+                operation: "get_config".to_owned(),
+            });
+        };
+        // Projecting the current snapshot back to a DTO keeps secrets in
+        // their reference form (`docs/CLI.md` §4.1/§4.3).
+        Ok(config_apply.service().current().project())
     }
 
-    async fn update_config(&self, _config: mag_service::ConfigDto) -> Result<(), ServiceError> {
-        Err(ServiceError::Unsupported {
-            operation: "update_config".to_owned(),
-        })
+    async fn update_config(&self, config: mag_service::ConfigDto) -> Result<(), ServiceError> {
+        let Some(config_apply) = &self.inner.config_apply else {
+            return Err(ServiceError::Unsupported {
+                operation: "update_config".to_owned(),
+            });
+        };
+        let snapshot = config_apply
+            .service()
+            .update(config)
+            .map_err(config_error)?;
+        let _ = self
+            .inner
+            .event_bus
+            .emit(mag_service::Event::ConfigChanged {
+                revision: snapshot.revision(),
+            });
+        Ok(())
     }
 
     async fn reload_config(&self) -> Result<(), ServiceError> {
-        Err(ServiceError::Unsupported {
-            operation: "reload_config".to_owned(),
-        })
+        let Some(config_apply) = &self.inner.config_apply else {
+            return Err(ServiceError::Unsupported {
+                operation: "reload_config".to_owned(),
+            });
+        };
+        let snapshot = config_apply.service().reload().map_err(config_error)?;
+        let _ = self
+            .inner
+            .event_bus
+            .emit(mag_service::Event::ConfigChanged {
+                revision: snapshot.revision(),
+            });
+        Ok(())
     }
 
     async fn apply_config(&self) -> Result<(), ServiceError> {
-        Err(ServiceError::Unsupported {
-            operation: "apply_config".to_owned(),
-        })
+        let Some(config_apply) = &self.inner.config_apply else {
+            return Err(ServiceError::Unsupported {
+                operation: "apply_config".to_owned(),
+            });
+        };
+        // Bump the shared generation, then poke every live session actor:
+        // idle sessions apply immediately when they service the command;
+        // sessions with a run in flight apply at the run's turn boundary
+        // (`docs/CLI.md` §4.4/§4.5).
+        let generation = config_apply.bump();
+        self.inner.manager.apply_config(generation);
+        Ok(())
     }
 }
 
@@ -325,6 +412,12 @@ struct EngineInner {
     session_ids: SessionIdSource,
     store: Arc<Persistence>,
     manager: SessionManager,
+    /// Present when the engine was assembled with a [`ConfigService`]
+    /// (`docs/CLI.md` §4.3): backs the `MagService` configuration surface.
+    config_apply: Option<ConfigApplyState>,
+    /// Engine-wide turn-complete hook (`docs/CLI.md` §4.5), shared with every
+    /// session driver.
+    turn_complete: TurnCompleteHub,
 }
 
 impl EngineInner {
@@ -332,6 +425,7 @@ impl EngineInner {
         client: Option<Arc<dyn LlmClient>>,
         tools: Arc<ToolRegistry>,
         store: Arc<Persistence>,
+        config: Option<Arc<ConfigService>>,
     ) -> Self {
         let event_bus = EventBus::new();
         // Seed the id counter past every persisted session so a restarted engine
@@ -344,14 +438,66 @@ impl EngineInner {
             }
             _ => SessionIdSource::new(),
         };
-        let manager = SessionManager::new(client, tools, event_bus.clone(), store.clone());
+        let config_apply = config.map(ConfigApplyState::new);
+        let turn_complete = TurnCompleteHub::default();
+        let manager = SessionManager::new(
+            client,
+            tools,
+            event_bus.clone(),
+            store.clone(),
+            config_apply.clone(),
+            turn_complete.clone(),
+        );
         Self {
             sessions: Mutex::new(BTreeMap::new()),
             event_bus,
             session_ids,
             store,
             manager,
+            config_apply,
+            turn_complete,
         }
+    }
+}
+
+/// Shared config-apply plumbing between the engine and its session actors
+/// (`docs/CLI.md` §4.4, decision D2).
+///
+/// `apply_config` bumps `generation` (the *pending* marker); each session
+/// actor tracks the generation it last applied and lands the current snapshot
+/// on its agent as soon as it observes a newer generation while at rest —
+/// immediately when idle (the actor services the `ApplyConfig` command), or
+/// at the next run terminal when a run is in flight (the run-completion path
+/// re-checks the generation, which is how the apply rides the turn-complete
+/// boundary of §4.5).
+#[derive(Clone, Debug)]
+pub(crate) struct ConfigApplyState {
+    service: Arc<ConfigService>,
+    generation: Arc<AtomicU64>,
+}
+
+impl ConfigApplyState {
+    /// Creates the shared state around `service`, with no apply pending.
+    pub(crate) fn new(service: Arc<ConfigService>) -> Self {
+        Self {
+            service,
+            generation: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// The configuration service backing this apply channel.
+    pub(crate) fn service(&self) -> &Arc<ConfigService> {
+        &self.service
+    }
+
+    /// Marks a new apply request pending, returning its generation.
+    pub(crate) fn bump(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// The generation of the newest apply request (0 = none ever requested).
+    pub(crate) fn pending(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
     }
 }
 
@@ -365,6 +511,17 @@ fn in_memory_store() -> Arc<Persistence> {
 /// Maps a [`PersistenceError`] into a service-level [`ServiceError::Backend`].
 fn persistence_backend(error: PersistenceError) -> ServiceError {
     ServiceError::Backend {
+        message: error.to_string(),
+    }
+}
+
+/// Maps a [`ConfigError`] into the service-level [`ServiceError::Config`].
+///
+/// The error's Display carries the dotted field path / line-column detail but
+/// never a materialized secret value (secrets stay `{env=...}` references in
+/// the file and DTO, `docs/CLI.md` §4.1).
+fn config_error(error: ConfigError) -> ServiceError {
+    ServiceError::Config {
         message: error.to_string(),
     }
 }
@@ -2434,6 +2591,429 @@ mod pivot {
         assert!(
             json.contains("start"),
             "persisted snapshot should carry the original message: {json}",
+        );
+    }
+}
+
+#[cfg(test)]
+mod config_apply {
+    //! M3-5 integration tests: turn-complete listener fan-out and the
+    //! `apply_config` → turn-boundary reconfigure flow (`docs/CLI.md`
+    //! §4.4/§4.5), all offline over the scripted [`FakeLlmClient`].
+
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use agent_lib::{client::LlmClient, model::usage::Usage};
+    use futures::StreamExt;
+    use futures::stream::BoxStream;
+    use mag_service::{
+        MagService, RoutingMode, ServiceError, ServiceEvent, SessionConfig, SessionId, UserInput,
+    };
+    use tokio::time::{Duration, timeout};
+
+    use crate::test_support::{
+        FakeLlmClient, StreamGate, StreamScript, gated_text_stream, stalling_text_stream,
+        text_stream_with_usage,
+    };
+    use crate::{ConfigService, TurnCompleteListener, TurnCompletion, TurnSummary};
+
+    use super::Engine;
+
+    /// Unique temp directory per test, removed on drop (same pattern as the
+    /// `TempConfigDir` helper in `config.rs` tests).
+    struct TempConfigDir(PathBuf);
+
+    impl TempConfigDir {
+        fn new() -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos();
+            let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let mut path = std::env::temp_dir();
+            path.push(format!("mag-apply-{}-{nanos}-{unique}", std::process::id()));
+            fs::create_dir_all(&path).expect("create temp dir");
+            Self(path)
+        }
+
+        fn config_path(&self) -> PathBuf {
+            self.0.join("config.toml")
+        }
+    }
+
+    impl Drop for TempConfigDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Config whose `agents.default` only overrides the model.
+    const CONFIG_MODEL_B: &str = r#"
+[agents.default]
+model = "model-b"
+"#;
+
+    /// Config whose `agents.default` overrides the model and narrows the tool
+    /// surface to a subset of the built-ins.
+    const CONFIG_MODEL_B_TOOLS: &str = r#"
+[agents.default]
+model = "model-b"
+tools = ["read_file"]
+"#;
+
+    fn session_config(model: &str) -> SessionConfig {
+        SessionConfig {
+            provider: "fake".to_owned(),
+            model: model.to_owned(),
+            tool_profile: None,
+            cwd: None,
+            routing: RoutingMode::ModelRouted,
+            budget: None,
+        }
+    }
+
+    fn usage(input: u32, output: u32) -> Usage {
+        Usage {
+            input,
+            output,
+            total: Some(input + output),
+            ..Usage::default()
+        }
+    }
+
+    /// Builds an engine wired to a [`ConfigService`] serving `toml`, plus the
+    /// scripted fake client.
+    fn engine_with_config(
+        toml: &str,
+        scripts: Vec<StreamScript>,
+    ) -> (TempConfigDir, Engine, Arc<FakeLlmClient>) {
+        let dir = TempConfigDir::new();
+        fs::write(dir.config_path(), toml).expect("write config");
+        let service =
+            Arc::new(ConfigService::load_or_default(dir.config_path()).expect("load config"));
+        let fake = FakeLlmClient::scripted_streams(scripts);
+        let client: Arc<dyn LlmClient> = fake.clone();
+        let engine =
+            Engine::with_config_service(client, mag_tools::ToolRegistry::with_builtins(), service);
+        (dir, engine, fake)
+    }
+
+    async fn next_event(events: &mut BoxStream<'static, ServiceEvent>) -> ServiceEvent {
+        timeout(Duration::from_secs(5), events.next())
+            .await
+            .expect("event timed out")
+            .expect("event stream closed")
+    }
+
+    /// Waits until the nth `RunFinished` for `session` arrives, returning once
+    /// the run's terminal event has been observed.
+    async fn wait_run_finished(events: &mut BoxStream<'static, ServiceEvent>, session: SessionId) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if let ServiceEvent::RunFinished { id, .. } = next_event(events).await {
+                    assert_eq!(id, session);
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("run did not finish in time");
+    }
+
+    struct PanickingListener;
+
+    impl TurnCompleteListener for PanickingListener {
+        fn on_turn_complete(&self, _summary: &TurnSummary) {
+            panic!("listener blew up");
+        }
+    }
+
+    /// Listener recording every summary it receives, with a `Notify` so tests
+    /// can await delivery (the callback runs on the session's driver thread).
+    #[derive(Default)]
+    struct RecordingListener {
+        summaries: Mutex<Vec<TurnSummary>>,
+        wake: tokio::sync::Notify,
+    }
+
+    impl TurnCompleteListener for RecordingListener {
+        fn on_turn_complete(&self, summary: &TurnSummary) {
+            self.summaries
+                .lock()
+                .expect("recording lock")
+                .push(summary.clone());
+            self.wake.notify_one();
+        }
+    }
+
+    impl RecordingListener {
+        /// Awaits at least `n` recorded summaries and returns a snapshot.
+        async fn wait_for(&self, n: usize) -> Vec<TurnSummary> {
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    {
+                        let recorded = self.summaries.lock().expect("recording lock");
+                        if recorded.len() >= n {
+                            return recorded.clone();
+                        }
+                    }
+                    self.wake.notified().await;
+                }
+            })
+            .await
+            .expect("turn-complete listener timed out")
+        }
+    }
+
+    /// M3-5 (b): a session with no in-progress run applies the current
+    /// snapshot immediately — the very first run after `apply_config` already
+    /// uses the new model and the narrowed tool surface.
+    #[tokio::test]
+    async fn apply_config_on_idle_session_applies_immediately() {
+        let (_dir, engine, fake) = engine_with_config(
+            CONFIG_MODEL_B_TOOLS,
+            vec![StreamScript::Complete(text_stream_with_usage(
+                &["ok"],
+                usage(1, 1),
+            ))],
+        );
+        let session = engine
+            .create_session(session_config("fake-chat"))
+            .await
+            .expect("create session");
+        let mut events = engine.subscribe(Some(session));
+
+        engine.apply_config().await.expect("apply config");
+        engine
+            .send_message(session, UserInput::text("hi"))
+            .await
+            .expect("send message");
+        wait_run_finished(&mut events, session).await;
+
+        let requests = fake.stream_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].model, "model-b");
+        let tool_names: Vec<&str> = requests[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(tool_names, vec!["read_file"]);
+    }
+
+    /// M3-5 (a): `apply_config` arriving mid-run lands at the turn boundary —
+    /// the in-flight run keeps its original configuration to the end (the
+    /// facade only admits reconfiguration at rest), and the reconfigure takes
+    /// effect for the next run.
+    #[tokio::test]
+    async fn apply_config_during_run_lands_at_the_turn_boundary() {
+        let gate = StreamGate::new();
+        let (_dir, engine, fake) = engine_with_config(
+            CONFIG_MODEL_B,
+            vec![
+                gated_text_stream(&["first"], gate.clone(), usage(1, 1)),
+                StreamScript::Complete(text_stream_with_usage(&["second"], usage(1, 1))),
+            ],
+        );
+        let session = engine
+            .create_session(session_config("fake-chat"))
+            .await
+            .expect("create session");
+        let mut events = engine.subscribe(Some(session));
+
+        engine
+            .send_message(session, UserInput::text("one"))
+            .await
+            .expect("first send");
+        // Wait until the run is genuinely in flight (parked on the gate).
+        loop {
+            if matches!(
+                next_event(&mut events).await,
+                ServiceEvent::TextDelta { .. }
+            ) {
+                break;
+            }
+        }
+
+        engine.apply_config().await.expect("apply config mid-run");
+        // The in-flight run is untouched: one request so far, old model.
+        assert_eq!(fake.stream_requests().len(), 1);
+        assert_eq!(fake.stream_requests()[0].model, "fake-chat");
+
+        gate.open();
+        wait_run_finished(&mut events, session).await;
+
+        engine
+            .send_message(session, UserInput::text("two"))
+            .await
+            .expect("second send");
+        wait_run_finished(&mut events, session).await;
+
+        // The reconfigure happened after the first run's terminal (it is only
+        // admitted at rest): the second run's request carries the new model.
+        let requests = fake.stream_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].model, "model-b");
+    }
+
+    /// M3-5 (c): a panicking listener is isolated — later listeners still
+    /// receive the summary and the run's event flow is undisturbed.
+    #[tokio::test]
+    async fn panicking_listener_is_isolated_from_run_and_other_listeners() {
+        let fake = FakeLlmClient::scripted(vec![text_stream_with_usage(&["ok"], usage(1, 1))]);
+        let client: Arc<dyn LlmClient> = fake;
+        let engine = Engine::with_llm_client(client);
+        engine.add_turn_complete_listener(Arc::new(PanickingListener));
+        let recorder = Arc::new(RecordingListener::default());
+        engine.add_turn_complete_listener(recorder.clone());
+
+        let session = engine
+            .create_session(session_config("fake-chat"))
+            .await
+            .expect("create session");
+        let mut events = engine.subscribe(Some(session));
+        engine
+            .send_message(session, UserInput::text("hi"))
+            .await
+            .expect("send message");
+        wait_run_finished(&mut events, session).await;
+
+        let summaries = recorder.wait_for(1).await;
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].session_id(), session);
+        assert_eq!(summaries[0].completion(), TurnCompletion::Committed);
+    }
+
+    /// The hook fires for every terminal kind, not just successful runs: a
+    /// cancelled run reports `Cancelled`.
+    #[tokio::test]
+    async fn listener_observes_cancelled_completion() {
+        let fake = FakeLlmClient::scripted_streams(vec![stalling_text_stream(&["hi"])]);
+        let client: Arc<dyn LlmClient> = fake;
+        let engine = Engine::with_llm_client(client);
+        let recorder = Arc::new(RecordingListener::default());
+        engine.add_turn_complete_listener(recorder.clone());
+
+        let session = engine
+            .create_session(session_config("fake-chat"))
+            .await
+            .expect("create session");
+        let mut events = engine.subscribe(Some(session));
+        engine
+            .send_message(session, UserInput::text("hi"))
+            .await
+            .expect("send message");
+        // Wait for the run to be in flight, then cancel it.
+        loop {
+            match next_event(&mut events).await {
+                ServiceEvent::RunStarted { .. } => break,
+                _ => continue,
+            }
+        }
+        engine.cancel(session).await.expect("cancel");
+        loop {
+            match next_event(&mut events).await {
+                ServiceEvent::RunError {
+                    kind: mag_service::RunErrorKind::Cancelled,
+                    ..
+                } => break,
+                _ => continue,
+            }
+        }
+
+        let summaries = recorder.wait_for(1).await;
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].completion(), TurnCompletion::Cancelled);
+    }
+
+    /// The four `MagService` configuration methods proxy the injected
+    /// `ConfigService`: reads project the current snapshot, writes bump the
+    /// revision and emit `ConfigChanged`, and failures surface as
+    /// `ServiceError::Config` without disturbing the snapshot.
+    #[tokio::test]
+    async fn config_methods_proxy_the_config_service() {
+        let (_dir, engine, _fake) = engine_with_config(CONFIG_MODEL_B, Vec::new());
+        let mut events = engine.subscribe(None);
+
+        // get_config projects the current snapshot (DTO form).
+        let dto = engine.get_config().await.expect("get config");
+        assert_eq!(
+            dto.agents
+                .get("default")
+                .and_then(|agent| agent.model.as_deref()),
+            Some("model-b")
+        );
+
+        // update_config swaps the snapshot and announces the new revision.
+        let mut updated = dto.clone();
+        updated
+            .agents
+            .get_mut("default")
+            .expect("default agent")
+            .model = Some("model-c".to_owned());
+        engine
+            .update_config(updated.clone())
+            .await
+            .expect("update config");
+        assert_eq!(
+            next_event(&mut events).await,
+            ServiceEvent::ConfigChanged { revision: 1 }
+        );
+        assert_eq!(
+            engine.get_config().await.expect("get updated config"),
+            updated
+        );
+
+        // reload_config picks up an external edit.
+        fs::write(
+            _dir.config_path(),
+            CONFIG_MODEL_B.replace("model-b", "model-d"),
+        )
+        .expect("external edit");
+        engine.reload_config().await.expect("reload config");
+        assert_eq!(
+            next_event(&mut events).await,
+            ServiceEvent::ConfigChanged { revision: 2 }
+        );
+        let dto = engine.get_config().await.expect("get reloaded config");
+        assert_eq!(
+            dto.agents
+                .get("default")
+                .and_then(|agent| agent.model.as_deref()),
+            Some("model-d")
+        );
+
+        // A failing update surfaces `ServiceError::Config` and changes
+        // nothing.
+        let invalid = mag_service::ConfigDto::parse_str("[agents.default]\nprovider = \"ghost\"\n")
+            .expect("invalid-reference DTO still parses");
+        let error = engine
+            .update_config(invalid)
+            .await
+            .expect_err("invalid update must fail");
+        assert!(matches!(error, ServiceError::Config { .. }), "got: {error}");
+        assert_eq!(engine.get_config().await.expect("config unchanged"), dto);
+    }
+
+    /// `apply_config` with no configuration backend stays `Unsupported`
+    /// (engines built by the other constructors).
+    #[tokio::test]
+    async fn apply_config_without_config_service_is_unsupported() {
+        let engine = Engine::new();
+        assert_eq!(
+            engine.apply_config().await,
+            Err(ServiceError::Unsupported {
+                operation: "apply_config".to_owned(),
+            })
         );
     }
 }

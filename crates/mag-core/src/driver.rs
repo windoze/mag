@@ -19,7 +19,7 @@
 //! [`IpcApproval`]; tools without a permission stay auto-allowed and never
 //! interrupt the run.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::convert::Infallible;
 use std::sync::{
     Arc, Mutex, PoisonError,
@@ -32,11 +32,12 @@ use agent_lib::{
     agent::{BudgetLimits, InteractionHandler, WorktreeRef},
     client::LlmClient,
     facade::{
-        Agent, AgentRunStream, AgentSnapshot, ApprovalPolicy, CancelHandle, FacadeError, Tool,
-        ToolContext, ToolResult, ToolTrace as FacadeToolTrace, UsageSummary, WireRunEvent,
-        WireRunOutput,
+        Agent, AgentRunStream, AgentSnapshot, ApprovalPolicy, CancelHandle, FacadeError, ModelRef,
+        ReconfigRequest, Tool, ToolContext, ToolResult, ToolSetId, ToolSetRef,
+        ToolTrace as FacadeToolTrace, UsageSummary, WireRunEvent, WireRunOutput,
     },
 };
+use mag_config::ConfigSnapshot;
 use mag_service::{
     Event, RunErrorKind, RunId as WireRunId, RunOutput, SessionBudget, SessionConfig, SessionId,
     ToolCallIdWire, ToolStatusWire, ToolTrace, UsageInfo,
@@ -45,10 +46,25 @@ use mag_tools::{ToolPlugin, ToolRegistry};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::{EventBus, engine::approval::IpcApproval, persistence::Persistence};
+use crate::{
+    EventBus,
+    engine::approval::IpcApproval,
+    persistence::Persistence,
+    turn_complete::{TurnCompleteHub, TurnCompletion, TurnSummary},
+};
 
 const DEFAULT_MAX_TOKENS: u32 = 512;
 const DEFAULT_MAX_STEPS: u32 = 8;
+
+/// Name of the `agents.<name>` entry a session reconfigures from on
+/// `apply_config` (`docs/CLI.md` §4.4).
+///
+/// Provisional binding: sessions do not yet carry an agent name (they are
+/// created from a wire [`SessionConfig`]), so the runtime config apply reads
+/// the well-known `default` agent entry — the same entry the §4.2 example
+/// config defines. The session↔agent binding becomes explicit when
+/// `Engine::from_config` lands (M3-6).
+const DEFAULT_AGENT_NAME: &str = "default";
 
 /// Shared pivot queue bridging one in-flight run and its session actor
 /// (`docs/CLI.md` §3.2, decision D1).
@@ -104,7 +120,16 @@ impl PivotQueue {
 #[derive(Debug)]
 pub(crate) struct SessionDriver {
     agent: Agent,
+    /// Executable tool surface the agent was built with; consulted again at
+    /// config-apply time to project a filtered [`ReplaceToolSet`] declaration
+    /// list (`docs/CLI.md` §4.4).
+    tools: Arc<ToolRegistry>,
+    /// Turn-complete hook point: notified once after every run terminal
+    /// (`docs/CLI.md` §4.5).
+    turn_complete: TurnCompleteHub,
     run_counter: AtomicU64,
+    /// Mints fresh tool-set identities for `apply_config` reconfigurations.
+    tool_set_counter: AtomicU64,
 }
 
 impl SessionDriver {
@@ -129,10 +154,11 @@ impl SessionDriver {
     pub(crate) fn new(
         config: &SessionConfig,
         client: Arc<dyn LlmClient>,
-        tools: &ToolRegistry,
+        tools: Arc<ToolRegistry>,
         approval: Arc<IpcApproval>,
+        turn_complete: TurnCompleteHub,
     ) -> Result<Self, FacadeError> {
-        let (facade_tools, policy) = tool_surface(tools);
+        let (facade_tools, policy) = tool_surface(&tools);
         let mut builder = Agent::builder()
             .client(client)
             .model(config.model.clone())
@@ -152,7 +178,10 @@ impl SessionDriver {
 
         Ok(Self {
             agent,
+            tools,
+            turn_complete,
             run_counter: AtomicU64::new(1),
+            tool_set_counter: AtomicU64::new(1),
         })
     }
 
@@ -180,12 +209,13 @@ impl SessionDriver {
     /// a snapshot whose state cannot be deserialized).
     pub(crate) fn restore(
         client: Arc<dyn LlmClient>,
-        tools: &ToolRegistry,
+        tools: Arc<ToolRegistry>,
         approval: Arc<IpcApproval>,
         snapshot: AgentSnapshot,
         budget: Option<&SessionBudget>,
+        turn_complete: TurnCompleteHub,
     ) -> Result<Self, FacadeError> {
-        let (facade_tools, policy) = tool_surface(tools);
+        let (facade_tools, policy) = tool_surface(&tools);
         let mut builder = Agent::restore()
             .snapshot(snapshot)
             .client(client)
@@ -200,7 +230,10 @@ impl SessionDriver {
 
         Ok(Self {
             agent,
+            tools,
+            turn_complete,
             run_counter: AtomicU64::new(1),
+            tool_set_counter: AtomicU64::new(1),
         })
     }
 
@@ -249,6 +282,13 @@ impl SessionDriver {
     /// [`Event::PivotDropped`] with the run's terminal reason *before* the
     /// terminal event is emitted, and the outcome is returned so the session
     /// actor can drop any pivot that raced the run's end with the same reason.
+    ///
+    /// Right after the terminal event is emitted — with the run's mutable
+    /// stream borrow released and the facade agent at rest — the turn-complete
+    /// hook fires exactly once (`docs/CLI.md` §4.5): every registered
+    /// [`TurnCompleteListener`](crate::TurnCompleteListener) observes the
+    /// session id and the run's completion kind, with listener failures
+    /// isolated from the driver.
     pub(crate) async fn run_turn(
         &mut self,
         session_id: SessionId,
@@ -258,6 +298,9 @@ impl SessionDriver {
         pivots: &PivotQueue,
         store: &Persistence,
     ) -> TurnOutcome {
+        // Cloned up front so the early-error path below can fire the
+        // turn-complete hook without touching the mutably borrowed agent.
+        let turn_complete = self.turn_complete.clone();
         let mut stream = match self.agent.stream_with_cancel(text, cancel.clone()).await {
             Ok(stream) => stream,
             Err(error) => {
@@ -267,6 +310,7 @@ impl SessionDriver {
                     message: error.to_string(),
                     kind: error_kind(&error),
                 });
+                turn_complete.notify(&TurnSummary::new(session_id, TurnCompletion::Failed));
                 return TurnOutcome::Failed {
                     kind: error_kind(&error),
                     message: error.to_string(),
@@ -340,7 +384,153 @@ impl SessionDriver {
             },
         };
         let _ = events.emit(terminal);
+        self.notify_turn_complete(session_id, TurnCompletion::from(&outcome));
         outcome
+    }
+
+    /// Emits the turn-complete hook for this run terminal (`docs/CLI.md` §4.5).
+    ///
+    /// Called after the terminal event went out and the run's mutable stream
+    /// borrow was released: the facade agent is at rest (committed, failed, or
+    /// cancelled), which is exactly the committed consistency point §4.5 hangs
+    /// the notification on. Listener failures are isolated inside the hub.
+    fn notify_turn_complete(&self, session_id: SessionId, completion: TurnCompletion) {
+        self.turn_complete
+            .notify(&TurnSummary::new(session_id, completion));
+    }
+
+    /// Applies the runtime configuration snapshot to this session's agent at a
+    /// turn boundary (`docs/CLI.md` §4.4, decision D2).
+    ///
+    /// The caller (the session actor) only invokes this while the agent is at
+    /// rest — right after a run terminal, or immediately when the session has
+    /// no in-progress run — satisfying agent-lib's reconfigure admission rule
+    /// (Idle/between-runs only).
+    ///
+    /// Field mapping from the snapshot's [`DEFAULT_AGENT_NAME`] entry:
+    ///
+    /// - `model` → [`ReconfigRequest::SetModel`] (only when it actually
+    ///   changed; `max_tokens`/`temperature` keep their current values since
+    ///   the config schema carries no LLM sampling parameters yet).
+    /// - `tools` → [`ReconfigRequest::ReplaceToolSet`] with the declarations
+    ///   of the enabled entries, projected from this driver's executable
+    ///   [`ToolRegistry`] (only when the effective name set changed). A config
+    ///   tool name with no registered plugin is skipped with a warn log — the
+    ///   facade would reject the whole set for referencing a tool outside its
+    ///   registry. An agent entry with no tool list imposes no constraint and
+    ///   leaves the current surface untouched.
+    ///
+    /// Out of scope on the current agent-lib reconfigure surface (documented
+    /// for M3-R/M3-6): the approval policy is baked into the agent at build
+    /// time and has no reconfigure variant, so `tools.*.approval` /
+    /// `approval.*` changes take effect on the next session (re)build rather
+    /// than mid-session; per-run `budget` is likewise build-time only (and
+    /// `session` defaults only affect new sessions per decision D2).
+    pub(crate) fn apply_config(&mut self, session_id: SessionId, snapshot: &ConfigSnapshot) {
+        let requests = self.reconfig_requests(session_id, snapshot);
+        self.apply_reconfig_items(session_id, requests);
+    }
+
+    /// Applies each reconfigure request independently.
+    ///
+    /// Per-item failure isolation (`docs/CLI.md` §4.4, TODO M3-5): a rejected
+    /// item — an immutable variant such as a skill request (facade reports
+    /// [`FacadeError::Config`]), or a payload failing admission — is logged at
+    /// warn level and skipped, keeping the agent's previous value; the
+    /// remaining items are still applied and the session's main flow is never
+    /// interrupted.
+    pub(crate) fn apply_reconfig_items(
+        &mut self,
+        session_id: SessionId,
+        requests: Vec<ReconfigRequest>,
+    ) {
+        for request in requests {
+            let family = reconfig_family(&request);
+            if let Err(error) = self.agent.reconfigure(request) {
+                tracing::warn!(
+                    session_id = %session_id,
+                    request = family,
+                    error = %error,
+                    "config apply: reconfigure item rejected; keeping the previous value"
+                );
+            }
+        }
+    }
+
+    /// Builds the reconfigure batch projecting the snapshot's
+    /// [`DEFAULT_AGENT_NAME`] entry onto this session's agent.
+    fn reconfig_requests(
+        &mut self,
+        session_id: SessionId,
+        snapshot: &ConfigSnapshot,
+    ) -> Vec<ReconfigRequest> {
+        let Some(agent_config) = snapshot.agent(DEFAULT_AGENT_NAME) else {
+            return Vec::new();
+        };
+        let mut requests = Vec::new();
+
+        if let Some(model) = agent_config.model() {
+            let current = self.agent.state().current_model();
+            if current.model() != model {
+                requests.push(ReconfigRequest::SetModel {
+                    model: ModelRef::new(
+                        model.to_owned(),
+                        current.max_tokens(),
+                        current.temperature(),
+                        None,
+                    ),
+                });
+            }
+        }
+
+        let wanted: Vec<&str> = agent_config
+            .tools()
+            .iter()
+            .filter(|tool| tool.is_enabled())
+            .map(|tool| tool.name())
+            .collect();
+        if !wanted.is_empty() {
+            let mut declarations = Vec::new();
+            for name in wanted {
+                match self
+                    .tools
+                    .plugins()
+                    .iter()
+                    .find(|plugin| plugin.name() == name)
+                {
+                    Some(plugin) => declarations.push(plugin.declaration()),
+                    None => tracing::warn!(
+                        session_id = %session_id,
+                        tool = name,
+                        "config apply: tool not present in the tool registry; skipped"
+                    ),
+                }
+            }
+            let current_names: BTreeSet<&str> = self
+                .agent
+                .state()
+                .current_tool_set()
+                .tools()
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect();
+            let wanted_names: BTreeSet<&str> =
+                declarations.iter().map(|tool| tool.name.as_str()).collect();
+            if current_names != wanted_names {
+                let id = self.next_tool_set_id();
+                requests.push(ReconfigRequest::ReplaceToolSet {
+                    tool_set: ToolSetRef::new(id, declarations),
+                });
+            }
+        }
+
+        requests
+    }
+
+    /// Mints a fresh identity for a replacement tool set.
+    fn next_tool_set_id(&self) -> ToolSetId {
+        let value = self.tool_set_counter.fetch_add(1, Ordering::Relaxed);
+        ToolSetId::new(Uuid::from_u128(u128::from(value)))
     }
 
     /// Captures the agent's committed [`AgentSnapshot`] and writes it to `store`.
@@ -391,6 +581,33 @@ impl TurnOutcome {
             Self::Failed { .. } => PIVOT_DROP_RUN_FAILED,
             Self::Cancelled => PIVOT_DROP_RUN_CANCELLED,
         }
+    }
+}
+
+impl From<&TurnOutcome> for TurnCompletion {
+    /// Maps the driver's terminal outcome onto the turn-complete hook's
+    /// completion kind (`docs/CLI.md` §4.5).
+    fn from(outcome: &TurnOutcome) -> Self {
+        match outcome {
+            TurnOutcome::Completed => Self::Committed,
+            TurnOutcome::Failed { .. } => Self::Failed,
+            TurnOutcome::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+/// Short static label identifying a reconfigure request variant, stamped on
+/// warn logs when an item is rejected at admission.
+fn reconfig_family(request: &ReconfigRequest) -> &'static str {
+    match request {
+        ReconfigRequest::ActivateSkill { .. } => "activate_skill",
+        ReconfigRequest::DeactivateSkill { .. } => "deactivate_skill",
+        ReconfigRequest::ReplaceActiveSkills { .. } => "replace_active_skills",
+        ReconfigRequest::SetSystemPromptOverlay { .. } => "set_system_prompt_overlay",
+        ReconfigRequest::ReplaceToolSet { .. } => "replace_tool_set",
+        ReconfigRequest::PatchToolSet { .. } => "patch_tool_set",
+        ReconfigRequest::SetModel { .. } => "set_model",
+        ReconfigRequest::SetLoopPolicy { .. } => "set_loop_policy",
     }
 }
 
@@ -611,6 +828,8 @@ mod tests {
     use serde_json::Map;
     use uuid::Uuid;
 
+    use crate::test_support::{FakeLlmClient, text_stream_with_usage};
+
     use super::map_wire_event;
 
     fn session_id() -> SessionId {
@@ -751,9 +970,26 @@ mod tests {
     /// committed snapshot, proving `SessionConfig.cwd` reached the facade agent's
     /// [`WorktreeRef`](agent_lib::agent::WorktreeRef).
     fn worktree_for_cwd(cwd: Option<std::path::PathBuf>) -> serde_json::Value {
+        let driver = driver_with_cwd(FakeLlmClient::scripted(Vec::new()), cwd);
+
+        let snapshot = driver.agent.snapshot().expect("committed snapshot");
+        let json = serde_json::to_value(&snapshot).expect("serialize snapshot");
+        json["agent_state"]["spec"]["worktree"].clone()
+    }
+
+    /// Builds a driver over the built-in tool registry with a `fake-model`
+    /// session config, ready for config-apply tests.
+    fn driver_for_test(client: std::sync::Arc<FakeLlmClient>) -> super::SessionDriver {
+        driver_with_cwd(client, None)
+    }
+
+    fn driver_with_cwd(
+        client: std::sync::Arc<FakeLlmClient>,
+        cwd: Option<std::path::PathBuf>,
+    ) -> super::SessionDriver {
         use crate::EventBus;
         use crate::engine::approval::{AskFrontendDecider, IpcApproval};
-        use crate::test_support::FakeLlmClient;
+        use crate::turn_complete::TurnCompleteHub;
 
         let config = mag_service::SessionConfig {
             provider: "fake".to_owned(),
@@ -768,17 +1004,14 @@ mod tests {
             EventBus::new(),
             std::sync::Arc::new(AskFrontendDecider),
         ));
-        let driver = super::SessionDriver::new(
+        super::SessionDriver::new(
             &config,
-            FakeLlmClient::scripted(Vec::new()),
-            &mag_tools::ToolRegistry::new(),
+            client,
+            std::sync::Arc::new(mag_tools::ToolRegistry::with_builtins()),
             approval,
+            TurnCompleteHub::default(),
         )
-        .expect("build session driver");
-
-        let snapshot = driver.agent.snapshot().expect("committed snapshot");
-        let json = serde_json::to_value(&snapshot).expect("serialize snapshot");
-        json["agent_state"]["spec"]["worktree"].clone()
+        .expect("build session driver")
     }
 
     #[test]
@@ -791,5 +1024,189 @@ mod tests {
     fn new_without_cwd_keeps_default_worktree() {
         let worktree = worktree_for_cwd(None);
         assert_eq!(worktree, serde_json::json!("."));
+    }
+
+    /// TODO M3-5 (d): a rejected reconfigure item (here an immutable skill
+    /// variant, which the facade rejects with `FacadeError::Config`) is warned
+    /// and skipped without interrupting the remaining items or the agent.
+    #[test]
+    fn reconfig_items_apply_independently_with_rejections_skipped() {
+        driver_test_runtime().block_on(async {
+            use agent_lib::agent::SkillId;
+            use agent_lib::facade::{ModelRef, ReconfigRequest};
+
+            let client =
+                FakeLlmClient::scripted(vec![text_stream_with_usage(&["ok"], usage(1, 1))]);
+            let mut driver = driver_for_test(client.clone());
+            let max_tokens = driver.agent.state().current_model().max_tokens();
+
+            let requests = vec![
+                ReconfigRequest::ActivateSkill {
+                    skill_id: SkillId::new(Uuid::from_u128(42)),
+                },
+                ReconfigRequest::SetModel {
+                    model: ModelRef::new("model-b", max_tokens, None, None),
+                },
+            ];
+            driver.apply_reconfig_items(session_id(), requests);
+
+            // The skill request was rejected (facade: no skill registry), yet
+            // the later model item still landed and renders into the next
+            // turn's request.
+            drive_one_turn(&mut driver).await;
+            let requests = client.stream_requests();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].model, "model-b");
+        });
+    }
+
+    /// `apply_config` projects the snapshot's `agents.default` entry onto the
+    /// agent: a changed model becomes `SetModel`, and the enabled tool list
+    /// becomes a filtered `ReplaceToolSet` (`docs/CLI.md` §4.4). Queued
+    /// reconfigurations apply at the next turn start (agent-lib turn-boundary
+    /// semantics), so the effect is observed on the next run's request.
+    #[test]
+    fn apply_config_projects_model_and_tool_subset_from_snapshot() {
+        driver_test_runtime().block_on(async {
+            use mag_config::{ConfigDto, ConfigSnapshot};
+
+            let client =
+                FakeLlmClient::scripted(vec![text_stream_with_usage(&["ok"], usage(1, 1))]);
+            let mut driver = driver_for_test(client.clone());
+            let dto = ConfigDto::parse_str(
+                r#"
+[agents.default]
+model = "model-b"
+tools = ["read_file", "shell"]
+"#,
+            )
+            .expect("config parses");
+            let snapshot = ConfigSnapshot::resolve(&dto, 1).expect("config resolves");
+
+            driver.apply_config(session_id(), &snapshot);
+            drive_one_turn(&mut driver).await;
+
+            let requests = client.stream_requests();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].model, "model-b");
+            let names: Vec<&str> = requests[0]
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect();
+            assert_eq!(names, vec!["read_file", "shell"]);
+        });
+    }
+
+    /// A disabled tool is filtered out, and a config tool name with no
+    /// registered plugin is skipped (warn log) instead of poisoning the whole
+    /// replacement set.
+    #[test]
+    fn apply_config_skips_disabled_and_unknown_tools() {
+        driver_test_runtime().block_on(async {
+            use mag_config::{ConfigDto, ConfigSnapshot};
+
+            let client =
+                FakeLlmClient::scripted(vec![text_stream_with_usage(&["ok"], usage(1, 1))]);
+            let mut driver = driver_for_test(client.clone());
+            let dto = ConfigDto::parse_str(
+                r#"
+[agents.default]
+tools = ["read_file", "shell", "ghost"]
+
+[tools.shell]
+enabled = false
+"#,
+            )
+            .expect("config parses");
+            let snapshot = ConfigSnapshot::resolve(&dto, 1).expect("config resolves");
+
+            driver.apply_config(session_id(), &snapshot);
+            drive_one_turn(&mut driver).await;
+
+            let requests = client.stream_requests();
+            assert_eq!(requests.len(), 1);
+            let names: Vec<&str> = requests[0]
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect();
+            assert_eq!(names, vec!["read_file"]);
+        });
+    }
+
+    /// A snapshot without an `agents.default` entry (or without relevant
+    /// fields) changes nothing.
+    #[test]
+    fn apply_config_without_agent_entry_is_a_noop() {
+        driver_test_runtime().block_on(async {
+            use mag_config::ConfigSnapshot;
+
+            let client =
+                FakeLlmClient::scripted(vec![text_stream_with_usage(&["ok"], usage(1, 1))]);
+            let mut driver = driver_for_test(client.clone());
+            let snapshot = ConfigSnapshot::resolve(&mag_config::ConfigDto::default(), 1)
+                .expect("default config resolves");
+
+            driver.apply_config(session_id(), &snapshot);
+            drive_one_turn(&mut driver).await;
+
+            let requests = client.stream_requests();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].model, "fake-model");
+            let names: Vec<&str> = requests[0]
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect();
+            assert_eq!(names, vec!["read_file", "list_dir", "grep", "shell"]);
+        });
+    }
+
+    /// Single-threaded runtime for driver tests: the facade run stream is not
+    /// `Send`, mirroring the session actor's `current_thread` discipline.
+    fn driver_test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build driver test runtime")
+    }
+
+    /// Drives one turn through the driver's own `run_turn` and asserts it
+    /// completes, so config-apply tests observe the queued reconfiguration the
+    /// way production turns do.
+    async fn drive_one_turn(driver: &mut super::SessionDriver) {
+        use agent_lib::facade::CancelHandle;
+
+        use crate::EventBus;
+        use crate::persistence::Persistence;
+
+        let events = EventBus::new();
+        let cancel = CancelHandle::new();
+        let pivots = super::PivotQueue::new();
+        let store = Persistence::in_memory().expect("in-memory store");
+        let outcome = driver
+            .run_turn(
+                session_id(),
+                "hi".to_owned(),
+                &events,
+                &cancel,
+                &pivots,
+                &store,
+            )
+            .await;
+        assert!(
+            matches!(outcome, super::TurnOutcome::Completed),
+            "the post-apply turn must complete"
+        );
+    }
+
+    fn usage(input: u32, output: u32) -> agent_lib::model::usage::Usage {
+        agent_lib::model::usage::Usage {
+            input,
+            output,
+            total: Some(input + output),
+            ..agent_lib::model::usage::Usage::default()
+        }
     }
 }

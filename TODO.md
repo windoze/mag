@@ -628,7 +628,7 @@ GUI/web/CLI 无需感知多个会话通道。
     -D warnings` ✅ 4) `cargo test --workspace` ✅（全部测试目标 ok，1 ignored 为既有
     `#[ignore]` 联调测试）5) `cargo doc --no-deps --workspace` ✅（0 warning）。
 
-### M3-5 [TODO] mag-core：turn-complete 通知/回调机制 + `apply_config`
+### M3-5 [DONE] mag-core：turn-complete 通知/回调机制 + `apply_config`
 
 - **上下文**：`docs/CLI.md` §4.5（决策 D2 附带）：通用「turn complete」通知/回调机制——不光能
   apply config，还能做其他功能（如弹桌面通知）。
@@ -644,6 +644,71 @@ GUI/web/CLI 无需感知多个会话通道。
 - **验证条件**：聚焦测试：(a) `apply_config` 后进行中会话在 turn 结束边界被 reconfigure（fake agent
   断言 reconfigure 调用时机在 run 终态之后）；(b) Idle 会话立即应用；(c) listener 异常不影响后续
   listener 与主流程；(d) 不可变项变更记 warn 且不中断。默认验证序列全过。
+
+  **完成记录**（2026-07-23）：
+  - 实现要点：新增 `crates/mag-core/src/turn_complete.rs`（lib.rs `mod turn_complete;` + 公开
+    re-export `TurnCompleteListener`/`TurnCompletion`/`TurnSummary`；模块 rustdoc 引用
+    `docs/CLI.md` §4.5）。`TurnCompleteListener: Send + Sync` 为**同步**回调
+    `on_turn_complete(&self, &TurnSummary)`（`TurnSummary{session_id, completion:
+    TurnCompletion::{Committed,Failed,Cancelled}}`）；crate 内部 `TurnCompleteHub`
+    （`Arc<RwLock<Vec<Arc<dyn TurnCompleteListener>>>>`，Clone 共享注册表）持有 listener 列表，
+    `notify()` 逐一对每个 listener `catch_unwind` 调用——panic 记 `tracing::warn!` 后继续后续
+    listener，绝不波及 driver（投递前快照 listener 列表，毒锁按仓库统一策略恢复）。同步而非
+    async 的取舍：触发点恰在 run 的可变 stream 借用释放、facade agent 归位之后，观察提交态
+    无需 `.await`；异步消费者（桌面通知等）在回调内自行 spawn，rustdoc 注明。
+  - 注入点（driver 层）：`SessionDriver::run_turn` 两条终态路径（stream 建立失败的早退 +
+    主循环终态）在终态事件发出后各发一次 `TurnSummary`——§4.5 的 committed 一致点语义
+    （成功 = 快照落库后；cancel/失败 = 归位后）。Engine 持有 hub（`EngineInner.turn_complete`），
+    经 `SessionManager`→`session_thread`→`SessionDriver` 注入；公开注册口
+    `Engine::add_turn_complete_listener`（hub 是 Arc 共享，会话存活后注册依然生效，供 bin
+    装配处挂桌面通知等后续消费者）。
+  - 第一消费者（配置 apply）：`Engine::apply_config` 从 Unsupported stub 变为真实实现。Engine
+    新增构造器 `with_config_service(client, tools, Arc<ConfigService>)`（配置注入点；M3-6 的
+    `Engine::from_config` 将走此路径），`EngineInner` 持有 `ConfigApplyState{service,
+    generation: Arc<AtomicU64>}`（**pending 标记**=共享世代计数）并克隆给 `SessionManager`→
+    各 session actor。`apply_config()`：`bump()` 世代+1 → 向每个存活 actor 发
+    `SessionCommand::ApplyConfig{generation}` → `Ok(())`；无 config 后端的引擎（其余构造器）
+    四方法维持 `Unsupported`。actor 侧：`ApplyConfig` 命令到达时 Idle 则立即应用
+    （**Idle 立即应用**）；Running 则不动，run 终态回收 driver 处（`run_done_rx` 分支，先于
+    deferred 命令重放）按 pending 世代补应用（**turn 边界应用**，§4.4「driver actor 在 run
+    之间检查」）。actor 记录 `applied_generation`，重复命令/重复世代幂等。
+    **竞态修复**：actor 线程启动晚于 bump 时「spawn 时读 pending 作基线」会丢应用——改为
+    基线在 `spawn_session` 同步读取（注册 handle 之前）+ `ApplyConfig` 命令携带世代号，
+    两种交错全覆盖。
+  - reconfigure 字段映射（`SessionDriver::apply_config`，从快照 `agents.default` 条目映射；
+    会话↔agent 名绑定在 M3-6 `from_config` 才显式化，`DEFAULT_AGENT_NAME` 常量注明）：
+    `model` 变更→`SetModel`（`max_tokens`/`temperature` 沿用现值——配置 schema 尚无采样参数）；
+    `tools`（过滤 `enabled=false`）→`ReplaceToolSet`（声明从 driver 持有的 `Arc<ToolRegistry>`
+    投影，与现名集比对去抖，新 `ToolSetId` 由计数器铸造）；配置中的工具名不在注册表→warn 跳过
+    （避免整组被 facade 准入拒绝）；agent 条目无 tools 列表=不约束，不动现有面。**逐项隔离**：
+    每个 `ReconfigRequest` 独立 `agent.reconfigure`，失败（skill 变体等不可变项的
+    `FacadeError::Config`、准入失败）记 `tracing::warn!` 换下一项，agent 与主流程不受影响。
+    **出范围（记录备 M3-R/M3-6）**：审批策略与 budget 烤在 agent build 时、agent-lib reconfigure
+    无对应变体——`tools.*.approval`/`approval.*` 变更在下次会话（重）建生效；`session` 缺省按
+    D2 本就只影响新会话。
+  - `get_config/update_config/reload_config` 一并接（M3-4 完成记录预留的 M3-5 接线点）：
+    Engine 已持 `ConfigService`，`get_config` 投影当前快照回 DTO（secret 保持引用形态）；
+    `update_config`/`reload_config` 代理 service，成功后经 EventBus 发
+    `ServiceEvent::ConfigChanged{revision}`；`ConfigError` 展平为 `ServiceError::Config{message}`
+    （message 不含物化 secret）。注：`ConfigChanged` 目前由引擎内发起的 update/reload 直接发射；
+    未来 watch 自动 reload（M3-3 降级项）需另接 broadcast→事件桥。
+  - 测试（全部离线；mag-core 81 passed，新增 11 个）：`turn_complete` 单测（panicking listener
+    不饿死后续 listener）；driver 层 4 个——逐项隔离（(d)：`ActivateSkill` 报 Config 错跳过、
+    后续 `SetModel` 仍生效且 turn 正常完成）、model+工具子集投影、disabled/未知工具过滤、无
+    `agents.default` 条目 no-op（agent-lib 语义：reconfigure 排队、下一 turn 起点生效，断言经
+    fake client 记录的请求）；engine 层 6 个——(a) gated stream 在飞 run 中 `apply_config`：
+    首请求旧 model、run 正常完成后第二个 run 新 model（边界语义），(b) Idle 会话 apply 后首个
+    run 即新 model+收缩工具面，(c) panicking listener 在后置 recording listener 之前注册：
+    run 事件流正常且 recording 收到 `Committed`，cancel 终态→`Cancelled` 通知，
+    四方法代理（get/update/reload/无效 update 报 `Config` 且快照不动 + `ConfigChanged` 事件），
+    无后端 `apply_config` 维持 `Unsupported`。聚焦测试连跑 3 次无 flake。
+  - 依赖边界：mag-core 新增 `tracing = "0.1"`（warn 日志；lockfile 已有 0.1.44，离线可用），
+    未新增其他依赖；依赖方向不变。
+  - 门禁结果：1) `cargo fmt --all -- --check` ✅（初次 6 处 fmt diff，`cargo fmt --all` 修复后
+    复检通过）2) 聚焦测试 ✅（`cargo test -p mag-core apply_config` 6 个 + turn_complete/driver
+    单测，连跑 3 次无 flake）3) `cargo clippy --all-targets -- -D warnings` ✅ 4)
+    `cargo test --workspace` ✅（24 个测试目标全 ok，1 ignored 为既有 `#[ignore]` 联调测试）
+    5) `cargo doc --no-deps --workspace` ✅（0 warning）。
 
 ### M3-6 [TODO] `Engine::from_config` + bin 读配置
 
