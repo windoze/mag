@@ -12,14 +12,16 @@
 //!
 //! # Layering
 //!
-//! - **DTO** (this task's scope): pure serde data + TOML read/write +
-//!   structural validation. Secret fields hold *references* only
-//!   ([`SecretRef`]); values are never materialized here.
-//! - **DO** (`ConfigSnapshot`, an `Arc` object graph): built from the DTO by
-//!   the resolve half of the DTO↔DO conversion. That conversion — including
-//!   cross-reference checks (agent → provider/tools names must exist) and
-//!   enum validation (`approval` / `routing` values) — lives in this crate
-//!   too but is a separate layer on top of these types.
+//! - **DTO**: pure serde data + TOML read/write + structural validation.
+//!   Secret fields hold *references* only ([`SecretRef`]); values are never
+//!   materialized here.
+//! - **DO** ([`ConfigSnapshot`], an `Arc` object graph): built from the DTO by
+//!   [`ConfigSnapshot::resolve`] (validation + normalization: enum checks,
+//!   cross-reference resolution into shared `Arc` nodes) and written back by
+//!   [`ConfigSnapshot::project`] (lossless; secret references stay
+//!   references). Snapshots are immutable and cheap to clone, so a session
+//!   pinning one is unaffected by later updates (snapshot isolation,
+//!   `docs/CLI.md` §4.4, decision D2).
 //!
 //! # Dependency boundary (hard constraint)
 //!
@@ -38,11 +40,14 @@
 //! - [`ConfigDto::validate`] — cheap structural validation with field-path
 //!   errors ([`ConfigError::Validation`]). Parse failures carry line/column
 //!   information ([`ConfigError::Parse`]).
+//! - [`ConfigSnapshot::resolve`] / [`ConfigSnapshot::project`] — the two
+//!   halves of the DTO↔DO conversion (`docs/CLI.md` §4.2, decision D4).
 
 mod dto;
 mod error;
 mod io;
 mod secret;
+mod snapshot;
 
 pub use dto::{
     AgentDto, ApprovalSectionDto, BudgetDto, ConfigDto, ExternalAgentDto, ProviderDto,
@@ -50,3 +55,8 @@ pub use dto::{
 };
 pub use error::ConfigError;
 pub use secret::SecretRef;
+pub use snapshot::{
+    ApprovalConfig, ApprovalPolicyKind, Budget, ConfigSnapshot, ExternalAgentKind, ProviderWire,
+    ResolvedAgent, ResolvedExternalAgent, ResolvedProvider, ResolvedTool, RoutingModeKind,
+    SessionDefaults,
+};

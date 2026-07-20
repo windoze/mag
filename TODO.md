@@ -449,7 +449,7 @@ GUI/web/CLI 无需感知多个会话通道。
     3) `cargo clippy --all-targets -- -D warnings` ✅ 4) `cargo test --workspace` ✅（全绿，
     1 ignored 为既有 `#[ignore]` 联调测试）5) `cargo doc --no-deps --workspace` ✅（0 warning）。
 
-### M3-2 [TODO] mag-config：DTO ↔ DO 双向转换
+### M3-2 [DONE] mag-config：DTO ↔ DO 双向转换
 
 - **上下文**：`docs/CLI.md` §4.2（决策 D4）。DO 对应程序实际使用的配置对象；由于动态生效需求，DO 不是
   简单嵌套 struct，而是**引用计数的关联对象树/森林**——会话钉住 `Arc<ConfigSnapshot>` 后，后续
@@ -463,6 +463,57 @@ GUI/web/CLI 无需感知多个会话通道。
     （无损回写，secret 引用形态保持引用不物化）。
   - 转换测试：DTO→DO→DTO roundtrip 等价；非法交叉引用报错路径正确。
 - **验证条件**：聚焦测试 `cargo test -p mag-config`；默认验证序列全过。
+
+  **完成记录**（2026-07-22）：
+  - 实现要点：新增 `crates/mag-config/src/snapshot.rs`（DO 层），lib.rs 补 re-export 与 crate 文档
+    「Layering」「Entry points」更新。`ConfigSnapshot{revision: u64, providers/agents/external_agents/
+    tools: BTreeMap<String, Arc<..>>, session_defaults/approval: Option<Arc<..>>}`——整树 `Clone`
+    只拷 `Arc` 句柄，节点构建后不可变；`resolve(&ConfigDto, revision)` 为 DTO→DO（先跑
+    `ConfigDto::validate()` 结构校验 → 语义校验 → 按拓扑序实例化 Arc 节点：providers/tools 先于引用
+    它们的 agents → 打 revision 戳；任一步失败整体失败，不产出半个图）；`project()` 为 DO→DTO 无损
+    回写（revision 属 DO 元数据不回投）。节点访问器齐备（`revision()`/`provider(name)`/`agent(name)`/
+    `tools()`/`session_defaults()`/`approval()` 等）。
+  - 关键决策：① **DO 命名以 §4.2 结构图为准**——图里明确写的是 `Arc<ResolvedProvider>`/
+    `Arc<ResolvedAgent>`（`ResolvedConfig / ConfigSnapshot` 根），一致扩展为 `ResolvedExternalAgent`/
+    `ResolvedTool`；任务书列举的 `LlmConfig`/`AgentConfig`/`ExternalAgentConfig`/`ToolConfig` 对应
+    关系在 snapshot.rs 模块级 rustdoc 用对照表注明（`SessionDefaults`/`ApprovalConfig` 两侧同名）。
+    ② **raw + effective 双层访问器**实现「默认填充且无损回写」：节点保留 DTO 原始 `Option` 字段
+    （未设置的键投影后仍未设置，无幽灵节），默认值经 `is_enabled()`（默认 true）/
+    `effective_routing()`（默认 `ModelRouted`，对齐 mag-service `RoutingMode::default()`）/
+    `effective_default_policy()`（默认 `Allow`，对齐 agent-lib `ApprovalPolicy::default()` 的
+    auto_allow 层）/`effective_kind()`（默认 `Acp`）访问器填充。③ **工具引用宽松解析（有意偏离
+    任务书「tools 名必须存在」字面）**：`agents.<name>.tools` 引用的工具名不要求有 `[tools.<name>]`
+    条目——§4.2 示例的 `read_file`/`list_dir`/`grep`/`ask_user` 均无对应条目，且 §4.2 resolve 一节
+    只把「悬空 provider 引用」列为报错项；无条目的名字解析为按名共享的合成默认 `ResolvedTool` 节点
+    （implicit，多 agent 引用同名工具共享同一 Arc），不进入快照 `tools` map，投影时不回现（roundtrip
+    无损）；工具名对真实 tool registry 的存在性检查属装配层（M3-6 `Engine::from_config`）职责。
+    ④ `session`/`approval` 节在快照内为 `Option<Arc<..>>` 以保留「节是否存在」信息（显式空表与
+    缺失在投影时可区分）；节缺失时访问器返回节点上的 `const EMPTY`。⑤ 枚举类型 DO 侧落地为
+    `ProviderWire{Anthropic,OpenAi}`（协议集对齐 agent-lib adapter 实现的 Anthropic Messages /
+    OpenAI Responses）、`ApprovalPolicyKind{Ask,Allow,Deny}`、`RoutingModeKind{ModelRouted,
+    Dispatcher}`（字符串形态对齐 mag-service serde 名）、`ExternalAgentKind{Acp}`，均带
+    `as_str`/`Display`/`FromStr`（错误信息列合法值）。⑥ `provider.wire` 在 resolve 时必填——无协议
+    的 provider 无法装配，DTO 层 rustdoc 本就声明协议集在 resolve 校验。⑦ `Budget` 为 `BudgetDto`
+    的逐字段投影（双向 `From`）。
+  - resolve 校验规则清单（全部报 `ConfigError::Validation`，带点分字段路径）：结构校验
+    （`validate()` 先行，M3-1 已有规则原样生效）；`providers.<name>.wire` 缺失/未知值；
+    `agents.<name>.provider` 悬空引用（报 `unknown provider "<name>"`）；`tools.<name>.approval`、
+    `approval.default_policy` 非法策略枚举；`session.routing` 非法路由枚举；
+    `external_agents.<name>.kind` 非法 kind。
+  - 测试（全部离线；src 单元 3 个 + tests/snapshot.rs 集成 9 个，crate 总计 39 个）：§4.2 示例
+    逐字符 TOML resolve 成共享 Arc 图（`Arc::ptr_eq` 断言 agent→provider、agent→显式 tool override、
+    implicit tool 跨 agent 同名共享三处共享关系；implicit 节点不进 tools map）；DTO→DO→DTO
+    `PartialEq` 无损 roundtrip + 投影 DTO 序列化后 secret 仍为引用形态（`env = "ANTHROPIC_API_KEY"`/
+    `keyring = "mag/local_proxy"` 字样断言）且重解析等价；悬空 provider 报 `agents.reviewer.provider`；
+    四类非法枚举 + wire 缺失/未知逐例断言路径与消息；结构校验先于语义校验（空字符串 model 报
+    `agents.default.model`）；空 DTO → 空快照 + effective 访问器默认值 + 投影回 `ConfigDto::default()`；
+    默认填充不产生幽灵投影（raw 字段保持未设置）；快照隔离（rev1 钉住句柄在 rev2 改 base_url/model/
+    approval 后原值不变、revision 各自正确、整树 Clone 后节点 Arc 同一）。
+  - 依赖边界：`cargo tree -p mag-config -e normal --depth 1` 仍仅 serde/thiserror/toml——硬约束满足。
+  - 门禁结果：1) `cargo fmt --all -- --check` ✅ 2) `cargo test -p mag-config` ✅（39 passed）
+    3) `cargo clippy --all-targets -- -D warnings` ✅ 4) `cargo test --workspace` ✅（24 个测试
+    目标全 ok，1 ignored 为既有 `#[ignore]` 联调测试）5) `cargo doc --no-deps --workspace` ✅
+    （touch 强制重建 mag-config，0 warning）。
 
 ### M3-3 [TODO] mag-core：`ConfigService`
 
