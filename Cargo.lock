@@ -1078,6 +1078,7 @@ dependencies = [
  "mag-tools",
  "rusqlite",
  "serde_json",
+ "thiserror",
  "tokio",
  "tokio-stream",
  "tracing",

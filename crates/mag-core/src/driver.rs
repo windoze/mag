@@ -29,15 +29,15 @@ use std::sync::{
 use std::time::Duration;
 
 use agent_lib::{
-    agent::{BudgetLimits, InteractionHandler, WorktreeRef},
+    agent::{ApprovalDecision, BudgetLimits, InteractionHandler, WorktreeRef},
     client::LlmClient,
     facade::{
-        Agent, AgentRunStream, AgentSnapshot, ApprovalPolicy, CancelHandle, FacadeError, ModelRef,
-        ReconfigRequest, Tool, ToolContext, ToolResult, ToolSetId, ToolSetRef,
+        Agent, AgentRunStream, AgentSnapshot, Approval, ApprovalPolicy, CancelHandle, FacadeError,
+        ModelRef, ReconfigRequest, Tool, ToolContext, ToolResult, ToolSetId, ToolSetRef,
         ToolTrace as FacadeToolTrace, UsageSummary, WireRunEvent, WireRunOutput,
     },
 };
-use mag_config::ConfigSnapshot;
+use mag_config::{ApprovalPolicyKind, ConfigSnapshot};
 use mag_service::{
     Event, RunErrorKind, RunId as WireRunId, RunOutput, SessionBudget, SessionConfig, SessionId,
     ToolCallIdWire, ToolStatusWire, ToolTrace, UsageInfo,
@@ -48,6 +48,7 @@ use uuid::Uuid;
 
 use crate::{
     EventBus,
+    assembly::{ApprovalOverrides, SessionBinding},
     engine::approval::IpcApproval,
     persistence::Persistence,
     turn_complete::{TurnCompleteHub, TurnCompletion, TurnSummary},
@@ -55,16 +56,6 @@ use crate::{
 
 const DEFAULT_MAX_TOKENS: u32 = 512;
 const DEFAULT_MAX_STEPS: u32 = 8;
-
-/// Name of the `agents.<name>` entry a session reconfigures from on
-/// `apply_config` (`docs/CLI.md` §4.4).
-///
-/// Provisional binding: sessions do not yet carry an agent name (they are
-/// created from a wire [`SessionConfig`]), so the runtime config apply reads
-/// the well-known `default` agent entry — the same entry the §4.2 example
-/// config defines. The session↔agent binding becomes explicit when
-/// `Engine::from_config` lands (M3-6).
-const DEFAULT_AGENT_NAME: &str = "default";
 
 /// Shared pivot queue bridging one in-flight run and its session actor
 /// (`docs/CLI.md` §3.2, decision D1).
@@ -127,6 +118,9 @@ pub(crate) struct SessionDriver {
     /// Turn-complete hook point: notified once after every run terminal
     /// (`docs/CLI.md` §4.5).
     turn_complete: TurnCompleteHub,
+    /// The `agents.<name>` entry this session is bound to; `apply_config`
+    /// reconfigurations read that entry (`docs/CLI.md` §4.4).
+    agent_name: String,
     run_counter: AtomicU64,
     /// Mints fresh tool-set identities for `apply_config` reconfigurations.
     tool_set_counter: AtomicU64,
@@ -135,12 +129,20 @@ pub(crate) struct SessionDriver {
 impl SessionDriver {
     /// Builds a fresh facade [`Agent`] for the supplied session configuration.
     ///
-    /// The `tools` registry is projected onto the agent: each plugin becomes a
-    /// facade [`Tool`], and any plugin declaring a
-    /// [`permission`](ToolPlugin::permission) is gated behind
-    /// [`ApprovalPolicy::ask_tool`] so it pauses through `approval`. The shared
-    /// [`IpcApproval`] is injected as the interaction handler and stays the sole
-    /// authority answering a paused tool call (`docs/DESIGN.md` §3.3).
+    /// The `tools` registry is projected onto the agent through
+    /// [`tool_surface`]: `binding` narrows the surface to the bound
+    /// `agents.<name>` entry's enabled tool list when it sets one
+    /// (`docs/CLI.md` §4.4: new sessions use the current DO graph), each
+    /// remaining plugin declaring a [`permission`](ToolPlugin::permission) is
+    /// gated behind [`ApprovalPolicy::ask_tool`] so it pauses through
+    /// `approval`, and `overrides` applies the configured `[approval]` /
+    /// `[tools.<name>].approval` tiers on top. The shared [`IpcApproval`] is
+    /// injected as the interaction handler and stays the sole authority
+    /// answering a paused tool call (`docs/DESIGN.md` §3.3).
+    ///
+    /// The bound entry's `model` / `system_prompt` override the wire
+    /// [`SessionConfig`] values when set; the wire values are the fallback
+    /// (session ↔ agent binding, see [`Engine::from_config`](crate::Engine::from_config)).
     ///
     /// When [`config.cwd`](SessionConfig::cwd) is set, that path becomes the
     /// agent's [`WorktreeRef`] so the built-in tools resolve relative to the
@@ -157,14 +159,24 @@ impl SessionDriver {
         tools: Arc<ToolRegistry>,
         approval: Arc<IpcApproval>,
         turn_complete: TurnCompleteHub,
+        binding: &SessionBinding,
+        overrides: &ApprovalOverrides,
     ) -> Result<Self, FacadeError> {
-        let (facade_tools, policy) = tool_surface(&tools);
+        let (facade_tools, policy) = tool_surface(&tools, binding, overrides);
         let mut builder = Agent::builder()
             .client(client)
-            .model(config.model.clone())
+            .model(
+                binding
+                    .model()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| config.model.clone()),
+            )
             .max_tokens(DEFAULT_MAX_TOKENS)
             .max_steps(DEFAULT_MAX_STEPS)
             .interaction_handler(approval as Arc<dyn InteractionHandler>);
+        if let Some(system) = binding.system_prompt() {
+            builder = builder.system(system.to_owned());
+        }
         if let Some(cwd) = &config.cwd {
             builder = builder.worktree(WorktreeRef::new(cwd.clone()));
         }
@@ -180,6 +192,7 @@ impl SessionDriver {
             agent,
             tools,
             turn_complete,
+            agent_name: binding.agent_name().to_owned(),
             run_counter: AtomicU64::new(1),
             tool_set_counter: AtomicU64::new(1),
         })
@@ -207,6 +220,7 @@ impl SessionDriver {
     ///
     /// Returns any [`FacadeError`] raised while rebuilding the agent (for example
     /// a snapshot whose state cannot be deserialized).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn restore(
         client: Arc<dyn LlmClient>,
         tools: Arc<ToolRegistry>,
@@ -214,8 +228,10 @@ impl SessionDriver {
         snapshot: AgentSnapshot,
         budget: Option<&SessionBudget>,
         turn_complete: TurnCompleteHub,
+        binding: &SessionBinding,
+        overrides: &ApprovalOverrides,
     ) -> Result<Self, FacadeError> {
-        let (facade_tools, policy) = tool_surface(&tools);
+        let (facade_tools, policy) = tool_surface(&tools, binding, overrides);
         let mut builder = Agent::restore()
             .snapshot(snapshot)
             .client(client)
@@ -232,6 +248,7 @@ impl SessionDriver {
             agent,
             tools,
             turn_complete,
+            agent_name: binding.agent_name().to_owned(),
             run_counter: AtomicU64::new(1),
             tool_set_counter: AtomicU64::new(1),
         })
@@ -407,7 +424,8 @@ impl SessionDriver {
     /// no in-progress run — satisfying agent-lib's reconfigure admission rule
     /// (Idle/between-runs only).
     ///
-    /// Field mapping from the snapshot's [`DEFAULT_AGENT_NAME`] entry:
+    /// Field mapping from the snapshot's **bound** `agents.<name>` entry
+    /// (`self.agent_name`, resolved at session creation):
     ///
     /// - `model` → [`ReconfigRequest::SetModel`] (only when it actually
     ///   changed; `max_tokens`/`temperature` keep their current values since
@@ -421,10 +439,10 @@ impl SessionDriver {
     ///   leaves the current surface untouched.
     ///
     /// Out of scope on the current agent-lib reconfigure surface (documented
-    /// for M3-R/M3-6): the approval policy is baked into the agent at build
-    /// time and has no reconfigure variant, so `tools.*.approval` /
-    /// `approval.*` changes take effect on the next session (re)build rather
-    /// than mid-session; per-run `budget` is likewise build-time only (and
+    /// for M3-R): the approval policy is baked into the agent at build time
+    /// and has no reconfigure variant, so `tools.*.approval` / `approval.*`
+    /// changes take effect on the next session (re)build rather than
+    /// mid-session; per-run `budget` is likewise build-time only (and
     /// `session` defaults only affect new sessions per decision D2).
     pub(crate) fn apply_config(&mut self, session_id: SessionId, snapshot: &ConfigSnapshot) {
         let requests = self.reconfig_requests(session_id, snapshot);
@@ -457,14 +475,14 @@ impl SessionDriver {
         }
     }
 
-    /// Builds the reconfigure batch projecting the snapshot's
-    /// [`DEFAULT_AGENT_NAME`] entry onto this session's agent.
+    /// Builds the reconfigure batch projecting the snapshot's entry for this
+    /// session's bound agent (`self.agent_name`) onto this session's agent.
     fn reconfig_requests(
         &mut self,
         session_id: SessionId,
         snapshot: &ConfigSnapshot,
     ) -> Vec<ReconfigRequest> {
-        let Some(agent_config) = snapshot.agent(DEFAULT_AGENT_NAME) else {
+        let Some(agent_config) = snapshot.agent(&self.agent_name) else {
             return Vec::new();
         };
         let mut requests = Vec::new();
@@ -736,22 +754,77 @@ fn map_wire_event(
 /// Projects a [`ToolRegistry`] into the facade tool surface and its approval
 /// policy shared by [`SessionDriver::new`] and [`SessionDriver::restore`].
 ///
-/// Each plugin becomes a facade [`Tool`]; a plugin declaring a
-/// [`permission`](ToolPlugin::permission) is additionally gated behind
-/// [`ApprovalPolicy::ask_tool`] so it pauses through the injected
-/// [`IpcApproval`](crate::engine::approval::IpcApproval), while a permission-free
-/// (read-only) plugin stays on the default auto-allow tier and never interrupts
-/// the run (`docs/DESIGN.md` §3.2/§3.3).
-fn tool_surface(tools: &ToolRegistry) -> (Vec<Tool>, ApprovalPolicy) {
-    let mut policy = ApprovalPolicy::default();
+/// Assembly order:
+///
+/// 1. The whole-agent default tier comes from `overrides` (the `[approval]`
+///    section; `allow` matches agent-lib's own default).
+/// 2. When `binding` constrains the tool surface (the bound `agents.<name>`
+///    entry's enabled tool list), only those plugins are projected; a bound
+///    name with no registered plugin is warned about and skipped.
+/// 3. Each projected plugin declaring a [`permission`](ToolPlugin::permission)
+///    is gated behind [`ApprovalPolicy::ask_tool`] so it pauses through the
+///    injected [`IpcApproval`](crate::engine::approval::IpcApproval), while a
+///    permission-free (read-only) plugin stays on the policy default tier
+///    (`docs/DESIGN.md` §3.2/§3.3).
+/// 4. `overrides`' per-tool tiers (`[tools.<name>].approval`) replace the
+///    derived tier for their tool.
+///
+/// Tier mapping: `ask` → [`ApprovalPolicy::ask_tool`], `allow` →
+/// [`ApprovalPolicy::allow_tool`], `deny` → [`ApprovalPolicy::deny_tool`].
+/// Note that with mag's always-injected interaction handler, a `deny` tier
+/// still pauses through the interface (agent-lib resolves the pause through
+/// the injected handler rather than the policy's headless fallback) — the tier
+/// records the *policy intent*; the interface remains the deciding authority.
+fn tool_surface(
+    tools: &ToolRegistry,
+    binding: &SessionBinding,
+    overrides: &ApprovalOverrides,
+) -> (Vec<Tool>, ApprovalPolicy) {
+    let mut policy = base_policy(overrides.default_tier());
     let mut facade_tools = Vec::new();
     for plugin in tools.plugins() {
+        if let Some(allowed) = binding.tools()
+            && !allowed.iter().any(|name| name == plugin.name())
+        {
+            continue;
+        }
         if plugin.permission().is_some() {
             policy = policy.ask_tool(plugin.name());
         }
         facade_tools.push(facade_tool(Arc::clone(plugin)));
     }
+    if let Some(allowed) = binding.tools() {
+        for name in allowed {
+            if !tools.plugins().iter().any(|p| p.name() == name) {
+                tracing::warn!(
+                    tool = name.as_str(),
+                    "bound agent entry names a tool not present in the tool registry; skipped"
+                );
+            }
+        }
+    }
+    for (name, tier) in overrides.per_tool() {
+        policy = match tier {
+            ApprovalPolicyKind::Ask => policy.ask_tool(name.clone()),
+            ApprovalPolicyKind::Allow => policy.allow_tool(name.clone()),
+            ApprovalPolicyKind::Deny => policy.deny_tool(name.clone()),
+        };
+    }
     (facade_tools, policy)
+}
+
+/// Builds the whole-agent default [`ApprovalPolicy`] for a configured tier.
+///
+/// The `ask` tier carries a deny-by-default synchronous handler: with mag's
+/// injected [`IpcApproval`](crate::engine::approval::IpcApproval) every pause
+/// is answered by the interface, so the handler only matters as agent-lib's
+/// headless fallback, where denying is the conservative choice.
+fn base_policy(tier: ApprovalPolicyKind) -> ApprovalPolicy {
+    match tier {
+        ApprovalPolicyKind::Allow => ApprovalPolicy::default(),
+        ApprovalPolicyKind::Deny => ApprovalPolicy::new(Approval::auto_deny()),
+        ApprovalPolicyKind::Ask => ApprovalPolicy::new(Approval::ask(|_| ApprovalDecision::Deny)),
+    }
 }
 
 /// Projects one facade [`Tool`] from a [`ToolPlugin`].
@@ -988,6 +1061,7 @@ mod tests {
         cwd: Option<std::path::PathBuf>,
     ) -> super::SessionDriver {
         use crate::EventBus;
+        use crate::assembly::{ApprovalOverrides, SessionBinding};
         use crate::engine::approval::{AskFrontendDecider, IpcApproval};
         use crate::turn_complete::TurnCompleteHub;
 
@@ -1010,6 +1084,8 @@ mod tests {
             std::sync::Arc::new(mag_tools::ToolRegistry::with_builtins()),
             approval,
             TurnCompleteHub::default(),
+            &SessionBinding::resolve(&config, None),
+            &ApprovalOverrides::default(),
         )
         .expect("build session driver")
     }

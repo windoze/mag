@@ -710,7 +710,7 @@ GUI/web/CLI 无需感知多个会话通道。
     `cargo test --workspace` ✅（24 个测试目标全 ok，1 ignored 为既有 `#[ignore]` 联调测试）
     5) `cargo doc --no-deps --workspace` ✅（0 warning）。
 
-### M3-6 [TODO] `Engine::from_config` + bin 读配置
+### M3-6 [DONE] `Engine::from_config` + bin 读配置
 
 - **上下文**：`docs/CLI.md` §4.3/§4.6；Engine 现有构造器在 `crates/mag-core/src/engine.rs`；
   bin 在 `crates/mag/src/main.rs`（现有 `--acp` 装配路径）。
@@ -726,6 +726,59 @@ GUI/web/CLI 无需感知多个会话通道。
 - **验证条件**：聚焦测试：`Engine::from_config` 用样例配置装配成功；缺 secret env var 报带引用名的错；
   bin 级 smoke（`--config` 指向 tempdir 样例，`--help`/启动路径不崩，可用 `#[ignore]` 或假 LLM 注入点）。
   默认验证序列全过。
+
+  **完成记录**（2026-07-23）：
+  - 实现要点：新增 `crates/mag-core/src/assembly.rs`——`EngineError`（thiserror；变体
+    `Secret{provider,reference,reason}`/`Provider(String)`/`Persistence(#[from])`/`Io(#[from])`，
+    `#[non_exhaustive]`，错误只带引用名/provider 名，绝不带值）；`Engine::from_config(
+    Arc<ConfigService>) -> Result<Self, EngineError>` 装配构造器（LLM client 自 `agents.default`
+    条目的 provider 装配；persistence：`persist_path` 是目录，db 文件
+    `SESSION_DB_FILENAME = "mag-sessions.db"` 放其下）；`assemble_tool_registry`（builtins 减
+    `enabled=false`，未知工具名 warn 跳过）；`assemble_source_registry`（providers→`LlmSource`、
+    external_agents→`LocalAgentSlot::Acp` 占位供 M4）；`SessionBinding`（会话↔agent 绑定）+
+    `ApprovalOverrides::from_snapshot`；`DEFAULT_AGENT_NAME` 自 driver.rs 移入（pub(crate)）。
+    `engine.rs`：`EngineInner` 新增 `sources: SourceRegistry` 字段 + 公开访问器
+    `Engine::sources()`；`assemble`/`in_memory_store` 改 `pub(crate)` 供 assembly 复用；
+    `with_config_service` rustdoc 改现在时。bin 重写 `crates/mag/src/main.rs`：手写参数解析
+    （`--acp`、`--config <path>`/`--config=<path>`、`--help`/`-h`；未知参数→usage+exit 2），
+    默认路径 `$XDG_CONFIG_HOME/mag/config.toml` 否则 `~/.config/mag/config.toml`；文件缺失记
+    info 用内置默认配置不报错；`--acp` 走 `ConfigService::load_or_default` → `Engine::from_config`
+    → `mag_acp::serve`。
+  - 关键设计/取舍：
+    - **secret 解析**：惰性——只解析默认 agent provider 的 api_key；env 变体在此层
+      `std::env::var` 读取；keyring 报 `EngineError::Secret` 明确 Unsupported（mag-sources
+      `os-keyring` feature 未开，离线约束下按任务口径只实现 env 变体）；错误带 `{env = "VAR"}`
+      引用名 + provider 名，不输出值。
+    - **会话↔agent 绑定**：`SessionConfig.provider` 命名 `agents.<name>` 条目；空/"default"/
+      未知名→回落 `default`（未知名 warn，保住 ACP 占位 provider "openai" 与遗留 "fake" 标签）；
+      spawn 时（`session.rs::spawn_session`）从当前快照解析 `SessionBinding` +
+      `ApprovalOverrides`——**配置更新后新建的会话自动拾取新审批策略/绑定**（agent-lib policy
+      烤在 build 时，这是可行的最强语义）。创建时绑定条目的 model/tools/system_prompt 覆盖
+      wire 值（§4.4「新会话立即用新 DO 图」），wire 值兜底；budget 优先级：显式 wire >
+      `agents.<name>.budget` > `session.budget`；`apply_config` 从绑定条目 reconfigure（推广
+      M3-5 写死的 default，`reconfig_requests` 改用 `self.agent_name`）。无配置后端的引擎行为
+      完全不变。
+    - **审批策略**：`driver::tool_surface(tools, binding, overrides)` 重写——base_policy 映射
+      Allow→default / Deny→auto_deny / Ask→`Approval::ask(|_| Deny)` 兜底，binding.tools 过滤
+      面，per-tool 覆盖最后应用；`approval.timeout_secs` 无 agent-lib 表面对应，未接线（留
+      M3-R）；deny tier 在注入 IpcApproval 下仍暂停到界面（agent-lib 语义，rustdoc 已注明）。
+    - **provider params / 多 provider 并行**：未消费（agent-lib 无对应表面/单共享 client
+      架构），记录给 M3-R/M4。
+  - 测试（全部离线）：assembly 7 个单测；driver/session 层新增 `mod session_binding` 5 个 e2e
+    （创建时绑定 model+tools、命名条目绑定+apply 用绑定名、approval 默认 ask 暂停免权限工具、
+    per-tool allow 覆盖 ask 默认、disabled 工具不出现在会话面）；重写
+    `config_apply::apply_config_during_run_lands_at_the_turn_boundary`（创建时绑定使首个请求已是
+    model-b，改为 mid-run `update_config` 到 model-c 验证边界语义）；bin 级新增
+    `crates/mag/tests/cli.rs` 6 个 smoke（`env!("CARGO_BIN_EXE_mag")`：help、未知参数、无 --acp
+    不加载配置、样例配置+注入假 env secret 的 ACP initialize 握手含 agentCapabilities、配置文件
+    缺失握手、secret 缺失 exit≠0 且 stderr 带引用名/provider 名不带值）。
+  - 依赖边界：mag-core 新增 `thiserror.workspace = true`（lockfile 已有，离线可用）；未新增其他
+    依赖；依赖方向不变。
+  - 门禁结果：1) `cargo fmt --all -- --check` ✅（初次有 diff，`cargo fmt --all` 修复后复检通过）
+    2) 聚焦测试 ✅（`cargo test -p mag-core` 93 passed、`cargo test -p mag` 6 passed）
+    3) `cargo clippy --all-targets -- -D warnings` ✅（曾报 3 个 doc_lazy_continuation 缩进错，
+    已修）4) `cargo test --workspace` ✅（全部 ok，0 失败，1 ignored 为既有 zed 联调测试）
+    5) `cargo doc --no-deps --workspace` ✅（0 warning）。
 
 ### M3-R [TODO] M3 review
 

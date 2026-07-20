@@ -2,6 +2,7 @@
 
 //! Transport-neutral engine core for mag.
 
+mod assembly;
 mod config;
 mod driver;
 mod engine;
@@ -13,6 +14,7 @@ mod turn_complete;
 #[cfg(test)]
 mod test_support;
 
+pub use assembly::EngineError;
 pub use config::{ConfigChange, ConfigService};
 pub use engine::Engine;
 pub use event_bus::{EventBus, EventStream};

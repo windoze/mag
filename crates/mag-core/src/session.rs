@@ -38,6 +38,7 @@ use tokio::{
 
 use crate::{
     EventBus,
+    assembly::{ApprovalOverrides, SessionBinding},
     driver::{PivotQueue, SessionDriver, TurnOutcome},
     engine::{
         ConfigApplyState,
@@ -139,9 +140,8 @@ struct SessionActor {
     config_apply: Option<ConfigApplyState>,
     /// Generation of the last config apply this actor performed. Starts at the
     /// generation current when the actor spawns: a freshly created session is
-    /// assembled from the caller's own `SessionConfig` and counts as
-    /// up-to-date (the session↔snapshot binding becomes explicit with
-    /// `Engine::from_config`, M3-6).
+    /// assembled from the current snapshot through the session ↔ agent binding
+    /// (`Engine::from_config`) and counts as up-to-date.
     applied_generation: u64,
 }
 
@@ -376,7 +376,10 @@ impl SessionActor {
 /// When `restore` is `Some`, the session's facade agent is rebuilt from the
 /// persisted [`AgentSnapshot`] (re-injecting the client, tools, and approval
 /// handler a snapshot deliberately omits); when `None`, a fresh agent is built
-/// from `config` (`docs/DESIGN.md` §3.6).
+/// from `config` (`docs/DESIGN.md` §3.6). `binding` carries the session ↔
+/// agent binding resolved at spawn (model/tool/system overrides plus the bound
+/// entry name for `apply_config`), and `overrides` the configured approval
+/// tiers (`docs/CLI.md` §4.4).
 #[allow(clippy::too_many_arguments)]
 fn session_thread(
     session_id: SessionId,
@@ -389,6 +392,8 @@ fn session_thread(
     config_apply: Option<ConfigApplyState>,
     applied_generation: u64,
     turn_complete: TurnCompleteHub,
+    binding: SessionBinding,
+    overrides: ApprovalOverrides,
     commands: mpsc::UnboundedReceiver<SessionCommand>,
 ) {
     let runtime = Builder::new_current_thread()
@@ -411,8 +416,18 @@ fn session_thread(
             snapshot,
             config.budget.as_ref(),
             turn_complete,
+            &binding,
+            &overrides,
         ),
-        None => SessionDriver::new(&config, client, tools, approval.clone(), turn_complete),
+        None => SessionDriver::new(
+            &config,
+            client,
+            tools,
+            approval.clone(),
+            turn_complete,
+            &binding,
+            &overrides,
+        ),
     };
     let actor = SessionActor::new(
         session_id,
@@ -509,10 +524,17 @@ impl SessionManager {
     ///
     /// A no-op when the manager has no client, mirroring the engine's clientless
     /// behaviour.
+    ///
+    /// With a configuration backend this is where the session ↔ agent binding
+    /// and the approval overrides are derived from the **current** snapshot
+    /// (`docs/CLI.md` §4.4): a session (re)built after a configuration update
+    /// picks up the new model/tool/budget defaults and approval tiers. The
+    /// effective per-run budget (explicit wire budget > bound agent entry >
+    /// `[session]` default) is folded back into `config` for the driver.
     fn spawn_session(
         &self,
         session_id: SessionId,
-        config: SessionConfig,
+        mut config: SessionConfig,
         restore: Option<AgentSnapshot>,
     ) {
         let Some(client) = self.client.clone() else {
@@ -524,6 +546,12 @@ impl SessionManager {
         let store = self.store.clone();
         let config_apply = self.config_apply.clone();
         let turn_complete = self.turn_complete.clone();
+        let snapshot = config_apply.as_ref().map(|state| state.service().current());
+        let binding = SessionBinding::resolve(&config, snapshot.as_deref());
+        config.budget = binding.budget();
+        let overrides = snapshot
+            .as_deref()
+            .map_or_else(ApprovalOverrides::default, ApprovalOverrides::from_snapshot);
         // Read the apply generation synchronously *before* the handle is
         // registered: a bump racing the spawn either lands before this read
         // (the new session counts as up-to-date and never sees the command)
@@ -544,6 +572,8 @@ impl SessionManager {
                     config_apply,
                     applied_generation,
                     turn_complete,
+                    binding,
+                    overrides,
                     commands_rx,
                 )
             })

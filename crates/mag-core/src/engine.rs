@@ -18,6 +18,7 @@ use mag_service::{
     InteractionResponseWire, MagService, RequestId, RunId, ServiceError, ServiceEvent,
     SessionConfig, SessionId, SessionInfo, SourceInfo, UserInput,
 };
+use mag_sources::SourceRegistry;
 use mag_tools::ToolRegistry;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -59,7 +60,13 @@ impl Engine {
     /// store that survives a restart.
     #[must_use]
     pub fn new() -> Self {
-        Self::assemble(None, Arc::new(ToolRegistry::new()), in_memory_store(), None)
+        Self::assemble(
+            None,
+            Arc::new(ToolRegistry::new()),
+            in_memory_store(),
+            None,
+            SourceRegistry::new(),
+        )
     }
 
     /// Creates an engine that drives chat turns through `client`, exposing the
@@ -81,7 +88,13 @@ impl Engine {
     /// [`with_persistence`](Engine::with_persistence) for a durable store.
     #[must_use]
     pub fn with_llm_client_and_tools(client: Arc<dyn LlmClient>, tools: ToolRegistry) -> Self {
-        Self::assemble(Some(client), Arc::new(tools), in_memory_store(), None)
+        Self::assemble(
+            Some(client),
+            Arc::new(tools),
+            in_memory_store(),
+            None,
+            SourceRegistry::new(),
+        )
     }
 
     /// Creates an engine backed by a runtime [`ConfigService`]
@@ -101,8 +114,8 @@ impl Engine {
     /// [`ServiceError::Unsupported`].
     ///
     /// Persistence is in-memory; see [`with_persistence`](Engine::with_persistence)
-    /// for a durable store. `Engine::from_config` (M3-6) will assemble the
-    /// client/tools/persistence from the snapshot itself and route here.
+    /// for a durable store. [`Engine::from_config`] assembles the client, tools,
+    /// sources, and persistence from the snapshot itself and routes here.
     #[must_use]
     pub fn with_config_service(
         client: Arc<dyn LlmClient>,
@@ -114,6 +127,7 @@ impl Engine {
             Arc::new(tools),
             in_memory_store(),
             Some(config),
+            SourceRegistry::new(),
         )
     }
 
@@ -151,18 +165,38 @@ impl Engine {
         path: impl AsRef<Path>,
     ) -> Result<Self, PersistenceError> {
         let store = Arc::new(Persistence::open(path)?);
-        Ok(Self::assemble(Some(client), Arc::new(tools), store, None))
+        Ok(Self::assemble(
+            Some(client),
+            Arc::new(tools),
+            store,
+            None,
+            SourceRegistry::new(),
+        ))
+    }
+
+    /// The AI source registry this engine was assembled with
+    /// (`docs/CLI.md` §4.6).
+    ///
+    /// Engines built by [`from_config`](Engine::from_config) hold one
+    /// [`LlmSource`](mag_sources::LlmSource) per `[providers.<name>]` entry and
+    /// one reserved local-agent slot per `[external_agents.<name>]` entry
+    /// (decision D3; the M4 delegation wiring consumes those slots). Engines
+    /// built by the other constructors hold an empty registry.
+    #[must_use]
+    pub fn sources(&self) -> &SourceRegistry {
+        &self.inner.sources
     }
 
     /// Assembles an engine over an already-opened persistence store.
-    fn assemble(
+    pub(crate) fn assemble(
         client: Option<Arc<dyn LlmClient>>,
         tools: Arc<ToolRegistry>,
         store: Arc<Persistence>,
         config: Option<Arc<ConfigService>>,
+        sources: SourceRegistry,
     ) -> Self {
         Self {
-            inner: Arc::new(EngineInner::new(client, tools, store, config)),
+            inner: Arc::new(EngineInner::new(client, tools, store, config, sources)),
         }
     }
 }
@@ -415,6 +449,9 @@ struct EngineInner {
     /// Present when the engine was assembled with a [`ConfigService`]
     /// (`docs/CLI.md` §4.3): backs the `MagService` configuration surface.
     config_apply: Option<ConfigApplyState>,
+    /// The AI source registry assembled from the configuration
+    /// (`docs/CLI.md` §4.6); empty for engines built without `from_config`.
+    sources: SourceRegistry,
     /// Engine-wide turn-complete hook (`docs/CLI.md` §4.5), shared with every
     /// session driver.
     turn_complete: TurnCompleteHub,
@@ -426,6 +463,7 @@ impl EngineInner {
         tools: Arc<ToolRegistry>,
         store: Arc<Persistence>,
         config: Option<Arc<ConfigService>>,
+        sources: SourceRegistry,
     ) -> Self {
         let event_bus = EventBus::new();
         // Seed the id counter past every persisted session so a restarted engine
@@ -455,6 +493,7 @@ impl EngineInner {
             store,
             manager,
             config_apply,
+            sources,
             turn_complete,
         }
     }
@@ -504,7 +543,7 @@ impl ConfigApplyState {
 /// Opens a private in-memory persistence store for the non-durable engine
 /// constructors, panicking only if SQLite cannot open an in-memory database
 /// (which does not happen in practice).
-fn in_memory_store() -> Arc<Persistence> {
+pub(crate) fn in_memory_store() -> Arc<Persistence> {
     Arc::new(Persistence::in_memory().expect("open in-memory persistence store"))
 }
 
@@ -2813,7 +2852,9 @@ tools = ["read_file"]
     /// M3-5 (a): `apply_config` arriving mid-run lands at the turn boundary —
     /// the in-flight run keeps its original configuration to the end (the
     /// facade only admits reconfiguration at rest), and the reconfigure takes
-    /// effect for the next run.
+    /// effect for the next run. With the M3-6 session ↔ agent binding the
+    /// first run already uses the bound entry's model from creation, so the
+    /// boundary is demonstrated by updating the config mid-run.
     #[tokio::test]
     async fn apply_config_during_run_lands_at_the_turn_boundary() {
         let gate = StreamGate::new();
@@ -2843,11 +2884,18 @@ tools = ["read_file"]
                 break;
             }
         }
-
-        engine.apply_config().await.expect("apply config mid-run");
-        // The in-flight run is untouched: one request so far, old model.
+        // Create-time binding: the in-flight run already carries the bound
+        // entry's model (docs/CLI.md §4.4: new sessions use the current DO
+        // graph).
         assert_eq!(fake.stream_requests().len(), 1);
-        assert_eq!(fake.stream_requests()[0].model, "fake-chat");
+        assert_eq!(fake.stream_requests()[0].model, "model-b");
+
+        // Update the config mid-run and apply: the in-flight run is untouched.
+        let mut dto = engine.get_config().await.expect("get config");
+        dto.agents.get_mut("default").expect("default agent").model = Some("model-c".to_owned());
+        engine.update_config(dto).await.expect("update config");
+        engine.apply_config().await.expect("apply config mid-run");
+        assert_eq!(fake.stream_requests().len(), 1);
 
         gate.open();
         wait_run_finished(&mut events, session).await;
@@ -2862,7 +2910,7 @@ tools = ["read_file"]
         // admitted at rest): the second run's request carries the new model.
         let requests = fake.stream_requests();
         assert_eq!(requests.len(), 2);
-        assert_eq!(requests[1].model, "model-b");
+        assert_eq!(requests[1].model, "model-c");
     }
 
     /// M3-5 (c): a panicking listener is isolated — later listeners still
@@ -3015,5 +3063,408 @@ tools = ["read_file"]
                 operation: "apply_config".to_owned(),
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod session_binding {
+    //! M3-6 integration tests: the session ↔ agent binding and the configured
+    //! approval tiers, end-to-end over the scripted [`FakeLlmClient`]
+    //! (`docs/CLI.md` §4.4; see the [`Engine::from_config`] rustdoc).
+
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use agent_lib::{
+        client::LlmClient,
+        facade::{ToolContext, ToolResult},
+        model::{tool::Tool, usage::Usage},
+    };
+    use async_trait::async_trait;
+    use futures::stream::BoxStream;
+    use mag_service::{
+        ApprovalDecisionWire, InteractionResponseWire, MagService, RoutingMode, ServiceEvent,
+        SessionConfig, StepIdWire, ToolCallIdWire, UserInput,
+    };
+    use mag_tools::{PermissionSpec, ToolCategory, ToolPlugin, ToolRegistry, ToolRisk};
+    use serde_json::{Value, json};
+    use tokio::time::{Duration, timeout};
+    use uuid::Uuid;
+
+    use crate::test_support::{FakeLlmClient, text_stream_with_usage, tool_use_stream};
+    use crate::{ConfigService, Engine};
+
+    /// Unique temp directory per test, removed on drop (same pattern as the
+    /// `TempConfigDir` helper in `config.rs` tests).
+    struct TempConfigDir(PathBuf);
+
+    impl TempConfigDir {
+        fn new() -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos();
+            let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let mut path = std::env::temp_dir();
+            path.push(format!("mag-bind-{}-{nanos}-{unique}", std::process::id()));
+            fs::create_dir_all(&path).expect("create temp dir");
+            Self(path)
+        }
+
+        fn config_path(&self) -> PathBuf {
+            self.0.join("config.toml")
+        }
+    }
+
+    impl Drop for TempConfigDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A canned tool plugin (same pattern as `tool_turn::StubTool`): fixed
+    /// output, deterministic and offline.
+    #[derive(Debug)]
+    struct StubTool {
+        name: &'static str,
+        output: &'static str,
+        permission: Option<PermissionSpec>,
+    }
+
+    #[async_trait]
+    impl ToolPlugin for StubTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn declaration(&self) -> Tool {
+            Tool {
+                name: self.name.to_owned(),
+                description: format!("stub {} tool", self.name),
+                input_schema: json!({ "type": "object", "properties": {} }),
+            }
+        }
+
+        async fn invoke(&self, _ctx: ToolContext, _args: Value) -> ToolResult {
+            ToolResult::text(self.output)
+        }
+
+        fn permission(&self) -> Option<PermissionSpec> {
+            self.permission
+        }
+    }
+
+    /// A registry with a gated `shell` and an auto-allowed `read_file`.
+    fn registry() -> ToolRegistry {
+        ToolRegistry::new()
+            .register(Arc::new(StubTool {
+                name: "shell",
+                output: "shell output",
+                permission: Some(PermissionSpec::new(ToolCategory::Shell, ToolRisk::Medium)),
+            }))
+            .register(Arc::new(StubTool {
+                name: "read_file",
+                output: "file contents",
+                permission: None,
+            }))
+    }
+
+    /// Builds an engine backed by a [`ConfigService`] serving `toml`, with the
+    /// stub tool registry and the scripted fake client.
+    fn engine_with_config(
+        toml: &str,
+        scripts: Vec<Vec<agent_lib::stream::StreamEvent>>,
+    ) -> (TempConfigDir, Engine, Arc<FakeLlmClient>) {
+        let dir = TempConfigDir::new();
+        fs::write(dir.config_path(), toml).expect("write config");
+        let service =
+            Arc::new(ConfigService::load_or_default(dir.config_path()).expect("load config"));
+        let fake = FakeLlmClient::scripted(scripts);
+        let client: Arc<dyn LlmClient> = fake.clone();
+        let engine = Engine::with_config_service(client, registry(), service);
+        (dir, engine, fake)
+    }
+
+    fn session_config(provider: &str, model: &str) -> SessionConfig {
+        SessionConfig {
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+            tool_profile: None,
+            cwd: None,
+            routing: RoutingMode::ModelRouted,
+            budget: None,
+        }
+    }
+
+    fn usage() -> Usage {
+        Usage {
+            input: 2,
+            output: 1,
+            total: Some(3),
+            ..Usage::default()
+        }
+    }
+
+    /// The interface only supplies the decision; `step_id`/`call_id` are
+    /// reconstructed from the stored interaction, so nil placeholders are fine.
+    fn approval(decision: ApprovalDecisionWire) -> InteractionResponseWire {
+        InteractionResponseWire::Approval {
+            step_id: StepIdWire::new(Uuid::nil()),
+            call_id: ToolCallIdWire::new(Uuid::nil()),
+            decision,
+            message: None,
+        }
+    }
+
+    async fn next_event(events: &mut BoxStream<'static, ServiceEvent>) -> ServiceEvent {
+        timeout(Duration::from_secs(5), futures::StreamExt::next(events))
+            .await
+            .expect("event timed out")
+            .expect("event stream closed")
+    }
+
+    /// Reads events until (and including) the run's terminal event.
+    async fn collect_until_terminal(
+        events: &mut BoxStream<'static, ServiceEvent>,
+    ) -> Vec<ServiceEvent> {
+        let mut collected = Vec::new();
+        loop {
+            let event = next_event(events).await;
+            let terminal = matches!(
+                event,
+                ServiceEvent::RunFinished { .. } | ServiceEvent::RunError { .. }
+            );
+            collected.push(event);
+            if terminal {
+                return collected;
+            }
+        }
+    }
+
+    /// Create-time binding: a new session is assembled from the bound
+    /// `agents.default` entry — its model overrides the wire
+    /// `SessionConfig.model` and its tool list narrows the surface
+    /// (`docs/CLI.md` §4.4: new sessions use the current DO graph).
+    #[tokio::test]
+    async fn create_session_binds_model_and_tools_from_the_default_entry() {
+        let (_dir, engine, fake) = engine_with_config(
+            r#"
+[agents.default]
+model = "model-b"
+tools = ["read_file"]
+"#,
+            vec![text_stream_with_usage(&["ok"], usage())],
+        );
+        let session = engine
+            .create_session(session_config("fake", "fake-chat"))
+            .await
+            .expect("create session");
+        let mut events = engine.subscribe(Some(session));
+        engine
+            .send_message(session, UserInput::text("hi"))
+            .await
+            .expect("send message");
+        collect_until_terminal(&mut events).await;
+
+        let requests = fake.stream_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].model, "model-b");
+        let tool_names: Vec<&str> = requests[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(tool_names, vec!["read_file"]);
+    }
+
+    /// A session created with `provider = "reviewer"` binds the
+    /// `agents.reviewer` entry, and `apply_config` reconfigures it from that
+    /// same bound entry.
+    #[tokio::test]
+    async fn named_entry_binds_and_apply_config_uses_the_bound_name() {
+        let (_dir, engine, fake) = engine_with_config(
+            r#"
+[agents.default]
+model = "model-d"
+
+[agents.reviewer]
+model = "model-r1"
+"#,
+            vec![
+                text_stream_with_usage(&["one"], usage()),
+                text_stream_with_usage(&["two"], usage()),
+            ],
+        );
+        let session = engine
+            .create_session(session_config("reviewer", "fake-chat"))
+            .await
+            .expect("create session");
+        let mut events = engine.subscribe(Some(session));
+
+        engine
+            .send_message(session, UserInput::text("one"))
+            .await
+            .expect("first send");
+        collect_until_terminal(&mut events).await;
+        assert_eq!(fake.stream_requests()[0].model, "model-r1");
+
+        // Update the bound entry and apply: the next run uses the new model.
+        let mut dto = engine.get_config().await.expect("get config");
+        dto.agents
+            .get_mut("reviewer")
+            .expect("reviewer agent")
+            .model = Some("model-r2".to_owned());
+        engine.update_config(dto).await.expect("update config");
+        engine.apply_config().await.expect("apply config");
+
+        engine
+            .send_message(session, UserInput::text("two"))
+            .await
+            .expect("second send");
+        collect_until_terminal(&mut events).await;
+        let requests = fake.stream_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].model, "model-r2");
+    }
+
+    /// `[approval].default_policy = "ask"` gates even a permission-free
+    /// (normally auto-allowed) tool behind an `InteractionRequested`.
+    #[tokio::test]
+    async fn approval_default_ask_pauses_a_permission_free_tool() {
+        let (_dir, engine, _fake) = engine_with_config(
+            r#"
+[approval]
+default_policy = "ask"
+"#,
+            vec![
+                tool_use_stream("read_file", "call-1", json!({ "path": "x" })),
+                text_stream_with_usage(&["done"], usage()),
+            ],
+        );
+        let session = engine
+            .create_session(session_config("fake", "fake-chat"))
+            .await
+            .expect("create session");
+        let mut events = engine.subscribe(Some(session));
+        engine
+            .send_message(session, UserInput::text("read"))
+            .await
+            .expect("send message");
+
+        // Wait for the pause, then approve it.
+        let request_id = loop {
+            match next_event(&mut events).await {
+                ServiceEvent::InteractionRequested { request_id, .. } => break request_id,
+                ServiceEvent::RunStarted { .. } => continue,
+                other => panic!("expected the run to pause for approval, got {other:?}"),
+            }
+        };
+        engine
+            .respond_interaction(session, request_id, approval(ApprovalDecisionWire::Approve))
+            .await
+            .expect("approve");
+
+        let rest = collect_until_terminal(&mut events).await;
+        assert!(
+            rest.iter().any(|event| matches!(
+                event,
+                ServiceEvent::ToolStarted { trace, .. } if trace.name == "read_file"
+            )),
+            "the approved tool runs: {rest:?}"
+        );
+        assert!(
+            matches!(
+                rest.last().expect("terminal event"),
+                ServiceEvent::RunFinished { output, .. } if output.text == "done"
+            ),
+            "the turn finishes: {rest:?}"
+        );
+    }
+
+    /// A `[tools.<name>] approval = "allow"` entry overrides an `ask` default
+    /// for that tool: no pause, the tool runs directly.
+    #[tokio::test]
+    async fn per_tool_allow_overrides_an_ask_default() {
+        let (_dir, engine, _fake) = engine_with_config(
+            r#"
+[approval]
+default_policy = "ask"
+
+[tools.read_file]
+approval = "allow"
+"#,
+            vec![
+                tool_use_stream("read_file", "call-1", json!({ "path": "x" })),
+                text_stream_with_usage(&["done"], usage()),
+            ],
+        );
+        let session = engine
+            .create_session(session_config("fake", "fake-chat"))
+            .await
+            .expect("create session");
+        let mut events = engine.subscribe(Some(session));
+        engine
+            .send_message(session, UserInput::text("read"))
+            .await
+            .expect("send message");
+
+        let rest = collect_until_terminal(&mut events).await;
+        assert!(
+            !rest
+                .iter()
+                .any(|event| matches!(event, ServiceEvent::InteractionRequested { .. })),
+            "an allowed tool never pauses: {rest:?}"
+        );
+        assert!(
+            rest.iter().any(|event| matches!(
+                event,
+                ServiceEvent::ToolStarted { trace, .. } if trace.name == "read_file"
+            )),
+            "the tool runs without a pause: {rest:?}"
+        );
+    }
+
+    /// A `[tools.<name>] enabled = false` entry removes the tool from the
+    /// bound entry's enabled list, so an agent entry naming it cannot expose
+    /// it (the binding filters disabled tools at resolve time).
+    #[tokio::test]
+    async fn disabled_tool_is_absent_from_the_session_surface() {
+        let (_dir, engine, fake) = engine_with_config(
+            r#"
+[agents.default]
+tools = ["read_file", "shell"]
+
+[tools.shell]
+enabled = false
+"#,
+            vec![text_stream_with_usage(&["ok"], usage())],
+        );
+        let session = engine
+            .create_session(session_config("fake", "fake-chat"))
+            .await
+            .expect("create session");
+        let mut events = engine.subscribe(Some(session));
+        engine
+            .send_message(session, UserInput::text("hi"))
+            .await
+            .expect("send message");
+        collect_until_terminal(&mut events).await;
+
+        let requests = fake.stream_requests();
+        assert_eq!(requests.len(), 1);
+        let tool_names: Vec<&str> = requests[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(tool_names, vec!["read_file"]);
     }
 }
