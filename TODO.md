@@ -181,12 +181,53 @@ mag-core driver 落地 pivot 队列旁路（agent-lib `interject()`）。第二�
     3) `cargo clippy --all-targets -- -D warnings` ✅ 4) `cargo test --workspace` ✅（全绿，无失败）
     5) `cargo doc --no-deps --workspace` ✅。
 
-### M1-R [TODO] M1 review
+### M1-R [DONE] M1 review
 
 - **实现要求**：通读 M1 全部 diff，对照 `docs/CLI.md` §3.2 检查：契约只加不改、事件顺序正确、pivot 与
   cancel 竞态（cancel 抢占后 pivot 必须 `PivotDropped` 而非丢失）、持久化对齐、rustdoc 完整。发现问题直接
   修复并补测试。
 - **验证条件**：默认验证序列全过；完成记录列出 review 结论（发现/修复项）。
+
+  **完成记录**（2026-07-21）：
+  - review 范围：`git show e657fb0 9ee7141` 全 diff + 当前源码（`mag-service` service.rs/lib.rs、
+    `mag-core` driver.rs/session.rs/engine.rs/test_support.rs），对照 `docs/CLI.md` §3.2（决策 D1）。
+  - 检查点与结论：
+    1. **契约只加不改** ✅——`MagService` 仅新增 `pivot_message`；`ServiceError`/`ServiceEvent`/wire
+       `Event` 均只追加变体（`#[non_exhaustive]` 就位），既有方法签名、事件语义、既有 serde tag 未动；
+       `Command` 协议未动。旧事件流可反序列化（tag 不变，roundtrip+稳定 tag 用例覆盖三新变体与
+       `not_pivotable` 错误 tag）。
+    2. **投影完整性** ✅——`From<Event> for ServiceEvent` 覆盖 `PivotQueued/Applied/Dropped` 三变体；
+       `ServiceEvent::session_id()` 三变体均返回 `Some(id)`，故 `subscribe(Some(id))` 的按会话过滤
+       对新事件天然正确。
+    3. **事件顺序** ✅——actor 在回复 `Ok` 前先发 `PivotQueued`（订阅者必先见 Queued）；`drain_pivots`
+       在每次 poll 后尝试 `interject()`，`InvalidState` 留队盲重试、接受发 `PivotApplied`；run 终态
+       `drop_pivots` 在 terminal 事件**之前**发 `PivotDropped`（finished/failed/cancelled 三种 reason
+       区分）。测试逐条断言 `PivotQueued→PivotApplied`、`PivotDropped < terminal` 顺序。已知的良性
+       竞态：pivot 在 run 已发 terminal 之后才入队时，由 actor 回收 driver 时补发 `PivotDropped`
+       （同一 terminal reason）——此时 `PivotDropped` 落在 terminal 事件之后属不可避免，关键不变量
+       「每个 `PivotQueued` 必有恰好一个 `PivotApplied`/`PivotDropped` 收尾、绝不静默丢失」成立。
+    4. **pivot 与 cancel 竞态** ✅——cancel 抢占 → facade 流以取消错误收场 →
+       `TurnOutcome::Cancelled` → `drop_pivots`（reason 含 cancelled）先于 `RunError{Cancelled}`；
+       actor 侧二次 drain 兜底同一 reason。`queued_pivot_is_dropped_when_the_run_is_cancelled`
+       覆盖。
+    5. **持久化对齐** ✅——接受的 pivot 经 agent-lib `interject()` 语义成为 user message 进对话历史，
+       run 提交时走既有 `persist_committed_snapshot` 路径落盘（与 `send_message` 完全同路径）；
+       未落地 pivot 不进历史。`applied_pivot_is_persisted_with_the_committed_snapshot` 断言快照 JSON
+       同时含 pivot 与原始消息文本。
+    6. **rustdoc** ✅（修复 1 项后）——`pivot_message`/`NotPivotable`/`Pivot*`/`PivotQueue`/
+       `drain_pivots`/`drop_pivots`/`TurnOutcome::pivot_drop_reason` 均引用 `docs/CLI.md` §3.2 并准确
+       描述两层语义与旁路机制。
+  - 与 §3.2 设计稿的一处有意偏差（非问题）：§3.2 草图中 `Pivot*` 事件携带 `text: String`，M1-1 按
+    TODO 任务规范实现为不携带 text（事件保持小、调用方自知所发文本）——以 TODO 任务定义为准，
+    维持现状。
+  - 发现与修复项（共 1 项，已修复）：wire `Event::PivotQueued` 的 rustdoc 中
+    `[`ServiceEvent::PivotQueued`](crate::ServiceEvent::PivotQueued)` 显式链接目标冗余，
+    `cargo doc` 报 `redundant explicit link target` 警告——已改为裸 intra-doc link，workspace
+    文档构建警告归零。属纯文档修复，无需补测试。
+  - 门禁结果（修复后全量重跑）：1) `cargo fmt --all -- --check` ✅ 2) `cargo test -p mag-core pivot`
+    ✅（5 passed，连跑 3 次无 flake）+ `cargo test -p mag-service` ✅（14 passed）
+    3) `cargo clippy --all-targets -- -D warnings` ✅ 4) `cargo test --workspace` ✅（18 个测试目标
+    全 ok，无失败）5) `cargo doc --no-deps --workspace` ✅（0 warning）。
 
 ---
 

@@ -278,7 +278,7 @@ pub enum Event {
     ///
     /// First layer of the two-layer pivot semantics (`docs/CLI.md` §3.2,
     /// decision D1); the transport-facing twin of
-    /// [`ServiceEvent::PivotQueued`](crate::ServiceEvent::PivotQueued).
+    /// [`ServiceEvent::PivotQueued`].
     PivotQueued {
         /// Session whose in-progress run the pivot targets.
         id: SessionId,
