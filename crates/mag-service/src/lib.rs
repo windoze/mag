@@ -346,6 +346,12 @@ pub struct SessionConfig {
     /// Model identifier understood by the selected provider.
     pub model: String,
     /// Named tool profile to attach to the session.
+    ///
+    /// **Reserved, currently a dead field**: nothing in mag-core reads it —
+    /// the session's tool surface comes from the bound `agents.<name>` entry
+    /// of the pinned config snapshot. It stays on the wire for forward
+    /// compatibility (serde round-trips it), and a future tool-profile
+    /// concept may give it meaning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_profile: Option<String>,
     /// Session working root supplied by the interface (for ACP, the client's

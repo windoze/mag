@@ -4,6 +4,7 @@
 //! in-memory stdin/stdout pipes. They cover the M6 CLI contracts without a
 //! real terminal, network, credentials, or LLM.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -31,6 +32,7 @@ const REQ_QUESTION: &str = "10000000-0000-0000-0000-000000000002";
 const REQ_CHOICE: &str = "10000000-0000-0000-0000-000000000003";
 const REQ_PERMISSION: &str = "10000000-0000-0000-0000-000000000004";
 const REQ_BACKGROUND: &str = "10000000-0000-0000-0000-000000000005";
+const REQ_QUIT_LATE: &str = "10000000-0000-0000-0000-000000000006";
 const CALL_APPROVAL: &str = "20000000-0000-0000-0000-000000000001";
 const AGENT_PERMISSION: &str = "30000000-0000-0000-0000-000000000001";
 
@@ -53,6 +55,7 @@ struct ScriptedService {
     pivots: Arc<Mutex<Vec<SentMessage>>>,
     replies: Arc<Mutex<Vec<InteractionReply>>>,
     cancels: Arc<Mutex<Vec<SessionId>>>,
+    defer_cancel_terminal: Arc<AtomicBool>,
     resumes: Arc<Mutex<Vec<SessionId>>>,
     deletes: Arc<Mutex<Vec<SessionId>>>,
     list_sessions_calls: Arc<Mutex<usize>>,
@@ -74,6 +77,7 @@ impl ScriptedService {
             pivots: Arc::new(Mutex::new(Vec::new())),
             replies: Arc::new(Mutex::new(Vec::new())),
             cancels: Arc::new(Mutex::new(Vec::new())),
+            defer_cancel_terminal: Arc::new(AtomicBool::new(false)),
             resumes: Arc::new(Mutex::new(Vec::new())),
             deletes: Arc::new(Mutex::new(Vec::new())),
             list_sessions_calls: Arc::new(Mutex::new(0)),
@@ -101,6 +105,21 @@ impl ScriptedService {
 
     fn cancels(&self) -> Arc<Mutex<Vec<SessionId>>> {
         Arc::clone(&self.cancels)
+    }
+
+    fn defer_cancel_terminal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.defer_cancel_terminal)
+    }
+
+    /// Emits the cancelled terminal a `cancel` call would normally produce;
+    /// used together with `defer_cancel_terminal` to script the exact moment a
+    /// cancelled run reaches its terminal state.
+    fn emit_cancelled_terminal(&self, id: SessionId) {
+        let _ = self.events.send(ServiceEvent::RunError {
+            id,
+            message: "cancelled by user".to_owned(),
+            kind: mag_service::RunErrorKind::Cancelled,
+        });
     }
 
     fn resumes(&self) -> Arc<Mutex<Vec<SessionId>>> {
@@ -243,6 +262,21 @@ impl ScriptedService {
             origin: InteractionOrigin::default(),
         });
     }
+
+    fn emit_late_approval(&self, id: SessionId) {
+        let call_id = ToolCallIdWire::parse_str(CALL_APPROVAL).expect("valid call id");
+        let _ = self.events.send(ServiceEvent::InteractionRequested {
+            id,
+            request_id: RequestId::parse_str(REQ_QUIT_LATE).expect("valid request id"),
+            kind: InteractionKindWire::Approval {
+                call_id,
+                requirement: ApprovalRequirementWire::RequireApproval {
+                    reason: Some("late interaction during quit".to_owned()),
+                },
+            },
+            origin: InteractionOrigin::default(),
+        });
+    }
 }
 
 fn scripted_config() -> ConfigDto {
@@ -360,11 +394,9 @@ impl MagService for ScriptedService {
 
     async fn cancel(&self, id: SessionId) -> Result<(), ServiceError> {
         self.cancels.lock().expect("lock").push(id);
-        let _ = self.events.send(ServiceEvent::RunError {
-            id,
-            message: "cancelled by user".to_owned(),
-            kind: mag_service::RunErrorKind::Cancelled,
-        });
+        if !self.defer_cancel_terminal.load(Ordering::SeqCst) {
+            self.emit_cancelled_terminal(id);
+        }
         Ok(())
     }
 
@@ -509,6 +541,10 @@ fn options() -> CliOptions {
 }
 
 async fn drive(input: &str, service: Arc<ScriptedService>) -> String {
+    drive_dyn(input, service).await
+}
+
+async fn drive_dyn(input: &str, service: Arc<dyn MagService>) -> String {
     let (mut stdin_writer, stdin_reader) = tokio::io::duplex(1024);
     let (stdout_writer, mut stdout_reader) = tokio::io::duplex(4096);
     let cli_service: Arc<dyn MagService> = service;
@@ -539,6 +575,16 @@ async fn drive(input: &str, service: Arc<ScriptedService>) -> String {
 
 fn spawn_cli(
     service: Arc<ScriptedService>,
+) -> (
+    tokio::io::DuplexStream,
+    tokio::io::DuplexStream,
+    JoinHandle<Result<(), CliError>>,
+) {
+    spawn_cli_dyn(service)
+}
+
+fn spawn_cli_dyn(
+    service: Arc<dyn MagService>,
 ) -> (
     tokio::io::DuplexStream,
     tokio::io::DuplexStream,
@@ -1214,4 +1260,163 @@ async fn config_commands_call_service_methods_and_render_changes() {
     assert_eq!(*get_config_calls.lock().expect("lock"), 1);
     assert_eq!(*reload_config_calls.lock().expect("lock"), 1);
     assert_eq!(*apply_config_calls.lock().expect("lock"), 1);
+}
+/// Scripted service whose event stream ends immediately, simulating a service
+/// that closes the subscription while the CLI is still running (B6 regression).
+struct EndingStreamService {
+    inner: ScriptedService,
+}
+
+impl EndingStreamService {
+    fn new() -> Self {
+        Self {
+            inner: ScriptedService::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl MagService for EndingStreamService {
+    async fn create_session(&self, config: SessionConfig) -> Result<SessionId, ServiceError> {
+        self.inner.create_session(config).await
+    }
+
+    async fn list_sessions(&self) -> Result<Vec<SessionInfo>, ServiceError> {
+        self.inner.list_sessions().await
+    }
+
+    async fn resume_session(&self, id: SessionId) -> Result<(), ServiceError> {
+        self.inner.resume_session(id).await
+    }
+
+    async fn delete_session(&self, id: SessionId) -> Result<(), ServiceError> {
+        self.inner.delete_session(id).await
+    }
+
+    async fn send_message(&self, id: SessionId, input: UserInput) -> Result<RunId, ServiceError> {
+        self.inner.send_message(id, input).await
+    }
+
+    async fn cancel(&self, id: SessionId) -> Result<(), ServiceError> {
+        self.inner.cancel(id).await
+    }
+
+    async fn pivot_message(&self, id: SessionId, input: UserInput) -> Result<(), ServiceError> {
+        self.inner.pivot_message(id, input).await
+    }
+
+    async fn respond_interaction(
+        &self,
+        id: SessionId,
+        request_id: RequestId,
+        response: InteractionResponseWire,
+    ) -> Result<(), ServiceError> {
+        self.inner
+            .respond_interaction(id, request_id, response)
+            .await
+    }
+
+    fn subscribe(&self, _id: Option<SessionId>) -> BoxStream<'static, ServiceEvent> {
+        stream::empty().boxed()
+    }
+
+    async fn list_sources(&self) -> Result<Vec<SourceInfo>, ServiceError> {
+        self.inner.list_sources().await
+    }
+
+    async fn probe_local_agents(&self) -> Result<Vec<SourceInfo>, ServiceError> {
+        self.inner.probe_local_agents().await
+    }
+
+    async fn get_config(&self) -> Result<ConfigDto, ServiceError> {
+        self.inner.get_config().await
+    }
+
+    async fn update_config(&self, config: ConfigDto) -> Result<(), ServiceError> {
+        self.inner.update_config(config).await
+    }
+
+    async fn reload_config(&self) -> Result<(), ServiceError> {
+        self.inner.reload_config().await
+    }
+
+    async fn apply_config(&self) -> Result<(), ServiceError> {
+        self.inner.apply_config().await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quit_with_in_flight_run_cancels_and_auto_answers_late_interaction() {
+    let service = Arc::new(ScriptedService::new());
+    let replies = service.replies();
+    let cancels = service.cancels();
+    // Hold back the cancelled run's terminal so the wind-down window stays
+    // open: the late interaction then deterministically arrives while the CLI
+    // is quitting but the run is still active.
+    service
+        .defer_cancel_terminal()
+        .store(true, Ordering::SeqCst);
+    let (mut stdin_writer, mut stdout_reader, run) = spawn_cli(service.clone());
+    let mut output = String::new();
+    let session_a = SessionId::parse_str(SESSION_A).unwrap();
+
+    read_until(&mut stdout_reader, &mut output, SESSION_A).await;
+    // `hold` starts a run that never finishes on its own.
+    stdin_writer
+        .write_all(b"hold\n")
+        .await
+        .expect("start in-flight run");
+    stdin_writer.write_all(b"/quit\n").await.expect("quit CLI");
+    // The quit path proactively cancels the in-flight run; once that line is
+    // visible the CLI is already winding down.
+    read_until(&mut stdout_reader, &mut output, "[cancel requested").await;
+    // A driver blocked on a fresh interaction during wind-down must not hang
+    // the CLI: the interaction is answered with a cancel decision.
+    service.emit_late_approval(session_a);
+    read_until(&mut stdout_reader, &mut output, "cancelled during quit").await;
+    service.emit_cancelled_terminal(session_a);
+    stdin_writer.shutdown().await.expect("close scripted stdin");
+
+    let result = tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("CLI run must not hang")
+        .expect("CLI task must join");
+    result.expect("CLI run must succeed");
+
+    let cancels = cancels.lock().expect("lock").clone();
+    assert_eq!(cancels, vec![session_a]);
+
+    let replies = replies.lock().expect("lock").clone();
+    let late_reply = replies
+        .iter()
+        .find(|reply| reply.request_id == RequestId::parse_str(REQ_QUIT_LATE).unwrap())
+        .expect("late interaction must be answered with a cancel decision");
+    assert_eq!(late_reply.session_id, session_a);
+    match &late_reply.response {
+        InteractionResponseWire::Approval { decision, .. } => {
+            assert_eq!(*decision, ApprovalDecisionWire::Cancel);
+        }
+        other => panic!("expected approval cancel response, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_still_exits_after_the_event_stream_ends() {
+    // The subscription closes right away; the CLI must keep servicing input
+    // (instead of busy-spinning on the dead notice channel) and exit normally
+    // on /quit. The join timeout is the backstop against a hang regression.
+    let service = Arc::new(EndingStreamService::new());
+    let (mut stdin_writer, mut stdout_reader, run) = spawn_cli_dyn(service);
+    let mut output = String::new();
+
+    read_until(&mut stdout_reader, &mut output, "[session").await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    stdin_writer.write_all(b"/quit\n").await.expect("quit CLI");
+    stdin_writer.shutdown().await.expect("close scripted stdin");
+
+    let result = tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("CLI run must not hang after the event stream ended")
+        .expect("CLI task must join");
+    result.expect("CLI run must succeed");
 }

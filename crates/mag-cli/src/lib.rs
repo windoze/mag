@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::io::IsTerminal;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::{Stream, StreamExt};
 use mag_service::{
@@ -25,6 +26,7 @@ use mag_service::{
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, Stdout};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 /// Default provider used when the CLI creates a session without a user-supplied
 /// agent selection.
@@ -33,6 +35,19 @@ pub const DEFAULT_PROVIDER: &str = "openai";
 /// Default model used when the CLI creates a session without a user-supplied
 /// agent selection.
 pub const DEFAULT_MODEL: &str = "gpt-5-codex";
+
+/// Overall fallback window after `/quit` or Ctrl-D: in-flight runs are asked to
+/// cancel and the CLI waits for their terminals, but if a driver stays blocked
+/// past this window the CLI force-exits instead of hanging forever.
+const QUIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Grace window between `/quit`/Ctrl-D and the proactive cancel of in-flight
+/// runs. The render task lags the coordinator, so a run that *just* finished
+/// may still look active when the quit lands; cancelling it would print
+/// spurious cancel/error lines (and, in a real engine, race the run's own
+/// terminal). Runs still active after the grace window are genuinely in
+/// flight and get cancelled.
+const QUIT_CANCEL_GRACE: Duration = Duration::from_millis(500);
 
 type SharedOutput<W> = Arc<Mutex<W>>;
 
@@ -182,6 +197,18 @@ enum LineOutcome {
     Quit,
 }
 
+/// Result of a Ctrl-C on the active interaction prompt.
+enum ActiveCancel {
+    /// No prompt was active.
+    None,
+    /// The prompt kind carries a cancel decision variant, so the cancel was
+    /// delivered as an interaction response and the run keeps going.
+    Responded,
+    /// The prompt kind has no cancel decision variant, so the whole session
+    /// run was cancelled instead.
+    CancelledSession(SessionId),
+}
+
 #[derive(Clone, Debug)]
 struct PendingInteraction {
     session_id: SessionId,
@@ -258,22 +285,23 @@ impl PromptCoordinator {
         &mut self,
         service: &Arc<dyn MagService>,
         output: &SharedOutput<W>,
-    ) -> Result<bool, CliError>
+    ) -> Result<ActiveCancel, CliError>
     where
         W: AsyncWrite + Send + Unpin + 'static,
     {
         let Some(active) = self.active.clone() else {
-            return Ok(false);
+            return Ok(ActiveCancel::None);
         };
         if let Some(response) = cancellation_response(&active.kind) {
             self.respond(service, output, response).await?;
+            Ok(ActiveCancel::Responded)
         } else {
             self.active = None;
             self.queue
                 .retain(|interaction| interaction.session_id != active.session_id);
             cancel_session_for_interaction(service, output, active.session_id).await?;
+            Ok(ActiveCancel::CancelledSession(active.session_id))
         }
-        Ok(true)
     }
 
     async fn cancel_all<W>(
@@ -372,6 +400,11 @@ where
     SpawnInput: FnOnce(SharedOutput<W>, String, mpsc::Sender<InputCommand>) -> JoinHandle<()>,
 {
     let output = Arc::new(Mutex::new(output));
+    // Subscribe *before* printing the session banner: the banner is the
+    // interface's "ready" signal, and any event the service emits after it
+    // must already have a registered receiver (a broadcast subscription only
+    // sees events sent after it was created).
+    let events = service.subscribe(None);
     let mut session_id = if let Some(id) = opts.resume {
         service.resume_session(id).await?;
         write_line(&output, &format!("[session {id} resumed]\n")).await?;
@@ -386,28 +419,25 @@ where
     let (notice_tx, mut notice_rx) = mpsc::channel(8);
 
     let render_output = Arc::clone(&output);
-    let events = service.subscribe(None);
     let render_handle = tokio::spawn(render_events(events, render_output, notice_tx));
     let input_handle = spawn_input(Arc::clone(&output), opts.prompt.clone(), input_tx);
 
-    let mut active_runs = HashSet::new();
-    let mut skipped_terminals = HashMap::<SessionId, usize>::new();
-    let mut quitting = false;
+    let mut state = EventLoopState::default();
     let mut prompts = PromptCoordinator::default();
 
     loop {
-        if quitting && active_runs.is_empty() {
+        if state.quitting && state.active_runs.is_empty() {
             break;
         }
 
         tokio::select! {
-            command = input_rx.recv(), if !quitting => {
+            command = input_rx.recv(), if !state.quitting => {
                 match command {
                     Some(InputCommand::Line(line)) => {
                         if prompts.answer(&service, &output, line.clone()).await? {
                             continue;
                         }
-                        let current_session_running = active_runs.contains(&session_id);
+                        let current_session_running = state.active_runs.contains(&session_id);
                         match handle_line(
                             &service,
                             &opts,
@@ -421,63 +451,71 @@ where
                                 id,
                                 skip_next_terminal,
                             } => {
-                                active_runs.insert(id);
+                                state.active_runs.insert(id);
                                 if skip_next_terminal {
-                                    *skipped_terminals.entry(id).or_default() += 1;
+                                    *state.skipped_terminals.entry(id).or_default() += 1;
                                 }
                             }
                             LineOutcome::Quit => {
-                                if prompts.has_pending() {
-                                    prompts.cancel_all(&service, &output).await?;
-                                }
-                                quitting = true;
+                                begin_quit(
+                                    &service,
+                                    &output,
+                                    &mut prompts,
+                                    &mut notice_rx,
+                                    session_id,
+                                    &mut state,
+                                )
+                                .await?;
                             }
                         }
-                        if !quitting {
+                        if !state.quitting {
                             prompts.prompt_next(&output, session_id).await?;
                         }
                     }
                     Some(InputCommand::Interrupted) => {
-                        if prompts.cancel_active(&service, &output).await? {
-                            continue;
+                        match prompts.cancel_active(&service, &output).await? {
+                            ActiveCancel::CancelledSession(id) => {
+                                state.quashed_sessions.insert(id);
+                                continue;
+                            }
+                            ActiveCancel::Responded => continue,
+                            ActiveCancel::None => {}
                         }
-                        if active_runs.contains(&session_id) {
+                        if state.active_runs.contains(&session_id) {
+                            state.quashed_sessions.insert(session_id);
                             request_cancel(&service, &output, session_id).await?;
                         }
                     }
                     Some(InputCommand::Eof) | None => {
-                        if prompts.has_pending() {
-                            prompts.cancel_all(&service, &output).await?;
-                        }
-                        quitting = true;
+                        begin_quit(
+                            &service,
+                            &output,
+                            &mut prompts,
+                            &mut notice_rx,
+                            session_id,
+                            &mut state,
+                        )
+                        .await?;
                     }
                     Some(InputCommand::Io(error)) => return Err(CliError::Io(error)),
                     Some(InputCommand::Readline(error)) => return Err(CliError::Readline(error)),
                 }
             }
-            notice = notice_rx.recv() => {
-                match notice {
-                    Some(RenderNotice::Interaction(interaction)) => {
-                        prompts.enqueue(&output, session_id, *interaction).await?;
-                    }
-                    Some(RenderNotice::RunStarted(id)) => {
-                        active_runs.insert(id);
-                    }
-                    Some(RenderNotice::Terminal(id)) => {
-                        if should_skip_terminal(&mut skipped_terminals, id) {
-                            continue;
-                        }
-                        active_runs.remove(&id);
-                    }
-                    Some(RenderNotice::StreamEnded) | None => {
-                        active_runs.clear();
-                        skipped_terminals.clear();
-                        if quitting {
-                            break;
-                        }
-                    }
-                    Some(RenderNotice::Io(error)) => return Err(CliError::Io(error)),
-                }
+            notice = notice_rx.recv(), if !state.stream_ended => {
+                handle_notice(notice, &service, &output, &mut prompts, session_id, &mut state)
+                    .await?;
+            }
+            () = wait_for_deadline(state.quit_cancel_at), if state.quitting => {
+                state.quit_cancel_at = None;
+                cancel_in_flight_runs_on_quit(&service, &output, &mut state).await?;
+            }
+            () = wait_for_deadline(state.quit_deadline), if state.quitting => {
+                write_line(
+                    &output,
+                    "\n[quit timed out waiting for in-flight runs; forcing exit]\n",
+                )
+                .await?;
+                break;
             }
         }
     }
@@ -815,6 +853,197 @@ where
     service.cancel(session_id).await?;
     write_line(output, &format!("[cancel requested {session_id}]\n")).await?;
     Ok(())
+}
+
+/// Coordinator state for the run loop's wind-down logic.
+#[derive(Default)]
+struct EventLoopState {
+    /// Sessions with a run in flight (per the coordinator's view of notices).
+    active_runs: HashSet<SessionId>,
+    /// Terminals to ignore because the run was superseded by a fallback send.
+    skipped_terminals: HashMap<SessionId, usize>,
+    /// Sessions the CLI already asked to cancel (Ctrl-C, `/cancel`, or the
+    /// quit-time proactive cancel). Interactions arriving for a quashed session
+    /// belong to a run that is being torn down, so they are answered with a
+    /// cancel decision instead of being queued for a user who already moved on;
+    /// the entry is cleared when a *new* run starts on the session.
+    quashed_sessions: HashSet<SessionId>,
+    /// `/quit` or Ctrl-D was processed: input is disabled and the loop is
+    /// draining toward exit.
+    quitting: bool,
+    /// The render task ended; the notice branch is fused off to avoid busy
+    /// spinning on the closed channel.
+    stream_ended: bool,
+    /// When the proactive quit-time cancel of in-flight runs fires
+    /// ([`QUIT_CANCEL_GRACE`] after the quit).
+    quit_cancel_at: Option<Instant>,
+    /// Hard fallback deadline for the whole wind-down
+    /// ([`QUIT_DRAIN_TIMEOUT`] after the quit).
+    quit_deadline: Option<Instant>,
+}
+
+/// Handles one render notice (or the channel closing). Shared by the `select!`
+/// notice branch and the quit-time drain so both paths apply identical
+/// bookkeeping.
+async fn handle_notice<W>(
+    notice: Option<RenderNotice>,
+    service: &Arc<dyn MagService>,
+    output: &SharedOutput<W>,
+    prompts: &mut PromptCoordinator,
+    session_id: SessionId,
+    state: &mut EventLoopState,
+) -> Result<(), CliError>
+where
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    match notice {
+        Some(RenderNotice::Interaction(interaction)) => {
+            if state.quitting || state.quashed_sessions.contains(&interaction.session_id) {
+                // Nobody is left to answer prompts: the quit path disabled
+                // input, and a quashed session's run is being torn down.
+                // Auto-answer with a cancel decision so the driver never
+                // parks on a pending interaction nobody can resolve.
+                auto_cancel_interaction(service, output, &interaction).await?;
+            } else {
+                prompts.enqueue(output, session_id, *interaction).await?;
+            }
+        }
+        Some(RenderNotice::RunStarted(id)) => {
+            state.quashed_sessions.remove(&id);
+            state.active_runs.insert(id);
+        }
+        Some(RenderNotice::Terminal(id)) => {
+            if !should_skip_terminal(&mut state.skipped_terminals, id) {
+                state.active_runs.remove(&id);
+            }
+        }
+        Some(RenderNotice::StreamEnded) | None => {
+            // Fuse the branch: with the render task gone the notice channel
+            // stays closed, and selecting on it would busy spin at 100% CPU.
+            state.stream_ended = true;
+            state.active_runs.clear();
+            state.skipped_terminals.clear();
+        }
+        Some(RenderNotice::Io(error)) => return Err(CliError::Io(error)),
+    }
+    Ok(())
+}
+
+/// Shared `/quit` and Ctrl-D wind-down: disables input, resolves queued
+/// prompts with cancel decisions, and arms the two-stage exit — after
+/// [`QUIT_CANCEL_GRACE`] any runs still in flight are proactively cancelled
+/// ([`cancel_in_flight_runs_on_quit`]), and [`QUIT_DRAIN_TIMEOUT`] is the hard
+/// fallback that force-exits even if a driver never reaches its terminal.
+async fn begin_quit<W>(
+    service: &Arc<dyn MagService>,
+    output: &SharedOutput<W>,
+    prompts: &mut PromptCoordinator,
+    notice_rx: &mut mpsc::Receiver<RenderNotice>,
+    session_id: SessionId,
+    state: &mut EventLoopState,
+) -> Result<(), CliError>
+where
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    state.quitting = true;
+    let now = Instant::now();
+    state.quit_cancel_at = Some(now + QUIT_CANCEL_GRACE);
+    state.quit_deadline = Some(now + QUIT_DRAIN_TIMEOUT);
+    if prompts.has_pending() {
+        prompts.cancel_all(service, output).await?;
+    }
+    // Drain notices the render task already queued so runs that just finished
+    // drop out of `active_runs` immediately and late interactions get their
+    // cancel answer without waiting for the grace timer.
+    while let Ok(notice) = notice_rx.try_recv() {
+        handle_notice(Some(notice), service, output, prompts, session_id, state).await?;
+    }
+    Ok(())
+}
+
+/// Proactively cancels every session whose run is still in flight after the
+/// quit grace window (skipping sessions already cancelled by Ctrl-C), so exit
+/// does not wait for long runs to finish naturally. Cancel failures are
+/// reported, never fatal.
+async fn cancel_in_flight_runs_on_quit<W>(
+    service: &Arc<dyn MagService>,
+    output: &SharedOutput<W>,
+    state: &mut EventLoopState,
+) -> Result<(), CliError>
+where
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    let mut pending: Vec<SessionId> = state.active_runs.iter().copied().collect();
+    pending.sort_unstable();
+    for id in pending {
+        if !state.quashed_sessions.insert(id) {
+            continue;
+        }
+        match service.cancel(id).await {
+            Ok(()) => write_line(output, &format!("[cancel requested {id}]\n")).await?,
+            Err(error) => {
+                write_line(
+                    output,
+                    &format!("[error] cancel {id} during quit: {error}\n"),
+                )
+                .await?
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Answers an interaction that arrived while quitting (or for a session whose
+/// run is already being cancelled) with its cancel decision instead of queuing
+/// a prompt nobody can answer. Kinds without a cancel decision variant
+/// (question/choice) are dropped — the session cancel requested on the quit
+/// path unblocks their driver. Response failures are reported, never fatal.
+async fn auto_cancel_interaction<W>(
+    service: &Arc<dyn MagService>,
+    output: &SharedOutput<W>,
+    interaction: &PendingInteraction,
+) -> Result<(), CliError>
+where
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    let Some(response) = cancellation_response(&interaction.kind) else {
+        return Ok(());
+    };
+    let result = service
+        .respond_interaction(interaction.session_id, interaction.request_id, response)
+        .await;
+    match result {
+        Ok(()) => {
+            write_line(
+                output,
+                &format!(
+                    "\n[interaction {} cancelled during quit]\n",
+                    interaction.request_id
+                ),
+            )
+            .await?;
+        }
+        Err(error) => {
+            write_line(
+                output,
+                &format!(
+                    "\n[error] auto-cancel interaction {}: {error}\n",
+                    interaction.request_id
+                ),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Awaits an optional deadline; pends forever while it is unset so the
+/// `select!` branch stays dormant.
+async fn wait_for_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
 }
 
 fn should_skip_terminal(skipped_terminals: &mut HashMap<SessionId, usize>, id: SessionId) -> bool {

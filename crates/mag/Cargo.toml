@@ -14,6 +14,7 @@ mag-core = { path = "../mag-core" }
 mag-service = { path = "../mag-service" }
 agent-client-protocol = "1"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 agent-lib = { workspace = true }

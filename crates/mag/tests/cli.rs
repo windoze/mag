@@ -373,3 +373,71 @@ model = "claude-sonnet-4-5"
     );
     assert!(!stderr.contains("sk-"), "no secret material: {stderr}");
 }
+
+#[test]
+fn warn_level_diagnostics_reach_stderr_and_stay_off_stdout() {
+    let dir = TempDir::new("tracing");
+    fs::write(
+        dir.config_path(),
+        r#"
+[providers.openai]
+wire = "openai"
+api_key = { env = "MAG_BIN_TRACING_API_KEY" }
+
+[agents.default]
+provider = "openai"
+model = "gpt-5-codex"
+
+[tools.no_such_tool]
+approval = "ask"
+"#,
+    )
+    .expect("write config with an unknown tool override");
+
+    let envs = [("MAG_BIN_TRACING_API_KEY", "sk-bin-tracing")];
+    let output = run_cli_with_env(&dir.config_path(), &[], "/quit\n", &envs);
+
+    assert!(output.status.success(), "CLI exits 0: {output:?}");
+    // mag-core warns that the tool override names no registered plugin; the
+    // bin-installed tracing subscriber must surface it on stderr by default
+    // (no MAG_LOG/RUST_LOG set) while stdout keeps only the CLI transcript.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("tool override names no registered tool plugin"),
+        "warn diagnostic lands on stderr: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("tool override names no registered tool plugin"),
+        "stdout stays free of log output: {stdout}"
+    );
+}
+
+#[test]
+fn mag_log_env_overrides_the_default_level() {
+    let dir = TempDir::new("tracing-env");
+    fs::write(
+        dir.config_path(),
+        r#"
+[tools.shell]
+enabled = false
+"#,
+    )
+    .expect("write config disabling a builtin tool");
+
+    // `shell` disabled by config is an info-level diagnostic: invisible at the
+    // default warn level, visible once MAG_LOG asks for info.
+    let quiet = run_cli(&dir.config_path(), &[], "/quit\n");
+    let quiet_stderr = String::from_utf8_lossy(&quiet.stderr);
+    assert!(
+        !quiet_stderr.contains("tool disabled by configuration"),
+        "info diagnostic hidden at the default level: {quiet_stderr}"
+    );
+
+    let verbose = run_cli_with_env(&dir.config_path(), &[], "/quit\n", &[("MAG_LOG", "info")]);
+    let verbose_stderr = String::from_utf8_lossy(&verbose.stderr);
+    assert!(
+        verbose_stderr.contains("tool disabled by configuration"),
+        "MAG_LOG=info surfaces the info diagnostic: {verbose_stderr}"
+    );
+}

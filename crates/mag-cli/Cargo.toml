@@ -7,7 +7,7 @@ edition.workspace = true
 futures = { workspace = true }
 mag-service = { path = "../mag-service" }
 rustyline = "14"
-tokio = { workspace = true, features = ["io-std", "io-util", "rt", "sync"] }
+tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
 async-trait = { workspace = true }

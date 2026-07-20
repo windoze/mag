@@ -23,6 +23,26 @@ use agent_client_protocol::Stdio;
 use mag_cli::{Cli as TerminalCli, CliOptions};
 use mag_core::{ConfigService, Engine};
 use mag_service::{MagService, SessionId};
+use tracing_subscriber::EnvFilter;
+
+/// Installs the process-wide tracing subscriber.
+///
+/// All diagnostics (mag-core's warn-level tool/agent fallbacks, apply-step
+/// rejections, listener panics) go to **stderr**; stdout stays reserved for
+/// user output in the terminal CLI and, critically, for the ACP stdio
+/// JSON-RPC stream under `--acp`, which any stdout log line would corrupt.
+/// The level filter is `MAG_LOG` first, then `RUST_LOG`, defaulting to
+/// `warn` — the prototype logs sparingly, so warn keeps the terminal quiet
+/// while surfacing every diagnostic mag-core currently emits.
+fn init_tracing() {
+    let filter = EnvFilter::try_from_env("MAG_LOG")
+        .or_else(|_| EnvFilter::try_from_default_env())
+        .unwrap_or_else(|_| EnvFilter::new("warn"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
+}
 
 /// Parsed command line.
 struct Cli {
@@ -144,6 +164,8 @@ fn assemble_engine(config_path: &std::path::Path) -> Result<Engine, String> {
 #[tokio::main]
 async fn main() -> ExitCode {
     use std::io::Write as _;
+
+    init_tracing();
 
     let cli = match parse_args(std::env::args().skip(1)) {
         Ok(cli) => cli,

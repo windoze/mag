@@ -87,17 +87,23 @@ stdin ──> input task (rustyline readline) ──> 命令分派 ──> MagSe
                                                         │  ├─ 纯文本 → pivot 或 send_message（§3.2 两层语义）
                                                         │  └─ 交互应答 → respond_interaction
                                                         ▼
-service.subscribe(root_sid) ──> render task ──> stdout（TextDelta 流式、工具/委派/终态摘要）
+service.subscribe(None) ──> render task ──> stdout（TextDelta 流式、工具/委派/终态摘要）
 ```
 
-**交互提示协调**（关键小机制）：`InteractionRequested` 到达时 render task 暂停打印流式文本，
-向 input task 发「请提示用户」信号；input task 用 rustyline 渲染审批/问题选项（编号选择），
-用户回答后调 `respond_interaction`，render task 恢复。**pending 交互是单一全局队列**：
-凡是 root 会话（含其全部子 agent 委派链）的交互都进同一队列逐一提示，提示行带来源标注
-（见决策 D5）——与 GUI 的「每 root 会话一个模态审批队列」同构。
+> 图示为全局订阅（`subscribe(None)`）：render task 接收全部会话事件，交互提示经来源标注区分
+> 归属会话——这正是目标语义（单一全局交互队列，见下）。
 
-**Ctrl-C**：run 进行中第一次 = `cancel(session_id)`；无 run 时 = 退出 REPL（或 Ctrl-D 直退；
-细节实现时定，以不丢会话为前提——会话已持久化，退出不丢数据）。
+**交互提示协调**（关键小机制）：`InteractionRequested` 到达时 render task 向 input task 发
+「请提示用户」信号；input task 用 rustyline 渲染审批/问题选项（编号选择），用户回答后调
+`respond_interaction`。**pending 交互是单一全局队列**：凡是 root 会话（含其全部子 agent
+委派链）的交互都进同一队列逐一提示，提示行带来源标注（见决策 D5）——与 GUI 的「每 root
+会话一个模态审批队列」同构。原设计里「交互期间 render 暂停流式打印」**未实现**（原型已知
+限制：流式输出与交互提示可能交错，交互期间靠队列串行应答保证可用；暂停/恢复渲染留待
+GUI 阶段设计）。
+
+**Ctrl-C**：run 进行中第一次 = `cancel(session_id)`；无 run 且无活动交互时**忽略（不退出
+REPL）**——退出用 `/quit` 或 Ctrl-D（会话已持久化，退出不丢数据；`/quit`/Ctrl-D 会对仍在
+飞行的 run 主动发 cancel 后退出，不无限等待自然结束）。
 
 ## 2. 命令面（slash commands）
 
@@ -112,9 +118,9 @@ service.subscribe(root_sid) ──> render task ──> stdout（TextDelta 流�
 | `/delete <id>` | `delete_session` | 5 |
 | `/cancel` | `cancel` 当前会话 | 6 |
 | `/sources` | `list_sources` + `probe_local_agents` 打印 | 3 |
-| `/config show` | `get_config` 打印当前生效配置（脱敏）+ 当前会话钉住的 revision | 7 |
-| `/config reload` | `reload_config` 显式重载，打印新 revision 与差异摘要 | 7 |
-| `/config apply` | 把当前全局配置显式应用到当前会话（排队到 turn 边界，§4.4） | 7 |
+| `/config show` | `get_config` 打印当前生效配置 TOML（脱敏）；不含 revision（**未实现**——service 层缺 revision 暴露，后续版本补） | 7 |
+| `/config reload` | `reload_config` 显式重载；无差异摘要（**未实现**——service 层缺 revision 暴露，后续版本补） | 7 |
+| `/config apply` | **全局无参 apply**：捕获当前快照并应用到所有活会话（各会话在自身闲置点/turn 边界落地，§4.4） | 7 |
 | `/help`、`/quit` | 本地 | — |
 
 ## 3. pivot 与 cancel：MagService 的新增能力
@@ -298,8 +304,15 @@ ConfigService {
 async fn get_config(&self) -> Result<ConfigView, ServiceError>;              // 脱敏 DTO 视图 + revision
 async fn update_config(&self, patch: ConfigPatch) -> Result<u64, ServiceError>;  // 返回新 revision
 async fn reload_config(&self) -> Result<u64, ServiceError>;                  // 显式重载文件
-async fn apply_config(&self, id: SessionId) -> Result<(), ServiceError>;     // 把 current 应用到会话（§4.4）
+async fn apply_config(&self) -> Result<(), ServiceError>;                    // 全局无参 apply（§4.4）
 ```
+
+> `apply_config` 的权威语义是**全局无参 apply**：trait 不带 `SessionId`，不写「应用到当前
+> 会话」。实现采用世代/pending 机制——调用时捕获当前 `Arc<ConfigSnapshot>` 并 bump 共享
+> `generation`（pending 标记）；每个会话 actor 记录自己已应用的 generation，观察到更新的
+> generation 时落地捕获的那份快照：空闲会话立即（服务 `ApplyConfig` 命令时），有 run 在飞
+> 的会话在 run 终态后的 turn 边界落地。请求时捕获快照保证 apply 落地前发生的新
+> reload/update 不会悄悄改变这次 apply 要应用的内容。
 
 `ConfigView` 是脱敏投影（secret 引用显示为 `{env = "..."}` 字样，永不显示值）。`ConfigPatch`
 第一版是最小结构：整段替换某个 provider/agent/external_agent/tool 节，或设置 session 缺省；
@@ -314,20 +327,20 @@ model/system 恒定。再叠加快照一致性：会话的 provider/工具装配
 | 配置类别 | 生效时机 |
 |---|---|
 | providers / external_agents（来源增删改） | **新会话**立即用新 DO 图；既有会话钉住创建时的 `Arc<ConfigSnapshot>`（持引用即钉住，零拷贝） |
-| agents.*（agent 定义：model/tools/system） | 同上；`apply_config(session)` 把 current 图**排队到该会话下一 turn 边界**应用 |
-| tools.*.approval（审批策略） | 下一次 run 开始时装配 `ApprovalPolicy` 即生效（policy 在 run 起点组装，无需等会话边界） |
+| agents.*（agent 定义：model/tools/system） | 同上；`apply_config`（全局无参）把 current 图**排队到各会话下一 turn 边界/闲置点**应用（覆盖 model/tools/system_prompt） |
+| tools.*.approval（审批策略） | **仅会话（重）建时生效**：`ApprovalPolicy` 在 facade agent build 时烤死（agent-lib 无 reconfigure 变体），改审批策略对既有会话不生效；`apply_config` 也不覆盖它 |
 | session 缺省（routing/budget） | 只影响新会话 |
 
 - 会话钉住的实现：`create_session` 时取 `current.clone()`（`Arc`）存入会话状态；restore 时
   快照中的会话 config 决定重建哪一版装配（持久化的是 DTO 形态的会话配置，恢复时 resolve 成
   DO——若引用的 provider 在新图里已删，报明确错误并保留会话数据）。
-- turn 边界应用：`apply_config` 在会话状态里置 pending 标记；driver actor 在 run 之间检查，
-  有则按新图 reconfig facade `Agent`（**依赖 agent-lib A2**——facade reconfigure API，见 §5A；
-  落地前不可用 snapshot/restore 替代，它换不了 model/system/tool 声明）；run 进行中
-  到达的 apply 一律排队。应用动作挂在 §4.5 的 turn-complete 钩子上执行。
-- 时机如实可见：`/config show` 同时显示全局 revision 与当前会话钉住的 revision；
-  `ConfigChanged{summary}` 说明影响范围。自动应用（改配置即影响所有空闲会话）第一版不做，
-  GUI 阶段再评估（决策 D2 记录）。
+- turn 边界应用：`apply_config` 捕获当前快照并 bump 共享 generation（pending 标记，§4.3）；
+  各会话 actor 观察到更新 generation 时按捕获快照 reconfig facade `Agent`（覆盖 model/
+  tools/system_prompt；审批策略不在 reconfig 覆盖范围内，见上表）。run 进行中到达的 apply
+  一律排队到 run 终态后的 turn 边界。应用动作挂在 §4.5 的 turn-complete 钩子上执行。
+- 时机可见性（`/config show` 显示全局 revision 与当前会话钉住的 revision、
+  `ConfigChanged{summary}` 说明影响范围）**未实现**（service 层缺 revision 暴露），后续
+  版本补。自动应用（改配置即影响所有空闲会话）第一版不做，GUI 阶段再评估（决策 D2 记录）。
 
 ### 4.5 turn-complete 通用通知/回调机制（决策 D2 附带）
 

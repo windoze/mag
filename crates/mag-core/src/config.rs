@@ -25,13 +25,16 @@
 //! # Change signal
 //!
 //! Every successful apply broadcasts a [`ConfigChange`] on a
-//! `tokio::sync::broadcast` channel (see [`ConfigService::subscribe`]). This
-//! is the seam where M3-4 bridges configuration changes to the service
-//! contract's `ServiceEvent::ConfigChanged{revision}`: `broadcast` is
-//! multi-subscriber, lag-tolerant, and matches the existing [`EventBus`]
-//! fan-out pattern, so the engine can forward changes without the service
-//! layer reaching into a callback registry. Emitting with no subscribers is
-//! a no-op.
+//! `tokio::sync::broadcast` channel (see [`ConfigService::subscribe`]).
+//! **Current status: this broadcast has no production consumer.** The
+//! engine does *not* forward it — `Engine::update_config` /
+//! `Engine::reload_config` emit `ServiceEvent::ConfigChanged{revision}`
+//! directly on the event bus after a successful update/reload, bypassing
+//! the bridge this channel was designed for. The broadcast remains as the
+//! reserved seam for future consumers (a file watcher, a GUI settings
+//! panel): `broadcast` is multi-subscriber, lag-tolerant, and matches the
+//! existing [`EventBus`] fan-out pattern, and emitting with no subscribers
+//! is a no-op, so keeping it costs nothing.
 //!
 //! [`EventBus`]: crate::EventBus
 
@@ -58,9 +61,10 @@ const CHANGE_CHANNEL_CAPACITY: usize = 16;
 /// Notification broadcast after every successful configuration apply
 /// (`update` / `reload`); carries the revision and the new snapshot.
 ///
-/// This is the M3-3 signal seam: M3-4 forwards it as
-/// `ServiceEvent::ConfigChanged{revision}`; other consumers (e.g. a future
-/// file watcher or GUI) may subscribe directly.
+/// Reserved seam: no production subscriber today — the engine emits
+/// `ServiceEvent::ConfigChanged{revision}` directly rather than forwarding
+/// this signal. Future consumers (e.g. a file watcher or GUI) may subscribe
+/// directly.
 #[derive(Clone, Debug)]
 pub struct ConfigChange {
     revision: u64,
@@ -172,6 +176,11 @@ impl ConfigService {
     /// Subscribes to [`ConfigChange`] notifications emitted by future
     /// successful `update`/`reload` calls. Lagging receivers can re-read
     /// [`ConfigService::current`]; the latest snapshot is authoritative.
+    ///
+    /// Note: no production code subscribes today — the engine emits
+    /// `ServiceEvent::ConfigChanged` directly instead of forwarding this
+    /// channel. It is kept as the reserved seam for future consumers (file
+    /// watcher, GUI).
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<ConfigChange> {
         self.changes.subscribe()
