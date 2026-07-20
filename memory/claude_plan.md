@@ -1,30 +1,41 @@
-# 执行计划
+执行计划
 
-## 目标
+1. 读取 `TODO.md`，按标题是否带有 `[DONE]` 判断第一个未完成任务，并核对该任务的验证要求与依赖。
+2. 检查最近提交和当前工作区状态，只关注与当前任务直接相关或会阻塞当前任务的问题，不做开放式历史问题扫查。
+3. 阅读当前任务涉及的代码、测试和文档，确定最小正确实现范围；如发现必须先修复的具体前置问题，则更新 `TODO.md` 并停止。
+4. 按任务要求实现代码或文档变更，避免 workaround 和偏离规格的实现。
+5. 按要求先运行格式化，再运行 lint，再运行相关测试和必要的完整测试；如出现未调度失败，修复或在 `TODO.md` 中加入最小前置任务。
+6. 更新 `TODO.md`：在完成任务标题前加 `[DONE]`，补全完成记录；仅当阶段级计划变化时才更新 `PLAN.md`。
+7. 检查变更，提交所有本次任务相关改动，提交后停止，不继续下一个任务。
 
-完成 `TODO.md` 中按顺序出现的第一个未完成任务，验证后更新任务记录并提交一次 Git commit，然后停止。
+进度记录
 
-## 步骤
+- 已创建本执行计划文件，下一步读取 `TODO.md` 确认第一个未完成任务。
+- 已读取 `TODO.md`，首个未完成任务为 `M6-1 [TODO] mag-cli 骨架：双任务 REPL + 基本对话渲染`。
+- 当前执行重点：新增只依赖 `mag-service` 与允许库的 `mag-cli` crate，提供 `Cli::run(Arc<dyn MagService>, opts)`，实现 stdin/rustyline 输入任务、service 事件渲染任务、基本会话创建、消息发送、`/new`、`/quit`，并补 scripted service 的管道 e2e。
+- 下一步检查工作区状态与最近提交，只处理与 M6-1 直接相关的未完成事项。
+- 已新增 `crates/mag-cli` crate、workspace 成员、`Cli::run` / `Cli::run_with_io`、基础 REPL 分派、事件渲染和 pipe e2e 测试；下一步运行格式化与聚焦测试，按编译反馈修正。
+- 验证已通过：`cargo fmt --all -- --check`、`cargo test -p mag-cli`、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`、`cargo doc --no-deps --workspace`。
+- 已将 `TODO.md` 中 M6-1 标记为 `[DONE]` 并补完成记录；下一步检查 diff 后提交。
+- 复查时补强 TTY prompt 输出路径，使其与 pipe prompt 一样经共享 stdout 锁写出；已重新通过完整验证序列。
+## 本轮执行计划
 
-1. 读取 `TODO.md`，按标题是否带有 `[DONE]` 判断第一个未完成任务。
-2. 检查该任务的正文、依赖、验证要求和完成记录；必要时查看最新提交是否明确提到与该任务直接相关的未完成问题。
-3. 根据任务内容只收集必要代码上下文，避免开放式历史问题排查。
-4. 实现该任务；如果发现阻塞当前任务的具体前置问题，则将最小必要前置任务插入 `TODO.md`，提交后停止。
-5. 运行格式化、lint 和相关测试；如有未排期失败，修复或把最小必要任务排到当前任务之前。
-6. 将已完成任务标题加上 `[DONE]`，更新其完成记录；仅在阶段级计划改变时更新 `PLAN.md`。
-7. 检查 Git 状态和差异，提交本次任务涉及的全部变更。
-8. 停止，不继续下一个任务。
+1. 读取 `TODO.md`，按标题是否带 `[DONE]` 判断第一个未完成任务，并核对相关依赖、验证要求和完成记录。
+2. 检查最近提交和当前工作区状态，仅确认是否存在与当前任务直接相关的未完成事项或未提交改动。
+3. 针对第一个未完成任务阅读必要代码与测试，明确最小正确实现范围，不做开放式历史问题扫描。
+4. 实现该任务；如果发现阻塞当前任务的规格不匹配或未排期失败测试，则按要求在 `TODO.md` 添加最小前置任务并停止。
+5. 运行格式化、lint 和相关测试；若代码变更需要完整验证，则在 lint 通过后运行完整测试套件。
+6. 在验证通过后，将当前任务标题加上 `[DONE]`，更新完成记录；仅当阶段级计划变化时更新 `PLAN.md`。
+7. 检查 diff 和 git 状态，提交本轮全部相关改动，然后停止，不推进下一项任务。
 
-## 当前状态
+进度：已读取 `TODO.md`，本轮第一个未完成任务为 `M6-2 [TODO] PromptCoordinator：交互提示（审批 + Question/Choice）`。
 
-- 已写入初始执行计划。
-- 已读取 `TODO.md`，首个未完成任务为 `M5-R [TODO] M5 review`。
-- 本轮只处理 M5 review：对照 `docs/CLI.md` §5 P6 检查 `ask_user` 的交互桥复用一致性、cancel 语义、tool profile 开关与 rustdoc；发现问题则直接修复并补测试。
-- 已检查最新提交 `[M5-1] Implement ask_user ToolPlugin`，提交说明未列未完成事项。
-- Review 发现：`ask_user` 的桥调用被包进 `tokio::spawn`；取消分支返回时只丢弃 `JoinHandle`，不会取消桥 future。mag-core 的桥会自行观察 cancel，但插件契约层不应依赖桥实现主动退出。
-- 修复计划：改为在 `tokio::select!` 中直接等待 `bridge.ask_user(ctx, request)`，取消时直接 drop 桥 future；新增 mag-tools 运行中取消测试验证桥 future 被 drop；同时补强 mag-core ask_user cancel 测试，断言取消后迟到响应不再命中 pending 交互。
-- 已完成修复：`AskUserTool` 直接 select 桥 future；`IpcApproval::emit_and_await` 增加 pending cleanup guard，确保桥 future 被 drop 时 request id 从 pending map 移除。
-- 已通过验证：`cargo fmt --all -- --check`、`cargo test -p mag-tools ask_user`（5 passed）、`cargo test -p mag-core ask_user`（3 passed）。
-- 已通过完整门禁：`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`（全绿，1 ignored 为既有 zed 联调测试）、`cargo doc --no-deps --workspace`（0 warning）。
-- 已更新 `TODO.md`：`M5-R` 标题标记为 `[DONE]`，完成记录列出 review 结论、修复项与验证结果；`PLAN.md` 未改，因为阶段级计划未变化。
-- 下一步：提交本任务变更后停止。
+## M6-2 具体执行步骤
+
+1. 检查 git 状态与最近提交，只处理与 M6-2 直接相关的未完成事项。
+2. 阅读 `crates/mag-cli` 现有双任务 REPL、测试与 `mag-service` 交互 wire 类型。
+3. 在 `mag-cli` 内实现交互协调：`InteractionRequested` 入队、非流式输出时逐条提示、按类型读取用户输入并调用 `respond_interaction`。已完成：render task 将交互事件转交 coordinator，coordinator 持有单一队列与 active prompt。
+4. 审批提示渲染可用 tool call 摘要、requirement reason 和 origin 前缀；Question 读取文本；Choice 渲染编号菜单并回传 index；pending 交互中的 Ctrl-C/EOF 映射为保守取消响应。已完成。
+5. 增加 scripted service 管道 e2e，覆盖审批、Question、Choice、delegate origin 标注和多条交互顺序。已完成。
+6. 运行规定验证序列，修复发现的问题。已通过：`cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test -p mag-cli`、`cargo test --workspace`、`cargo doc --no-deps --workspace`。
+7. 将 M6-2 标记 `[DONE]` 并补完成记录；提交本轮相关改动后停止。已更新 `TODO.md`，下一步检查 diff 并提交。

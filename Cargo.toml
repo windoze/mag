@@ -2,6 +2,7 @@
 members = [
     "crates/mag",
     "crates/mag-acp",
+    "crates/mag-cli",
     "crates/mag-config",
     "crates/mag-core",
     "crates/mag-service",

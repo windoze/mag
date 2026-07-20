@@ -1,0 +1,14 @@
+[package]
+name = "mag-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+futures = { workspace = true }
+mag-service = { path = "../mag-service" }
+rustyline = "14"
+tokio = { workspace = true, features = ["io-std", "io-util", "rt", "sync"] }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread", "sync", "time"] }

@@ -1171,7 +1171,7 @@ GUI/web/CLI 无需感知多个会话通道。
 
 目标：最小 CLI 验证原型——「符合 GUI/web 使用模式」风格的最小实现，验证端到端管线。易用性/美观不考虑。
 
-### M6-1 [TODO] `mag-cli` 骨架：双任务 REPL + 基本对话渲染
+### M6-1 [DONE] `mag-cli` 骨架：双任务 REPL + 基本对话渲染
 
 - **上下文**：`docs/CLI.md` §1.1（crate 与依赖边界）/§1.2（双任务结构）。**硬约束**：只依赖
   `mag-service`（+ rustyline/tokio/futures/serde/serde_json）。
@@ -1186,7 +1186,30 @@ GUI/web/CLI 无需感知多个会话通道。
 - **验证条件**：聚焦测试：scripted `Arc<dyn MagService>` + 管道 stdin/stdout e2e——输入两行消息断言
   stdout 含流式文本与 finish 摘要。默认验证序列全过。
 
-### M6-2 [TODO] PromptCoordinator：交互提示（审批 + Question/Choice）
+  **完成记录**（2026-07-20）：
+  - 实现要点：新增 `crates/mag-cli`（workspace member，`#![warn(missing_docs)]`），直接依赖边界为
+    `mag-service` + `futures`/`tokio`/`rustyline`（dev 侧 `async-trait` 仅用于 scripted service 测试），不依赖
+    `mag-core` / `agent-lib`。公开入口 `Cli::run(Arc<dyn MagService>, CliOptions)`：TTY stdin 使用
+    `rustyline::DefaultEditor` 读行并保留历史；非 TTY 自动走同一 pipe-friendly 读行器，供 headless e2e 驱动。
+    另提供 `Cli::run_with_io` 测试/嵌入入口。
+  - 双任务结构：启动先 `create_session`（默认 `openai` / `gpt-5-codex`，`RoutingMode::default()`），随后启动
+    input task 与 render task，经 `tokio::mpsc` 向 coordinator 汇报输入行、EOF、I/O 错误与 run 终态。stdout 经
+    `Arc<tokio::sync::Mutex<_>>` 串行写入；TTY 与 pipe prompt 都走同一锁，满足最小互斥。render 订阅
+    `service.subscribe(None)`，这样 `/new` 切换会话后无需重建渲染流，也能保留全局事件可见性；多会话精细过滤与
+    命令面扩展留给 M6-3。
+  - 基本对话/会话生命周期：普通非空输入调用 `send_message(current_session, UserInput::text(line))`；
+    `TextDelta` 原样流式写 stdout；`RunFinished` 在必要时补打印 final text（无 delta 的服务也可见输出），再打印
+    `[finished ...]` 摘要（含 usage 时输出 input/output/total tokens）；`RunError` 打印 kind + message。
+    slash 命令已实现 M6-1 范围内的 `/new`、`/help`、`/quit`，未知 slash 命令打印错误但不中断 REPL。`/quit`/EOF
+    会等待已启动 run 的 terminal 事件写出后再退出，避免 pipe e2e 丢尾部输出。
+  - 测试：新增 `crates/mag-cli/tests/e2e.rs`，使用 scripted `Arc<dyn MagService>` + `tokio::io::duplex` 管道，
+    全离线、无真实 LLM/凭据/网络。覆盖两条消息输入 → 记录两次 `send_message`、stdout 含两个流式文本与
+    `[finished usage ...]` 摘要；覆盖 `/new` 创建并切换到新 session，后续消息落到新 `SessionId`。
+  - 门禁结果：1) `cargo fmt --all -- --check` ✅ 2) `cargo test -p mag-cli` ✅（2 passed）3)
+    `cargo clippy --all-targets -- -D warnings` ✅ 4) `cargo test --workspace` ✅（全绿，1 ignored 为既有 zed
+    联调测试）5) `cargo doc --no-deps --workspace` ✅（0 warning）。
+
+### M6-2 [DONE] PromptCoordinator：交互提示（审批 + Question/Choice）
 
 - **上下文**：`docs/CLI.md` §1.2/§3.3；单一 pending 交互队列；origin 标注渲染（决策 D5）。
 - **实现要求**：
@@ -1199,6 +1222,29 @@ GUI/web/CLI 无需感知多个会话通道。
     对应变体）。
 - **验证条件**：e2e：scripted service 发审批/问题/选择交互（含 delegate origin），断言提示文本含 origin
   标注、回答正确回灌、多条交互按序处理。默认验证序列全过。
+
+  **完成记录**（2026-07-20）：
+  - 实现要点：`mag-cli` 新增 `PromptCoordinator`（单一 pending 队列 + active prompt），render task 遇到
+    `ServiceEvent::InteractionRequested` 不直接输出，而是通过 `RenderNotice::Interaction` 交给 coordinator；当前
+    会话的交互逐条提示并经 `MagService::respond_interaction` 回灌，其余会话只打印待处理提示。输入行在 active
+    prompt 存在时优先解释为交互回答，否则仍走既有 slash/普通消息分派。Ctrl-C（rustyline
+    `Interrupted`）在 pending 交互中发送保守取消响应；EOF 会取消已排队交互，避免关闭 stdin 后 run 永久挂起。
+  - 提示与响应：Approval 渲染 origin 前缀、`tool_call`、`ApprovalRequirementWire::RequireApproval.reason`
+    摘要并接受 `y/n/cancel`；由于冻结 `InteractionKindWire::Approval` 只携带 `call_id` + requirement，CLI 不伪造
+    不存在的 tool name/input 字段（与 mag-acp 同一 wire 约束），响应用占位 `step_id`，由 mag-core 按
+    `request_id` 重建真实 step/call id。Question 读取整行文本为 `Answer{text}`；Choice 渲染 1-based 编号菜单并
+    回传 0-based `Choice{index}`；Permission 也按同一队列做保守 y/n/cancel 支持，覆盖完整
+    `InteractionRequested` family。
+  - 测试：`crates/mag-cli/tests/e2e.rs` 的 scripted service 增加三交互脚本与 response 记录；新增
+    `prompt_coordinator_answers_queued_interactions_in_order`，通过管道按提示同步输入，断言 delegate origin
+    `[from researcher@depth1]` 出现在审批提示中、requirement reason 可见、Question/Choice 提示正确、三条
+    `respond_interaction` 按 `REQ_APPROVAL -> REQ_QUESTION -> REQ_CHOICE` 顺序回灌，Approval 为 Approve、Question
+    文本原样、Choice index 为 1。既有两条 M6-1 e2e 继续覆盖普通对话与 `/new`。
+  - 依赖边界：`cargo tree -p mag-cli -e normal --depth 1` 为 futures / mag-service / rustyline / tokio，未直接依赖
+    mag-core / agent-lib / mag-config。
+  - 门禁结果：1) `cargo fmt --all -- --check` ✅ 2) `cargo clippy --all-targets -- -D warnings` ✅（初次发现
+    `large_enum_variant` 与 `collapsible_str_replace`，已修）3) `cargo test -p mag-cli` ✅（3 passed）4)
+    `cargo test --workspace` ✅（全绿，1 ignored 为既有 zed 联调测试）5) `cargo doc --no-deps --workspace` ✅。
 
 ### M6-3 [TODO] pivot/cancel/会话命令
 
