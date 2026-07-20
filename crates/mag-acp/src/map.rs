@@ -740,7 +740,9 @@ mod tests {
         );
     }
 
-    use mag_service::{DelegationMessageWire, DelegationTrace, RunOutput, ToolCallIdWire};
+    use mag_service::{
+        DelegationMessageWire, DelegationStatusWire, DelegationTrace, RunOutput, ToolCallIdWire,
+    };
 
     // A distinct valid UUID for the framework tool-call id in tool traces.
     const TOOL_CALL_UUID: &str = "11111111-2222-3333-4444-555555555555";
@@ -869,9 +871,11 @@ mod tests {
             trace: DelegationTrace {
                 run_id: None,
                 delegate: "reviewer".to_owned(),
+                status: DelegationStatusWire::Started,
                 task: Some("audit diff".to_owned()),
                 output: None,
                 message: None,
+                usage: None,
             },
         };
 
@@ -894,9 +898,11 @@ mod tests {
             trace: DelegationTrace {
                 run_id: None,
                 delegate: "reviewer".to_owned(),
+                status: DelegationStatusWire::Finished,
                 task: None,
                 output: Some("looks good".to_owned()),
                 message: None,
+                usage: None,
             },
         };
         match service_event_to_session_update(&finished).expect("finish maps") {
@@ -913,9 +919,11 @@ mod tests {
             trace: DelegationTrace {
                 run_id: None,
                 delegate: "reviewer".to_owned(),
+                status: DelegationStatusWire::Failed,
                 task: None,
                 output: None,
                 message: Some("timeout".to_owned()),
+                usage: None,
             },
         };
         match service_event_to_session_update(&failed).expect("failure maps") {

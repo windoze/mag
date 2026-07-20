@@ -13,10 +13,11 @@ use futures::stream::{self, BoxStream, StreamExt};
 use mag_cli::{Cli, CliError, CliOptions};
 use mag_service::{
     AgentIdWire, ApprovalDecisionWire, ApprovalRequirementWire, ConfigDto, DelegationMessageWire,
-    DelegationTrace, InteractionKindWire, InteractionOrigin, InteractionResponseWire, MagService,
-    PermissionCategoryWire, PermissionDecisionWire, PermissionRiskWire, RequestId, RoutingMode,
-    RunId, RunOutput, ServiceError, ServiceEvent, SessionConfig, SessionId, SessionInfo,
-    SourceInfo, SourceKindWire, ToolCallIdWire, UsageInfo, UserInput,
+    DelegationStatusWire, DelegationTrace, HistoryEntry, InteractionKindWire, InteractionOrigin,
+    InteractionResponseWire, MagService, PermissionCategoryWire, PermissionDecisionWire,
+    PermissionRiskWire, RequestId, RoutingMode, RunId, RunOutput, ServiceError, ServiceEvent,
+    SessionConfig, SessionId, SessionInfo, SourceInfo, SourceKindWire, ToolCallIdWire, UsageInfo,
+    UserInput,
 };
 use serde_json::json;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -217,9 +218,11 @@ impl ScriptedService {
             trace: DelegationTrace {
                 run_id,
                 delegate: "researcher".to_owned(),
+                status: DelegationStatusWire::Started,
                 task: Some("summarize docs".to_owned()),
                 output: None,
                 message: None,
+                usage: None,
             },
         });
         let _ = self.events.send(ServiceEvent::DelegationMessage {
@@ -235,9 +238,11 @@ impl ScriptedService {
             trace: DelegationTrace {
                 run_id,
                 delegate: "researcher".to_owned(),
+                status: DelegationStatusWire::Finished,
                 task: Some("summarize docs".to_owned()),
                 output: Some("summary ready".to_owned()),
                 message: None,
+                usage: None,
             },
         });
         let _ = self.events.send(ServiceEvent::DelegationFailed {
@@ -245,9 +250,11 @@ impl ScriptedService {
             trace: DelegationTrace {
                 run_id,
                 delegate: "peer".to_owned(),
+                status: DelegationStatusWire::Failed,
                 task: Some("check external".to_owned()),
                 output: None,
                 message: Some("external process exited".to_owned()),
+                usage: None,
             },
         });
     }
@@ -334,6 +341,10 @@ impl MagService for ScriptedService {
     async fn resume_session(&self, id: SessionId) -> Result<(), ServiceError> {
         self.resumes.lock().expect("lock").push(id);
         Ok(())
+    }
+
+    async fn get_session_history(&self, _id: SessionId) -> Result<Vec<HistoryEntry>, ServiceError> {
+        Ok(Vec::new())
     }
 
     async fn delete_session(&self, id: SessionId) -> Result<(), ServiceError> {
@@ -1287,6 +1298,10 @@ impl MagService for EndingStreamService {
 
     async fn resume_session(&self, id: SessionId) -> Result<(), ServiceError> {
         self.inner.resume_session(id).await
+    }
+
+    async fn get_session_history(&self, id: SessionId) -> Result<Vec<HistoryEntry>, ServiceError> {
+        self.inner.get_session_history(id).await
     }
 
     async fn delete_session(&self, id: SessionId) -> Result<(), ServiceError> {

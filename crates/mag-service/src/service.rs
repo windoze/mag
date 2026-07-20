@@ -19,9 +19,9 @@ use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt};
 
 use crate::{
-    DelegationMessageWire, DelegationTrace, Event, InteractionKindWire, InteractionOrigin,
-    InteractionResponseWire, RequestId, RunErrorKind, RunId, RunOutput, SessionConfig, SessionId,
-    SourceInfo, ToolTrace,
+    DelegationMessageWire, DelegationTrace, Event, HistoryEntry, InteractionKindWire,
+    InteractionOrigin, InteractionResponseWire, RequestId, RunErrorKind, RunId, RunOutput,
+    SessionConfig, SessionId, SourceInfo, ToolTrace,
 };
 
 /// Transport-neutral service facade implemented by `mag-core::Engine`.
@@ -62,6 +62,15 @@ pub trait MagService: Send + Sync {
     /// Returns [`ServiceError::SessionNotFound`] when `id` is unknown, or another
     /// [`ServiceError`] when the engine cannot restore the session.
     async fn resume_session(&self, id: SessionId) -> Result<(), ServiceError>;
+
+    /// Returns the committed history for a persisted or live session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError::SessionNotFound`] when `id` is unknown, or another
+    /// [`ServiceError`] when the implementation cannot restore the committed
+    /// history snapshot.
+    async fn get_session_history(&self, id: SessionId) -> Result<Vec<HistoryEntry>, ServiceError>;
 
     /// Deletes a session and stops its driver.
     ///
@@ -611,7 +620,9 @@ impl Error for ServiceError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{PermissionCategoryWire, PermissionRiskWire, ToolStatusWire, UsageInfo};
+    use crate::{
+        DelegationStatusWire, PermissionCategoryWire, PermissionRiskWire, ToolStatusWire, UsageInfo,
+    };
     use futures::{StreamExt, stream};
     use serde_json::{Value, json};
     use std::sync::Arc;
@@ -652,9 +663,11 @@ mod tests {
         DelegationTrace {
             run_id: Some(RunId::new(uuid(3))),
             delegate: "codex".to_owned(),
+            status: DelegationStatusWire::Started,
             task: Some("review patch".to_owned()),
             output: None,
             message: None,
+            usage: None,
         }
     }
 
@@ -690,6 +703,13 @@ mod tests {
 
         async fn resume_session(&self, _id: SessionId) -> Result<(), ServiceError> {
             Ok(())
+        }
+
+        async fn get_session_history(
+            &self,
+            _id: SessionId,
+        ) -> Result<Vec<HistoryEntry>, ServiceError> {
+            Ok(Vec::new())
         }
 
         async fn delete_session(&self, _id: SessionId) -> Result<(), ServiceError> {

@@ -93,7 +93,7 @@
 - 已检查 `Command` 消费点：仓内无 `mag_service::Command` dispatcher 消费点；搜索命中均为 `mag-core` 内部 `SessionCommand` 或标准库 `Command`，无需同步处理。
 - 验证通过：`cargo fmt --all`、`cargo test -p mag-service`、`cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`、`cargo doc --no-deps --workspace`。
 
-### W1-2 [TODO] `get_session_history` + `HistoryEntry`（决策 D5，Q1 拍板）
+### W1-2 [DONE] `get_session_history` + `HistoryEntry`（决策 D5，Q1 拍板）
 
 - **上下文**：`docs/WEB.md` §3 P3。web thread view 必须能全量渲染历史（含 tool call 记录）；
   不用事件重放。
@@ -109,6 +109,15 @@
 - **验证条件**：聚焦测试：fake LLM 跑一轮含工具调用与委派的对话 → 持久化 → resume/新 Engine
   读取 history，断言变体顺序与内容（user/assistant/tool 终态/delegation）；serde roundtrip。
   默认验证序列全过。
+
+完成记录（2026-07-21）：
+
+- `mag-service` 新增 `HistoryEntry` wire 枚举、`MagService::get_session_history`、`Command::GetSessionHistory{id}`，并补 serde/tag roundtrip 测试。
+- `DelegationTrace` 向后兼容新增 `status: DelegationStatusWire` 与可选 `usage`，用于 history 单变体表达委派终态；既有事件映射同步填充 started/finished/failed。
+- `mag-core` 新增快照历史投影：通过 `Conversation::restore(snapshot.supervisor)` 读取 committed turns，按对话顺序输出 user/assistant/tool terminal/delegation terminal；普通 tool trace 从 tool-use/tool-result/pairing 还原 input/output/status，delegation 从 `ask_<delegate>` 调用还原终态、task/output/message。
+- `Engine::get_session_history` 从持久化 session/snapshot 读取历史；未知 session 返回 `SessionNotFound`，尚无 committed snapshot 的 session 返回空历史。测试 fake/DummyService 已同步新 trait 方法。
+- 已检查 `Command` 消费点：仓内仍无 `mag_service::Command` dispatcher 消费点；无需同步执行分发。
+- 验证通过：`cargo test -p mag-service`、`cargo test -p mag-core get_session_history_restores_messages_tools_and_delegations_after_restart`、`cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`、`cargo doc --no-deps --workspace`。
 
 ### W1-3 [TODO] `SessionInfo` 增强（P4）
 

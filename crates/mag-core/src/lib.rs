@@ -7,6 +7,7 @@ mod config;
 mod driver;
 mod engine;
 mod event_bus;
+mod history;
 mod persistence;
 mod session;
 mod turn_complete;

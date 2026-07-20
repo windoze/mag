@@ -27,9 +27,9 @@ use agent_client_protocol::{Agent, Channel, Client, ConnectionTo, on_receive_not
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use mag_service::{
-    InteractionResponseWire, MagService, RequestId, RunId, RunOutput, ServiceError, ServiceEvent,
-    SessionConfig, SessionId, SessionInfo, SourceInfo, ToolCallIdWire, ToolStatusWire, ToolTrace,
-    UserInput,
+    HistoryEntry, InteractionResponseWire, MagService, RequestId, RunId, RunOutput, ServiceError,
+    ServiceEvent, SessionConfig, SessionId, SessionInfo, SourceInfo, ToolCallIdWire,
+    ToolStatusWire, ToolTrace, UserInput,
 };
 
 // A fixed, valid UUID the scripted service accepts as the prompt's session id and
@@ -76,6 +76,10 @@ impl MagService for ScriptedService {
 
     async fn resume_session(&self, _id: SessionId) -> Result<(), ServiceError> {
         Ok(())
+    }
+
+    async fn get_session_history(&self, _id: SessionId) -> Result<Vec<HistoryEntry>, ServiceError> {
+        Ok(Vec::new())
     }
 
     async fn delete_session(&self, _id: SessionId) -> Result<(), ServiceError> {

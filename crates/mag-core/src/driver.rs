@@ -55,8 +55,9 @@ use agent_lib::{
 use async_trait::async_trait;
 use mag_config::{ApprovalPolicyKind, ConfigSnapshot};
 use mag_service::{
-    DelegationMessageWire, DelegationTrace, Event, RunErrorKind, RunId as WireRunId, RunOutput,
-    SessionBudget, SessionConfig, SessionId, ToolCallIdWire, ToolStatusWire, ToolTrace, UsageInfo,
+    DelegationMessageWire, DelegationStatusWire, DelegationTrace, Event, RunErrorKind,
+    RunId as WireRunId, RunOutput, SessionBudget, SessionConfig, SessionId, ToolCallIdWire,
+    ToolStatusWire, ToolTrace, UsageInfo,
 };
 use mag_tools::{
     ToolInvocation, ToolPlugin, ToolRegistry, UserInteractionBridge, UserInteractionError,
@@ -1001,15 +1002,15 @@ fn map_wire_event(
         }),
         WireRunEvent::DelegationStarted(trace) => Some(Event::DelegationStarted {
             id: session_id,
-            trace: delegation_trace_from_wire(&trace),
+            trace: delegation_trace_from_wire(&trace, DelegationStatusWire::Started),
         }),
         WireRunEvent::DelegationFinished(trace) => Some(Event::DelegationFinished {
             id: session_id,
-            trace: delegation_trace_from_wire(&trace),
+            trace: delegation_trace_from_wire(&trace, DelegationStatusWire::Finished),
         }),
         WireRunEvent::DelegationFailed(trace) => Some(Event::DelegationFailed {
             id: session_id,
-            trace: delegation_trace_from_wire(&trace),
+            trace: delegation_trace_from_wire(&trace, DelegationStatusWire::Failed),
         }),
         WireRunEvent::DelegationMessage(message) => Some(Event::DelegationMessage {
             id: session_id,
@@ -1426,13 +1427,18 @@ fn tool_trace_from_wire(trace: &FacadeToolTrace, status: ToolStatusWire) -> Tool
 /// in the M4-1 completion notes). `run_id` is `None` for the same reason as
 /// in [`tool_trace_from_wire`]: the facade does not surface a run id on its
 /// event stream.
-fn delegation_trace_from_wire(trace: &FacadeDelegationTrace) -> DelegationTrace {
+fn delegation_trace_from_wire(
+    trace: &FacadeDelegationTrace,
+    status: DelegationStatusWire,
+) -> DelegationTrace {
     DelegationTrace {
         run_id: None,
         delegate: trace.delegate.clone(),
+        status,
         task: None,
         output: None,
         message: None,
+        usage: Some(usage_info_from_usage(&trace.usage)),
     }
 }
 
@@ -1457,6 +1463,11 @@ fn run_output_from_wire(output: &WireRunOutput) -> RunOutput {
 /// Flattens a facade [`UsageSummary`] into the provider-neutral [`UsageInfo`].
 fn usage_from_summary(summary: &UsageSummary) -> UsageInfo {
     let usage = summary.total();
+    usage_info_from_usage(&usage)
+}
+
+/// Flattens agent-lib usage into the service-level usage DTO.
+fn usage_info_from_usage(usage: &agent_lib::model::usage::Usage) -> UsageInfo {
     UsageInfo {
         input_tokens: u64::from(usage.input),
         output_tokens: u64::from(usage.output),
@@ -1481,8 +1492,8 @@ mod tests {
         },
     };
     use mag_service::{
-        DelegationMessageWire, DelegationTrace, Event, SessionId, ToolCallIdWire, ToolStatusWire,
-        ToolTrace, UsageInfo,
+        DelegationMessageWire, DelegationStatusWire, DelegationTrace, Event, SessionId,
+        ToolCallIdWire, ToolStatusWire, ToolTrace, UsageInfo,
     };
     use serde_json::Map;
     use uuid::Uuid;
@@ -1636,16 +1647,20 @@ mod tests {
         .expect("deserialize facade delegation trace")
     }
 
-    /// The expected wire projection of a facade delegation trace: only the
-    /// delegate name is populated (agent-lib exposes no task/output/message on
-    /// its trace; see `delegation_trace_from_wire`).
-    fn wire_delegation_trace() -> DelegationTrace {
+    /// The expected wire projection of a facade delegation trace.
+    fn wire_delegation_trace(status: DelegationStatusWire) -> DelegationTrace {
         DelegationTrace {
             run_id: None,
             delegate: "researcher".to_owned(),
+            status,
             task: None,
             output: None,
             message: None,
+            usage: Some(UsageInfo {
+                input_tokens: 3,
+                output_tokens: 2,
+                total_tokens: 5,
+            }),
         }
     }
 
@@ -1661,7 +1676,7 @@ mod tests {
             mapped,
             Some(Event::DelegationStarted {
                 id: session_id(),
-                trace: wire_delegation_trace(),
+                trace: wire_delegation_trace(DelegationStatusWire::Started),
             })
         );
         assert!(final_output.is_none());
@@ -1679,7 +1694,7 @@ mod tests {
             mapped,
             Some(Event::DelegationFinished {
                 id: session_id(),
-                trace: wire_delegation_trace(),
+                trace: wire_delegation_trace(DelegationStatusWire::Finished),
             })
         );
     }
@@ -1696,7 +1711,7 @@ mod tests {
             mapped,
             Some(Event::DelegationFailed {
                 id: session_id(),
-                trace: wire_delegation_trace(),
+                trace: wire_delegation_trace(DelegationStatusWire::Failed),
             })
         );
     }

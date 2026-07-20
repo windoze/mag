@@ -139,6 +139,11 @@ pub enum Command {
         /// Session to resume.
         id: SessionId,
     },
+    /// Return the committed history for an existing session.
+    GetSessionHistory {
+        /// Session whose history should be returned.
+        id: SessionId,
+    },
     /// Delete an existing session and stop its driver.
     DeleteSession {
         /// Session to delete.
@@ -445,6 +450,36 @@ pub struct MessageAttachment {
     pub text: Option<String>,
 }
 
+/// One committed history item returned by `get_session_history`.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum HistoryEntry {
+    /// A user-authored message.
+    UserMessage {
+        /// User-visible text payload.
+        text: String,
+        /// Optional attachments supplied with the message.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<MessageAttachment>,
+    },
+    /// An assistant-authored text message.
+    AssistantMessage {
+        /// Assistant-visible text payload.
+        text: String,
+    },
+    /// A completed tool call trace.
+    ToolCall {
+        /// Terminal tool trace reconstructed from committed history.
+        trace: ToolTrace,
+    },
+    /// A completed delegation trace.
+    Delegation {
+        /// Terminal delegation trace reconstructed from committed history.
+        trace: DelegationTrace,
+    },
+}
+
 /// Final output reported for a successful run.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunOutput {
@@ -514,6 +549,9 @@ pub struct DelegationTrace {
     pub run_id: Option<RunId>,
     /// Stable delegate name or source key.
     pub delegate: String,
+    /// Current lifecycle state for this trace snapshot.
+    #[serde(default)]
+    pub status: DelegationStatusWire,
     /// Optional delegated task description.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
@@ -523,6 +561,23 @@ pub struct DelegationTrace {
     /// Optional failure or status message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Optional token usage reported by the delegate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageInfo>,
+}
+
+/// Wire-visible lifecycle state for a delegation trace.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationStatusWire {
+    /// The delegation has started but has not reported a terminal outcome.
+    #[default]
+    Started,
+    /// The delegation completed successfully.
+    Finished,
+    /// The delegation failed.
+    Failed,
 }
 
 /// Message emitted by a delegated child agent.
@@ -858,9 +913,15 @@ mod tests {
         DelegationTrace {
             run_id: Some(run_id()),
             delegate: "codex".to_owned(),
+            status: DelegationStatusWire::Finished,
             task: Some("review patch".to_owned()),
             output: Some("looks ok".to_owned()),
             message: message.map(str::to_owned),
+            usage: Some(UsageInfo {
+                input_tokens: 8,
+                output_tokens: 5,
+                total_tokens: 13,
+            }),
         }
     }
 
@@ -933,6 +994,10 @@ mod tests {
             (
                 Command::ResumeSession { id: session_id() },
                 "resume_session",
+            ),
+            (
+                Command::GetSessionHistory { id: session_id() },
+                "get_session_history",
             ),
             (
                 Command::DeleteSession { id: session_id() },
@@ -1098,6 +1163,53 @@ mod tests {
             assert_tag(&event, expected_tag);
             assert_round_trip(event);
         }
+    }
+
+    #[test]
+    fn history_entry_variants_round_trip_and_keep_stable_tags() {
+        let cases = vec![
+            (
+                HistoryEntry::UserMessage {
+                    text: "hello".to_owned(),
+                    attachments: vec![attachment()],
+                },
+                "user_message",
+            ),
+            (
+                HistoryEntry::AssistantMessage {
+                    text: "done".to_owned(),
+                },
+                "assistant_message",
+            ),
+            (
+                HistoryEntry::ToolCall {
+                    trace: tool_trace(ToolStatusWire::Finished),
+                },
+                "tool_call",
+            ),
+            (
+                HistoryEntry::Delegation {
+                    trace: delegation_trace(None),
+                },
+                "delegation",
+            ),
+        ];
+
+        for (entry, expected_tag) in cases {
+            assert_tag(&entry, expected_tag);
+            assert_round_trip(entry);
+        }
+    }
+
+    #[test]
+    fn legacy_delegation_trace_defaults_to_started_without_usage() {
+        let decoded = serde_json::from_value::<DelegationTrace>(json!({
+            "delegate": "codex"
+        }))
+        .expect("legacy delegation trace");
+
+        assert_eq!(decoded.status, DelegationStatusWire::Started);
+        assert_eq!(decoded.usage, None);
     }
 
     #[test]

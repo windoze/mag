@@ -15,8 +15,8 @@ use agent_client_protocol::{Channel, Client};
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use mag_service::{
-    InteractionResponseWire, MagService, RequestId, RunId, ServiceError, ServiceEvent,
-    SessionConfig, SessionId, SessionInfo, SourceInfo, UserInput,
+    HistoryEntry, InteractionResponseWire, MagService, RequestId, RunId, ServiceError,
+    ServiceEvent, SessionConfig, SessionId, SessionInfo, SourceInfo, UserInput,
 };
 
 // A fixed, valid UUID string so the fake can mint ids without pulling in the
@@ -55,6 +55,10 @@ impl MagService for FakeService {
     async fn resume_session(&self, id: SessionId) -> Result<(), ServiceError> {
         *self.recorded_resume.lock().expect("lock not poisoned") = Some(id);
         Ok(())
+    }
+
+    async fn get_session_history(&self, _id: SessionId) -> Result<Vec<HistoryEntry>, ServiceError> {
+        Ok(Vec::new())
     }
 
     async fn delete_session(&self, _id: SessionId) -> Result<(), ServiceError> {

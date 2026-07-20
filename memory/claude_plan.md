@@ -1,31 +1,35 @@
 # Execution Plan
 
-## Scope
+This file records the externally reviewable plan and progress for the current invocation. It avoids private chain-of-thought and focuses on concrete steps, decisions, and validation status.
+
+## Current Objective
 
 - Follow `TODO.md` as the authoritative task list.
-- Identify the first task whose heading is not prefixed with `[DONE]`.
-- Complete exactly that task, then stop after committing the result.
+- Complete `W1-2 [DONE] get_session_history + HistoryEntry`, the first task whose heading was not prefixed with `[DONE]` at invocation start.
+- Stop after committing that task or, if blocked, after recording the minimum required prerequisite task and committing that bookkeeping.
 
 ## Step-by-Step Plan
 
-1. Read `TODO.md` first and identify the first incomplete task by heading prefix.
-2. Check the latest commit message for a directly relevant unfinished issue only after selecting the current task.
-3. Inspect the files and tests relevant to the selected task.
-4. Implement the smallest correct change that fully satisfies the task requirements.
-5. Update this plan file when a key step is completed or if the plan changes.
-6. Run required validation in order: `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, then the relevant/full test suite as required by the task and current changes.
-7. If validation reveals unscheduled failures, fix them when in scope or add the minimum prerequisite task(s) to `TODO.md` before marking the current task done.
-8. Mark the completed task heading in `TODO.md` with `[DONE]` and update its completion record.
-9. Inspect git status, diff, and recent log; commit all intended changes with a descriptive task-scoped message.
-10. Stop without starting the next task.
+1. Read `TODO.md` and identify the first incomplete task by heading prefix.
+2. Check the latest commit message for any explicitly unfinished issue directly relevant to that selected task.
+3. Read the selected task details, dependencies, validation requirements, and completion record.
+4. Inspect only the code and documentation needed to implement the selected task correctly.
+5. Make the smallest complete implementation changes required by the task, without workarounds or scope narrowing.
+6. Run formatting first, then linting, then the relevant or full tests required by the task and repository policy.
+7. If tests reveal unscheduled failures, either fix them if in scope or add the minimum prerequisite/follow-up task before marking the selected task done.
+8. Update `TODO.md` by prefixing the completed task heading with `[DONE]` and filling in its completion record.
+9. Update this file when key steps complete or the plan changes.
+10. Review `git status`, `git diff`, and recent commit history, then commit all task-related changes with a clear task-specific message.
 
-## Current Status
+## Progress Log
 
-- Selected first incomplete task: `W1-1 [TODO] mag-service：Command 补 pivot/配置变体 + ServiceError::kind`.
-- Latest commit checked: no directly relevant unfinished W1-1 issue found.
-- Current worktree before code changes: only this plan file is modified.
-- Implemented W1-1 in `mag-service`: added five `Command` variants, added `ServiceError::kind()`, and added coverage for command tags plus all error kinds.
-- Checked `Command` consumers: no dispatcher consumes `mag_service::Command`; search hits outside `mag-service` are unrelated `SessionCommand` or `std::process::Command` usages.
-- Validation passed: `cargo fmt --all`, `cargo test -p mag-service`, `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace`, and `cargo doc --no-deps --workspace`.
-- `TODO.md` updated: `W1-1` is marked `[DONE]` with completion record.
-- Next step: inspect git diff/status/log and commit the W1-1 changes only.
+- Started invocation and recorded the initial execution plan.
+- Read `TODO.md`; selected `W1-2 [TODO] get_session_history + HistoryEntry` as the only task for this invocation.
+- Checked latest commit `149dffb [W1-1] Add service command variants and error kinds`; it does not mention an unfinished issue that blocks W1-2.
+- Inspected `mag-service`, `mag-core`, and the sibling `agent-lib` snapshot/conversation APIs. `AgentSnapshot.supervisor` can be restored through the public `Conversation::restore` API, so history projection can use validated turns/messages instead of private JSON parsing.
+- Found a W1-2-relevant contract gap: `HistoryEntry::Delegation` has no event variant to carry terminal state, while the existing `DelegationTrace` lacks status/usage. The implementation will add backward-compatible trace fields and map event/history terminal status explicitly.
+- Implemented the service contract changes: `HistoryEntry`, `Command::GetSessionHistory`, `MagService::get_session_history`, and `DelegationStatusWire` plus optional delegation usage.
+- Implemented `mag-core` history projection from restored `AgentSnapshot.supervisor` conversation turns, including terminal tool call and delegation entries.
+- Added a focused persistence test that drives a tool turn and a delegation turn, restarts/resumes the session, then asserts restored history order and serde roundtrip.
+- Validation passed: `cargo test -p mag-service`, `cargo test -p mag-core get_session_history_restores_messages_tools_and_delegations_after_restart`, `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace`, and `cargo doc --no-deps --workspace`.
+- Updated `TODO.md` to mark W1-2 `[DONE]` and recorded the completion details.

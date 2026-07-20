@@ -15,8 +15,8 @@ use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
 use mag_config::{ConfigError, ConfigSnapshot, ResolvedExternalAgent, ResolvedProvider};
 use mag_service::{
-    InteractionResponseWire, MagService, RequestId, RunId, ServiceError, ServiceEvent,
-    SessionConfig, SessionId, SessionInfo, SourceInfo, SourceKindWire, UserInput,
+    HistoryEntry, InteractionResponseWire, MagService, RequestId, RunId, ServiceError,
+    ServiceEvent, SessionConfig, SessionId, SessionInfo, SourceInfo, SourceKindWire, UserInput,
 };
 use mag_sources::SourceRegistry;
 use mag_tools::ToolRegistry;
@@ -26,6 +26,7 @@ use uuid::Uuid;
 use crate::{
     EventBus,
     config::ConfigService,
+    history::entries_from_snapshot,
     persistence::{Persistence, PersistenceError},
     session::SessionManager,
     turn_complete::{TurnCompleteHub, TurnCompleteListener},
@@ -272,6 +273,29 @@ impl MagService for Engine {
             return Err(error);
         }
         Ok(())
+    }
+
+    async fn get_session_history(&self, id: SessionId) -> Result<Vec<HistoryEntry>, ServiceError> {
+        if self
+            .inner
+            .store
+            .load_session(id)
+            .map_err(persistence_backend)?
+            .is_none()
+        {
+            return Err(ServiceError::SessionNotFound { id });
+        }
+
+        let Some(snapshot) = self
+            .inner
+            .store
+            .load_snapshot(id)
+            .map_err(persistence_backend)?
+        else {
+            return Ok(Vec::new());
+        };
+
+        entries_from_snapshot(&snapshot)
     }
 
     async fn delete_session(&self, id: SessionId) -> Result<(), ServiceError> {
@@ -2113,6 +2137,7 @@ mod persist {
     //! or real filesystem tools are involved.
 
     use std::{
+        fs,
         path::PathBuf,
         sync::{
             Arc,
@@ -2129,15 +2154,19 @@ mod persist {
     use async_trait::async_trait;
     use futures::stream::BoxStream;
     use mag_service::{
-        ApprovalDecisionWire, InteractionKindWire, InteractionResponseWire, MagService,
-        RoutingMode, ServiceEvent, SessionConfig, SessionId, StepIdWire, ToolCallIdWire, UserInput,
+        ApprovalDecisionWire, DelegationStatusWire, HistoryEntry, InteractionKindWire,
+        InteractionResponseWire, MagService, RoutingMode, ServiceEvent, SessionConfig, SessionId,
+        StepIdWire, ToolCallIdWire, ToolStatusWire, UserInput,
     };
+    use mag_sources::SourceRegistry;
     use mag_tools::{PermissionSpec, ToolCategory, ToolPlugin, ToolRegistry, ToolRisk};
     use serde_json::{Value, json};
     use tokio::time::{Duration, timeout};
     use uuid::Uuid;
 
     use crate::test_support::{FakeLlmClient, text_stream_with_usage, tool_use_stream};
+
+    use crate::{ConfigService, persistence::Persistence};
 
     use super::Engine;
 
@@ -2168,6 +2197,7 @@ mod persist {
             let _ = std::fs::remove_file(&self.path);
             let _ = std::fs::remove_file(self.path.with_extension("sqlite-wal"));
             let _ = std::fs::remove_file(self.path.with_extension("sqlite-shm"));
+            let _ = std::fs::remove_file(self.path.with_extension("toml"));
         }
     }
 
@@ -2231,6 +2261,52 @@ mod persist {
 
     fn gated_registry() -> ToolRegistry {
         ToolRegistry::new().register(Arc::new(GatedShell))
+    }
+
+    /// A deterministic auto-allowed tool used by the history reconstruction test.
+    #[derive(Debug)]
+    struct ReadFile;
+
+    #[async_trait]
+    impl ToolPlugin for ReadFile {
+        fn name(&self) -> &str {
+            "read_file"
+        }
+
+        fn declaration(&self) -> Tool {
+            Tool {
+                name: "read_file".to_owned(),
+                description: "stub read file tool".to_owned(),
+                input_schema: json!({ "type": "object", "properties": {} }),
+            }
+        }
+
+        async fn invoke(&self, _ctx: ToolContext, _args: Value) -> ToolResult {
+            ToolResult::text("file contents")
+        }
+    }
+
+    fn history_registry() -> ToolRegistry {
+        ToolRegistry::new().register(Arc::new(ReadFile))
+    }
+
+    fn engine_with_persistent_config(
+        client: Arc<dyn LlmClient>,
+        tools: ToolRegistry,
+        db: &TempDb,
+        toml: &str,
+    ) -> Engine {
+        let config_path = db.path.with_extension("toml");
+        fs::write(&config_path, toml).expect("write history config");
+        let config = Arc::new(ConfigService::load_or_default(config_path).expect("load config"));
+        let store = Arc::new(Persistence::open(&db.path).expect("open persistent store"));
+        Engine::assemble(
+            Some(client),
+            Arc::new(tools),
+            store,
+            Some(config),
+            SourceRegistry::new(),
+        )
     }
 
     async fn next_event(events: &mut BoxStream<'static, ServiceEvent>) -> ServiceEvent {
@@ -2511,6 +2587,106 @@ mod persist {
             ),
             "the resumed approved turn must finish with the follow-up text: {rest:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn get_session_history_restores_messages_tools_and_delegations_after_restart() {
+        let db = TempDb::new();
+        let history_config = r#"
+[agents.default]
+model = "model-d"
+
+[agents.researcher]
+model = "model-r"
+role = "Researches topics and reports findings."
+tools = []
+
+[tools.ask_researcher]
+approval = "allow"
+"#;
+
+        let client1: Arc<dyn LlmClient> = FakeLlmClient::scripted(vec![
+            tool_use_stream("read_file", "call-1", json!({ "path": "notes.txt" })),
+            text_stream_with_usage(&["tool answer"], usage(3, 1)),
+            tool_use_stream("ask_researcher", "del-1", json!({ "task": "find facts" })),
+            text_stream_with_usage(&["research summary"], usage(5, 2)),
+            text_stream_with_usage(&["final answer"], usage(7, 1)),
+        ]);
+        let engine1 =
+            engine_with_persistent_config(client1, history_registry(), &db, history_config);
+        let session = engine1
+            .create_session(config("default"))
+            .await
+            .expect("create session");
+        let mut events1 = engine1.subscribe(Some(session));
+
+        run_message(&engine1, session, &mut events1, "please read").await;
+        run_message(&engine1, session, &mut events1, "please research").await;
+        drop(events1);
+        drop(engine1);
+
+        let client2: Arc<dyn LlmClient> = FakeLlmClient::scripted(Vec::new());
+        let engine2 =
+            engine_with_persistent_config(client2, history_registry(), &db, history_config);
+        engine2
+            .resume_session(session)
+            .await
+            .expect("resume before reading history");
+
+        let history = engine2
+            .get_session_history(session)
+            .await
+            .expect("read session history");
+        assert_eq!(history.len(), 6, "history entries: {history:?}");
+
+        match &history[0] {
+            HistoryEntry::UserMessage { text, attachments } => {
+                assert_eq!(text, "please read");
+                assert!(attachments.is_empty());
+            }
+            other => panic!("expected first user message, got {other:?}"),
+        }
+        match &history[1] {
+            HistoryEntry::ToolCall { trace } => {
+                assert_eq!(trace.name, "read_file");
+                assert_eq!(trace.input, Some(json!({ "path": "notes.txt" })));
+                assert_eq!(trace.status, ToolStatusWire::Finished);
+                assert!(
+                    trace
+                        .output
+                        .as_ref()
+                        .is_some_and(|output| output.to_string().contains("file contents")),
+                    "tool output should include the committed result: {trace:?}"
+                );
+            }
+            other => panic!("expected terminal tool call, got {other:?}"),
+        }
+        match &history[2] {
+            HistoryEntry::AssistantMessage { text } => assert_eq!(text, "tool answer"),
+            other => panic!("expected assistant answer, got {other:?}"),
+        }
+        match &history[3] {
+            HistoryEntry::UserMessage { text, .. } => assert_eq!(text, "please research"),
+            other => panic!("expected second user message, got {other:?}"),
+        }
+        match &history[4] {
+            HistoryEntry::Delegation { trace } => {
+                assert_eq!(trace.delegate, "researcher");
+                assert_eq!(trace.status, DelegationStatusWire::Finished);
+                assert_eq!(trace.task.as_deref(), Some("find facts"));
+                assert_eq!(trace.output.as_deref(), Some("research summary"));
+            }
+            other => panic!("expected terminal delegation, got {other:?}"),
+        }
+        match &history[5] {
+            HistoryEntry::AssistantMessage { text } => assert_eq!(text, "final answer"),
+            other => panic!("expected final assistant answer, got {other:?}"),
+        }
+
+        let encoded = serde_json::to_string(&history).expect("serialize history");
+        let decoded: Vec<HistoryEntry> =
+            serde_json::from_str(&encoded).expect("deserialize history");
+        assert_eq!(decoded, history);
     }
 }
 

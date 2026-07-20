@@ -36,9 +36,10 @@ use async_trait::async_trait;
 use futures::channel::mpsc;
 use futures::stream::{BoxStream, StreamExt};
 use mag_service::{
-    ApprovalDecisionWire, ApprovalRequirementWire, InteractionKindWire, InteractionOrigin,
-    InteractionResponseWire, MagService, RequestId, RunErrorKind, RunId, ServiceError,
-    ServiceEvent, SessionConfig, SessionId, SessionInfo, SourceInfo, ToolCallIdWire, UserInput,
+    ApprovalDecisionWire, ApprovalRequirementWire, HistoryEntry, InteractionKindWire,
+    InteractionOrigin, InteractionResponseWire, MagService, RequestId, RunErrorKind, RunId,
+    ServiceError, ServiceEvent, SessionConfig, SessionId, SessionInfo, SourceInfo, ToolCallIdWire,
+    UserInput,
 };
 use tokio::sync::Notify;
 
@@ -116,6 +117,10 @@ impl MagService for CancelService {
 
     async fn resume_session(&self, _id: SessionId) -> Result<(), ServiceError> {
         Ok(())
+    }
+
+    async fn get_session_history(&self, _id: SessionId) -> Result<Vec<HistoryEntry>, ServiceError> {
+        Ok(Vec::new())
     }
 
     async fn delete_session(&self, _id: SessionId) -> Result<(), ServiceError> {
@@ -336,6 +341,10 @@ impl MagService for TwoRunService {
 
     async fn resume_session(&self, _id: SessionId) -> Result<(), ServiceError> {
         Ok(())
+    }
+
+    async fn get_session_history(&self, _id: SessionId) -> Result<Vec<HistoryEntry>, ServiceError> {
+        Ok(Vec::new())
     }
 
     async fn delete_session(&self, _id: SessionId) -> Result<(), ServiceError> {
