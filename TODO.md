@@ -1085,7 +1085,7 @@ GUI/web/CLI 无需感知多个会话通道。
 
 目标：AskUserQuestion 式通用交互作为普通 plugin 先行（GUI 阶段再详细设计）。
 
-### M5-1 [TODO] mag-tools：`ask_user` ToolPlugin
+### M5-1 [DONE] mag-tools：`ask_user` ToolPlugin
 
 - **上下文**：`docs/CLI.md` §5 P6 + 决策 D6；`ToolPlugin` trait 在
   `crates/mag-tools/src/plugin.rs`（执行时细读签名）；交互桥复用 mag 侧审批/交互注入路径
@@ -1099,6 +1099,35 @@ GUI/web/CLI 无需感知多个会话通道。
 - **验证条件**：聚焦测试：fake LLM 触发 `ask_user` → 订阅者收到 `Question/Choice` 交互 →
   `respond_interaction` 回答成为工具输出进入后续上下文；cancel 中途打断工具立即返回 Cancelled。
   默认验证序列全过。
+
+  **完成记录**（2026-07-20）：
+  - 实现要点：`mag-tools` 新增普通 `ToolPlugin`：`AskUserTool`（工具名 `ask_user`，输入
+    `{question:String, options:Option<Vec<String>>}`，描述为“向用户提问并等待回答”），并注册进
+    `ToolRegistry::with_builtins()` / `builtin_tools()`（内置工具顺序变为 `read_file`、`list_dir`、`grep`、
+    `shell`、`ask_user`）。`mag-tools` 同步新增 `ToolInvocation` 与 `UserInteractionBridge` 抽象：既有工具
+    继续只实现旧 `invoke(ToolContext, Value)`；`ask_user` 覆盖 `invoke_with_context`，通过桥发起用户交互。
+    `ToolRegistry::bind_with_user_interaction` 供直接 registry 路径注入桥，`bind` 无桥时 `ask_user` 返回
+    model-visible error（避免静默挂起）。
+  - mag-core 接线：`SessionDriver` 在把每个 `ToolPlugin` 投影成 facade `Tool` 时，为当前会话注入
+    `IpcUserInteractionBridge`（私有桥，持有同一 `Arc<IpcApproval>`）。桥把 `ask_user` 请求映射为
+    agent-lib `Interaction::question` / `Interaction::choice`，经既有 `IpcApproval` 发
+    `ServiceEvent::InteractionRequested{kind:Question|Choice, origin:root}`，再由 `respond_interaction` 回灌。
+    这复用同一 pending map / `RequestId` 铸造 / cancel 处理路径，未新增 service 契约。
+  - cancel 语义：`AskUserTool` 使用 `tokio::select!` 竞争桥调用与 `ToolContext::cancel.cancelled()`；cancel
+    触发时立即返回 `ToolResult::error("ask_user cancelled")`。桥侧构造的 `RunContext` 共享同一个 cancel token，
+    因此底层 `IpcApproval` 也会丢弃 pending 交互，避免迟到响应唤醒已取消 run。
+  - 输出形态：open `Question` 的 `Answer{text}` 作为纯文本工具输出；fixed `Choice{index}` 输出紧凑 JSON
+    `{"index":n,"option":"..."}`，并校验 index 落在 options 范围内，越界返回 model-visible error。
+  - 测试（全部离线）：`mag-tools` 新增 4 个集成测试覆盖 Question 桥调用、Choice 输出、无桥错误、预取消快速
+    返回，并更新内置工具声明/`ToolSetRef`/permission 元数据断言；`mag-core` 新增 3 个 fake LLM 端到端测试：
+    `ask_user_question_round_trips_through_interaction_and_enters_context`、
+    `ask_user_choice_round_trips_through_interaction_and_enters_context`、
+    `ask_user_cancel_unblocks_the_parked_tool`，断言订阅者收到 `Question/Choice`，`respond_interaction` 后工具输出
+    出现在下一次 LLM 请求上下文，cancel 后 run 以 `RunErrorKind::Cancelled` 结束。单测试均 < 1s。
+  - 门禁结果：1) `cargo fmt --all -- --check` ✅ 2) 聚焦测试 ✅：`cargo test -p mag-tools`（23 passed）与
+    `cargo test -p mag-core ask_user`（3 passed）3) `cargo clippy --all-targets -- -D warnings` ✅
+    4) `cargo test --workspace` ✅（全绿，1 ignored 为既有 zed 联调测试）5) `cargo doc --no-deps --workspace` ✅
+    （0 warning）。
 
 ### M5-R [TODO] M5 review
 

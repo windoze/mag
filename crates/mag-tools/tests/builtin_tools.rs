@@ -4,17 +4,22 @@
 //! a hand-built [`ToolContextParts`], never touching the network or any real
 //! agent loop.
 
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use agent_lib::agent::{
     AgentId, CancellationToken, RunId, ToolRegistry as AgentToolRegistry, ToolRuntimeError,
     ToolSetId, TraceHandle, TraceNodeId, WorktreeRef,
 };
 use agent_lib::conversation::ToolCallId;
+use agent_lib::facade::ToolContext;
 use agent_lib::facade::ToolContextParts;
 use agent_lib::model::content::ContentBlock;
 use agent_lib::model::tool::{ToolCall, ToolStatus};
-use mag_tools::{PermissionSpec, ToolCategory, ToolRegistry, ToolRisk};
+use async_trait::async_trait;
+use mag_tools::{
+    PermissionSpec, ToolCategory, ToolRegistry, ToolRisk, UserInteractionBridge,
+    UserInteractionError, UserInteractionRequest, UserInteractionResponse,
+};
 use serde_json::json;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -54,6 +59,52 @@ fn text_of(content: &[ContentBlock]) -> String {
             _ => None,
         })
         .collect()
+}
+
+#[derive(Debug)]
+struct StaticUserBridge {
+    response: UserInteractionResponse,
+    seen: std::sync::Mutex<Vec<UserInteractionRequest>>,
+}
+
+impl StaticUserBridge {
+    fn new(response: UserInteractionResponse) -> Arc<Self> {
+        Arc::new(Self {
+            response,
+            seen: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn seen(&self) -> Vec<UserInteractionRequest> {
+        self.seen.lock().expect("seen lock").clone()
+    }
+}
+
+#[async_trait]
+impl UserInteractionBridge for StaticUserBridge {
+    async fn ask_user(
+        &self,
+        _ctx: ToolContext,
+        request: UserInteractionRequest,
+    ) -> Result<UserInteractionResponse, UserInteractionError> {
+        self.seen.lock().expect("seen lock").push(request);
+        Ok(self.response.clone())
+    }
+}
+
+#[derive(Debug)]
+struct NeverUserBridge;
+
+#[async_trait]
+impl UserInteractionBridge for NeverUserBridge {
+    async fn ask_user(
+        &self,
+        _ctx: ToolContext,
+        _request: UserInteractionRequest,
+    ) -> Result<UserInteractionResponse, UserInteractionError> {
+        std::future::pending::<()>().await;
+        unreachable!("pending future never resolves")
+    }
 }
 
 #[tokio::test]
@@ -224,14 +275,111 @@ async fn shell_cancellation_interrupts_the_command() {
 }
 
 #[tokio::test]
-async fn registry_declares_the_four_builtin_tools() {
+async fn ask_user_question_uses_the_user_interaction_bridge() {
+    let dir = TempDir::new().expect("temp dir");
+    let bridge = StaticUserBridge::new(UserInteractionResponse::Answer("yes, continue".to_owned()));
+    let registry = ToolRegistry::with_builtins()
+        .bind_with_user_interaction(parts(dir.path(), CancellationToken::new()), bridge.clone());
+
+    let response = registry
+        .execute(
+            tool_call_id(),
+            call("ask_user", json!({ "question": "Continue?" })),
+        )
+        .await
+        .expect("ask_user executes");
+
+    assert_eq!(response.status, ToolStatus::Ok);
+    assert_eq!(text_of(&response.content), "yes, continue");
+    assert_eq!(
+        bridge.seen(),
+        vec![UserInteractionRequest::new("Continue?".to_owned(), None)]
+    );
+}
+
+#[tokio::test]
+async fn ask_user_choice_returns_the_selected_option() {
+    let dir = TempDir::new().expect("temp dir");
+    let bridge = StaticUserBridge::new(UserInteractionResponse::Choice(1));
+    let registry = ToolRegistry::with_builtins()
+        .bind_with_user_interaction(parts(dir.path(), CancellationToken::new()), bridge.clone());
+
+    let response = registry
+        .execute(
+            tool_call_id(),
+            call(
+                "ask_user",
+                json!({ "question": "Pick a color", "options": ["red", "blue"] }),
+            ),
+        )
+        .await
+        .expect("ask_user executes");
+
+    assert_eq!(response.status, ToolStatus::Ok);
+    assert_eq!(text_of(&response.content), r#"{"index":1,"option":"blue"}"#);
+    assert_eq!(
+        bridge.seen(),
+        vec![UserInteractionRequest::new(
+            "Pick a color".to_owned(),
+            Some(vec!["red".to_owned(), "blue".to_owned()]),
+        )]
+    );
+}
+
+#[tokio::test]
+async fn ask_user_without_a_bridge_reports_an_error() {
+    let dir = TempDir::new().expect("temp dir");
+    let registry = ToolRegistry::with_builtins().bind(parts(dir.path(), CancellationToken::new()));
+
+    let response = registry
+        .execute(
+            tool_call_id(),
+            call("ask_user", json!({ "question": "Anyone there?" })),
+        )
+        .await
+        .expect("ask_user returns a model-visible error");
+
+    assert_eq!(response.status, ToolStatus::Error);
+    assert!(text_of(&response.content).contains("bridge unavailable"));
+}
+
+#[tokio::test]
+async fn ask_user_cancellation_returns_promptly() {
+    let dir = TempDir::new().expect("temp dir");
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let registry = ToolRegistry::with_builtins()
+        .bind_with_user_interaction(parts(dir.path(), cancel), Arc::new(NeverUserBridge));
+
+    let started = std::time::Instant::now();
+    let response = registry
+        .execute(
+            tool_call_id(),
+            call("ask_user", json!({ "question": "Wait forever?" })),
+        )
+        .await
+        .expect("ask_user returns a cancellation result");
+
+    assert_eq!(response.status, ToolStatus::Error);
+    assert!(text_of(&response.content).contains("cancelled"));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "pre-cancelled ask_user must not park"
+    );
+}
+
+#[tokio::test]
+async fn registry_declares_the_builtin_tools() {
     let registry = ToolRegistry::with_builtins();
     let names: Vec<String> = registry
         .declarations()
         .into_iter()
         .map(|tool| tool.name)
         .collect();
-    assert_eq!(names, ["read_file", "list_dir", "grep", "shell"]);
+    assert_eq!(
+        names,
+        ["read_file", "list_dir", "grep", "shell", "ask_user"]
+    );
 }
 
 #[tokio::test]
@@ -260,6 +408,7 @@ fn permission_metadata_matches_the_gate_policy() {
     assert_eq!(registry.permission("read_file"), None);
     assert_eq!(registry.permission("list_dir"), None);
     assert_eq!(registry.permission("grep"), None);
+    assert_eq!(registry.permission("ask_user"), None);
 
     // Shell is gated with a conservative baseline.
     assert_eq!(
@@ -280,5 +429,8 @@ fn tool_set_carries_the_declarations() {
         .iter()
         .map(|tool| tool.name.as_str())
         .collect();
-    assert_eq!(names, ["read_file", "list_dir", "grep", "shell"]);
+    assert_eq!(
+        names,
+        ["read_file", "list_dir", "grep", "shell", "ask_user"]
+    );
 }

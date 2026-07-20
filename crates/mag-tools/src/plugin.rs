@@ -20,7 +20,7 @@ use agent_lib::model::tool::Tool;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 /// Coarse classification of what a tool acts on, used by the approval gate and
 /// surfaced to the UI / future AI-permission policy (`docs/DESIGN.md` §8.1).
@@ -65,6 +65,133 @@ pub struct PermissionSpec {
     pub risk: ToolRisk,
 }
 
+/// A request from a tool to ask the user a question through the host interface.
+///
+/// This is the `ask_user` bridge payload from `docs/CLI.md` §5 P6 / decision D6:
+/// an absent `options` field means an open-ended question, while a present list
+/// means the interface should render a fixed-choice prompt and return a selected
+/// zero-based index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserInteractionRequest {
+    /// Prompt shown to the user.
+    pub question: String,
+    /// Fixed choices shown to the user, when this is a choice prompt.
+    pub options: Option<Vec<String>>,
+}
+
+impl UserInteractionRequest {
+    /// Creates a user interaction request.
+    #[must_use]
+    pub fn new(question: String, options: Option<Vec<String>>) -> Self {
+        Self { question, options }
+    }
+}
+
+/// A response returned by the host after resolving an [`UserInteractionRequest`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UserInteractionResponse {
+    /// Free-form answer to an open-ended question.
+    Answer(String),
+    /// Zero-based selected index for a fixed-choice prompt.
+    Choice(usize),
+}
+
+/// Error returned when the host cannot resolve a user interaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserInteractionError {
+    message: String,
+}
+
+impl UserInteractionError {
+    /// Creates an error from a model-visible message.
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    /// Returns the contained message.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for UserInteractionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for UserInteractionError {}
+
+/// Host-side bridge used by tools that need to ask the user something.
+///
+/// The bridge is injected by the interface/service layer when a run binds its
+/// tool surface. Implementations must observe [`ToolContext::cancel`] and resolve
+/// promptly when it fires so a long-lived user prompt cannot freeze a cancelled
+/// run (`docs/CLI.md` §5 P6 / D6).
+#[async_trait]
+pub trait UserInteractionBridge: Send + Sync {
+    /// Resolves one user interaction request.
+    async fn ask_user(
+        &self,
+        ctx: ToolContext,
+        request: UserInteractionRequest,
+    ) -> Result<UserInteractionResponse, UserInteractionError>;
+}
+
+/// Full invocation context passed to tools that need host bridges in addition to
+/// agent-lib's run-scoped [`ToolContext`].
+#[derive(Clone)]
+pub struct ToolInvocation {
+    context: ToolContext,
+    user_interaction: Option<Arc<dyn UserInteractionBridge>>,
+}
+
+impl ToolInvocation {
+    /// Creates an invocation context without optional host bridges.
+    #[must_use]
+    pub fn new(context: ToolContext) -> Self {
+        Self {
+            context,
+            user_interaction: None,
+        }
+    }
+
+    /// Adds a user-interaction bridge to this invocation.
+    #[must_use]
+    pub fn with_user_interaction(mut self, bridge: Arc<dyn UserInteractionBridge>) -> Self {
+        self.user_interaction = Some(bridge);
+        self
+    }
+
+    /// Returns the agent-lib tool context.
+    #[must_use]
+    pub fn context(&self) -> &ToolContext {
+        &self.context
+    }
+
+    /// Consumes this wrapper and returns the agent-lib tool context.
+    #[must_use]
+    pub fn into_context(self) -> ToolContext {
+        self.context
+    }
+
+    /// Returns the user-interaction bridge, if one was supplied.
+    #[must_use]
+    pub fn user_interaction(&self) -> Option<&Arc<dyn UserInteractionBridge>> {
+        self.user_interaction.as_ref()
+    }
+}
+
+impl From<ToolContext> for ToolInvocation {
+    fn from(context: ToolContext) -> Self {
+        Self::new(context)
+    }
+}
+
 impl PermissionSpec {
     /// Creates a permission specification from a category and risk level.
     #[must_use]
@@ -101,6 +228,15 @@ pub trait ToolPlugin: Send + Sync + fmt::Debug {
     /// I/O errors, cancellation) as [`ToolResult::error`] rather than panicking,
     /// so the model can react to them.
     async fn invoke(&self, ctx: ToolContext, args: Value) -> ToolResult;
+
+    /// Runs one tool call with the extended mag invocation context.
+    ///
+    /// Most tools only need agent-lib's [`ToolContext`] and therefore implement
+    /// [`invoke`](Self::invoke). Tools such as `ask_user` override this method to
+    /// use host-provided bridges while preserving the same plugin trait.
+    async fn invoke_with_context(&self, invocation: ToolInvocation, args: Value) -> ToolResult {
+        self.invoke(invocation.into_context(), args).await
+    }
 
     /// Returns the approval metadata for this tool, or `None` to auto-allow it.
     ///

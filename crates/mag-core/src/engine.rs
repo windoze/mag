@@ -962,7 +962,8 @@ mod chat {
     use futures::StreamExt;
     use futures::stream::BoxStream;
     use mag_service::{
-        MagService, RoutingMode, ServiceEvent, SessionConfig, SessionId, UsageInfo, UserInput,
+        InteractionKindWire, InteractionResponseWire, MagService, RoutingMode, RunErrorKind,
+        ServiceEvent, SessionConfig, SessionId, UsageInfo, UserInput,
     };
     use tokio::time::{Duration, timeout};
 
@@ -1019,6 +1020,26 @@ mod chat {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn all_text(message: &Message) -> String {
+        fn collect(block: &ContentBlock, out: &mut Vec<String>) {
+            match block {
+                ContentBlock::Text { text, .. } => out.push(text.clone()),
+                ContentBlock::ToolResult { content, .. } => {
+                    for nested in content {
+                        collect(nested, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut parts = Vec::new();
+        for block in &message.content {
+            collect(block, &mut parts);
+        }
+        parts.join("\n")
     }
 
     #[tokio::test]
@@ -1307,6 +1328,197 @@ mod chat {
         let last = second_messages.last().expect("second request has messages");
         assert_eq!(last.role, Role::User);
         assert_eq!(text(last), "again");
+    }
+
+    #[tokio::test]
+    async fn ask_user_question_round_trips_through_interaction_and_enters_context() {
+        let fake = FakeLlmClient::scripted(vec![
+            crate::test_support::tool_use_stream(
+                "ask_user",
+                "ask-1",
+                serde_json::json!({ "question": "Where should I look?" }),
+            ),
+            text_stream_with_usage(&["Noted."], usage(4, 1)),
+        ]);
+        let engine = engine_with_fake(fake.clone());
+        let session = create_session(&engine).await;
+        let mut events = engine.subscribe(Some(session));
+
+        engine
+            .send_message(session, UserInput::text("need input"))
+            .await
+            .expect("send message");
+
+        let request_id = loop {
+            match next_event(&mut events).await {
+                ServiceEvent::InteractionRequested {
+                    id,
+                    request_id,
+                    kind: InteractionKindWire::Question { prompt },
+                    origin,
+                } => {
+                    assert_eq!(id, session);
+                    assert_eq!(prompt, "Where should I look?");
+                    assert!(origin.is_root());
+                    break request_id;
+                }
+                ServiceEvent::RunError { message, .. } => {
+                    panic!("run failed before ask_user resolved: {message}")
+                }
+                _ => continue,
+            }
+        };
+
+        engine
+            .respond_interaction(
+                session,
+                request_id,
+                InteractionResponseWire::Answer {
+                    text: "check src/lib.rs".to_owned(),
+                },
+            )
+            .await
+            .expect("respond answer");
+
+        loop {
+            match next_event(&mut events).await {
+                ServiceEvent::RunFinished { id, .. } if id == session => break,
+                ServiceEvent::RunError { message, .. } => panic!("run failed: {message}"),
+                _ => continue,
+            }
+        }
+
+        let requests = fake.stream_requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[1]
+                .messages
+                .iter()
+                .any(|message| all_text(message).contains("check src/lib.rs")),
+            "second LLM request should include the ask_user answer: {:?}",
+            requests[1].messages
+        );
+    }
+
+    #[tokio::test]
+    async fn ask_user_choice_round_trips_through_interaction_and_enters_context() {
+        let fake = FakeLlmClient::scripted(vec![
+            crate::test_support::tool_use_stream(
+                "ask_user",
+                "ask-1",
+                serde_json::json!({
+                    "question": "Choose a color",
+                    "options": ["red", "blue"]
+                }),
+            ),
+            text_stream_with_usage(&["Blue it is."], usage(4, 1)),
+        ]);
+        let engine = engine_with_fake(fake.clone());
+        let session = create_session(&engine).await;
+        let mut events = engine.subscribe(Some(session));
+
+        engine
+            .send_message(session, UserInput::text("need a choice"))
+            .await
+            .expect("send message");
+
+        let request_id = loop {
+            match next_event(&mut events).await {
+                ServiceEvent::InteractionRequested {
+                    id,
+                    request_id,
+                    kind: InteractionKindWire::Choice { prompt, options },
+                    origin,
+                } => {
+                    assert_eq!(id, session);
+                    assert_eq!(prompt, "Choose a color");
+                    assert_eq!(options, vec!["red".to_owned(), "blue".to_owned()]);
+                    assert!(origin.is_root());
+                    break request_id;
+                }
+                ServiceEvent::RunError { message, .. } => {
+                    panic!("run failed before ask_user resolved: {message}")
+                }
+                _ => continue,
+            }
+        };
+
+        engine
+            .respond_interaction(
+                session,
+                request_id,
+                InteractionResponseWire::Choice { index: 1 },
+            )
+            .await
+            .expect("respond choice");
+
+        loop {
+            match next_event(&mut events).await {
+                ServiceEvent::RunFinished { id, .. } if id == session => break,
+                ServiceEvent::RunError { message, .. } => panic!("run failed: {message}"),
+                _ => continue,
+            }
+        }
+
+        let requests = fake.stream_requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[1]
+                .messages
+                .iter()
+                .any(|message| all_text(message).contains(r#"{"index":1,"option":"blue"}"#)),
+            "second LLM request should include the selected ask_user option: {:?}",
+            requests[1].messages
+        );
+    }
+
+    #[tokio::test]
+    async fn ask_user_cancel_unblocks_the_parked_tool() {
+        let fake = FakeLlmClient::scripted(vec![crate::test_support::tool_use_stream(
+            "ask_user",
+            "ask-1",
+            serde_json::json!({ "question": "Should I wait?" }),
+        )]);
+        let engine = engine_with_fake(fake);
+        let session = create_session(&engine).await;
+        let mut events = engine.subscribe(Some(session));
+
+        engine
+            .send_message(session, UserInput::text("ask and wait"))
+            .await
+            .expect("send message");
+
+        loop {
+            match next_event(&mut events).await {
+                ServiceEvent::InteractionRequested {
+                    kind: InteractionKindWire::Question { prompt },
+                    ..
+                } => {
+                    assert_eq!(prompt, "Should I wait?");
+                    break;
+                }
+                ServiceEvent::RunError { message, .. } => {
+                    panic!("run failed before ask_user parked: {message}")
+                }
+                _ => continue,
+            }
+        }
+
+        engine.cancel(session).await.expect("cancel run");
+
+        loop {
+            match next_event(&mut events).await {
+                ServiceEvent::RunError { id, kind, message } if id == session => {
+                    assert_eq!(kind, RunErrorKind::Cancelled);
+                    assert!(message.contains("cancelled"));
+                    break;
+                }
+                ServiceEvent::RunFinished { .. } => {
+                    panic!("cancelled ask_user run must not finish")
+                }
+                _ => continue,
+            }
+        }
     }
 }
 

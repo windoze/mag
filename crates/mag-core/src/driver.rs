@@ -16,8 +16,9 @@
 //! (the facade injects the run-scoped [`ToolContext`] per call), and each tool
 //! that declares [`permission`](ToolPlugin::permission) is gated behind
 //! [`ApprovalPolicy::ask_tool`] so it pauses through the injected
-//! [`IpcApproval`]; tools without a permission stay auto-allowed and never
-//! interrupt the run.
+//! [`IpcApproval`]. The `ask_user` plugin is permission-free but still uses the
+//! same `IpcApproval` instance directly through a host bridge to emit
+//! `Question` / `Choice` interactions (`docs/CLI.md` §5 P6).
 
 use std::collections::{BTreeSet, VecDeque};
 use std::convert::Infallible;
@@ -33,13 +34,14 @@ use agent_lib::{
     agent::external::{
         AcpAdapter, AcpConfig, ExternalSessionRegistry, ExternalSessionShutdown, GitWorktreeManager,
     },
-    agent::{
-        AgentId, ExternalSessionHandler, ExternalSessionRequest, RequirementResult, RunContext,
-    },
+    agent::{AgentId, ExternalSessionHandler, ExternalSessionRequest},
     facade::{ManagedExternalAgent, RegistryExternalSessionHandler},
 };
 use agent_lib::{
-    agent::{ApprovalDecision, BudgetLimits, InteractionHandler, WorktreeRef},
+    agent::{
+        ApprovalDecision, BudgetLimits, Interaction, InteractionHandler, InteractionResponse,
+        RequirementResult, RunContext, StepId, TraceNodeId, WorktreeRef,
+    },
     client::LlmClient,
     facade::{
         Agent, AgentRunStream, AgentSnapshot, Approval, ApprovalPolicy, CancelHandle,
@@ -56,7 +58,10 @@ use mag_service::{
     DelegationMessageWire, DelegationTrace, Event, RunErrorKind, RunId as WireRunId, RunOutput,
     SessionBudget, SessionConfig, SessionId, ToolCallIdWire, ToolStatusWire, ToolTrace, UsageInfo,
 };
-use mag_tools::{ToolPlugin, ToolRegistry};
+use mag_tools::{
+    ToolInvocation, ToolPlugin, ToolRegistry, UserInteractionBridge, UserInteractionError,
+    UserInteractionRequest, UserInteractionResponse,
+};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -254,7 +259,9 @@ impl SessionDriver {
         binding: &SessionBinding,
         overrides: &ApprovalOverrides,
     ) -> Result<Self, FacadeError> {
-        let (facade_tools, policy) = tool_surface(&tools, binding, overrides);
+        let user_interaction = Arc::new(IpcUserInteractionBridge::new(Arc::clone(&approval)))
+            as Arc<dyn UserInteractionBridge>;
+        let (facade_tools, policy) = tool_surface(&tools, binding, overrides, user_interaction);
         let mut builder = Agent::builder()
             .client(client)
             .model(
@@ -347,7 +354,9 @@ impl SessionDriver {
         binding: &SessionBinding,
         overrides: &ApprovalOverrides,
     ) -> Result<Self, FacadeError> {
-        let (facade_tools, policy) = tool_surface(&tools, binding, overrides);
+        let user_interaction = Arc::new(IpcUserInteractionBridge::new(Arc::clone(&approval)))
+            as Arc<dyn UserInteractionBridge>;
+        let (facade_tools, policy) = tool_surface(&tools, binding, overrides, user_interaction);
         let mut builder = Agent::restore()
             .snapshot(snapshot)
             .client(client)
@@ -953,12 +962,16 @@ fn map_wire_event(
 /// 3. Each projected plugin declaring a [`permission`](ToolPlugin::permission)
 ///    is gated behind [`ApprovalPolicy::ask_tool`] so it pauses through the
 ///    injected [`IpcApproval`](crate::engine::approval::IpcApproval), while a
-///    permission-free (read-only) plugin stays on the policy default tier
-///    (`docs/DESIGN.md` §3.2/§3.3).
-/// 4. Every registered local or external delegate start tool (`ask_<name>`) is
+///    permission-free plugin stays on the policy default tier (`docs/DESIGN.md`
+///    §3.2/§3.3). This includes read-only tools and `ask_user`, whose own
+///    interaction is emitted by its handler rather than by the approval policy.
+/// 4. Every projected plugin receives the session's user-interaction bridge;
+///    `ask_user` consumes it to emit `Question` / `Choice` through the same
+///    `IpcApproval` path (`docs/CLI.md` §5 P6 / D6), while other tools ignore it.
+/// 5. Every registered local or external delegate start tool (`ask_<name>`) is
 ///    made an approval point by default (`docs/CLI.md` §5 P7 / TODO M4-3), so
 ///    starting a delegation goes through the root session's `IpcApproval`.
-/// 5. `overrides`' per-tool tiers (`[tools.<name>].approval`) replace the
+/// 6. `overrides`' per-tool tiers (`[tools.<name>].approval`) replace the
 ///    derived tier for their tool, including explicit `ask_<name>` allow/deny
 ///    overrides.
 ///
@@ -972,6 +985,7 @@ fn tool_surface(
     tools: &ToolRegistry,
     binding: &SessionBinding,
     overrides: &ApprovalOverrides,
+    user_interaction: Arc<dyn UserInteractionBridge>,
 ) -> (Vec<Tool>, ApprovalPolicy) {
     let mut policy = base_policy(overrides.default_tier());
     let mut facade_tools = Vec::new();
@@ -984,7 +998,10 @@ fn tool_surface(
         if plugin.permission().is_some() {
             policy = policy.ask_tool(plugin.name());
         }
-        facade_tools.push(facade_tool(Arc::clone(plugin)));
+        facade_tools.push(facade_tool(
+            Arc::clone(plugin),
+            Arc::clone(&user_interaction),
+        ));
     }
     if let Some(allowed) = binding.tools() {
         for name in allowed {
@@ -1198,15 +1215,95 @@ fn base_policy(tier: ApprovalPolicyKind) -> ApprovalPolicy {
     }
 }
 
+/// User-interaction bridge consumed by the `ask_user` tool (`docs/CLI.md` §5 P6).
+///
+/// The bridge deliberately reuses the session's [`IpcApproval`] instance: the
+/// same pending map, `RequestId` minting, origin handling, and
+/// `respond_interaction` wake-up path answer approvals, permissions, questions,
+/// and choices. A tool call supplies only agent-lib's [`ToolContext`], so this
+/// bridge reconstructs the minimal [`RunContext`] needed by the
+/// [`InteractionHandler`] using the tool call's run id, cancellation token, and a
+/// trace root derived from the tool call id.
+struct IpcUserInteractionBridge {
+    approval: Arc<IpcApproval>,
+}
+
+impl IpcUserInteractionBridge {
+    /// Creates a bridge over one session's approval handler.
+    fn new(approval: Arc<IpcApproval>) -> Self {
+        Self { approval }
+    }
+}
+
+#[async_trait::async_trait]
+impl UserInteractionBridge for IpcUserInteractionBridge {
+    async fn ask_user(
+        &self,
+        ctx: ToolContext,
+        request: UserInteractionRequest,
+    ) -> Result<UserInteractionResponse, UserInteractionError> {
+        let interaction = match &request.options {
+            Some(options) => Interaction::choice(
+                StepId::new(*ctx.tool_call_id.as_uuid()),
+                request.question.clone(),
+                options.clone(),
+            ),
+            None => Interaction::question(
+                StepId::new(*ctx.tool_call_id.as_uuid()),
+                request.question.clone(),
+            ),
+        };
+        let run_context = RunContext::new_root_with_cancellation(
+            ctx.run_id,
+            BudgetLimits::unbounded(),
+            TraceNodeId::new(format!("ask_user:{}", ctx.tool_call_id)),
+            ctx.cancel,
+        );
+
+        match self.approval.fulfill(&interaction, &run_context).await {
+            RequirementResult::Interaction(InteractionResponse::Answer(text)) => {
+                if request.options.is_some() {
+                    Err(UserInteractionError::new(
+                        "answer response received for a choice prompt",
+                    ))
+                } else {
+                    Ok(UserInteractionResponse::Answer(text))
+                }
+            }
+            RequirementResult::Interaction(InteractionResponse::Choice(index)) => {
+                if request.options.is_some() {
+                    Ok(UserInteractionResponse::Choice(index))
+                } else {
+                    Err(UserInteractionError::new(
+                        "choice response received for a free-form question",
+                    ))
+                }
+            }
+            RequirementResult::Interaction(other) => Err(UserInteractionError::new(format!(
+                "unexpected interaction response family `{}`",
+                other.tag()
+            ))),
+            _ => Err(UserInteractionError::new(
+                "unexpected requirement result while asking user",
+            )),
+        }
+    }
+}
+
 /// Projects one facade [`Tool`] from a [`ToolPlugin`].
 ///
 /// The plugin's [`declaration`](ToolPlugin::declaration) supplies the model-facing
 /// name, description, and JSON input schema; the executor forwards the run-scoped
 /// [`ToolContext`] and raw JSON arguments to
-/// [`ToolPlugin::invoke`](ToolPlugin::invoke). The plugin already encodes success
-/// and recoverable failure in its [`ToolResult`] status, so the executor is
-/// infallible from the facade's point of view.
-fn facade_tool(plugin: Arc<dyn ToolPlugin>) -> Tool {
+/// [`ToolPlugin::invoke_with_context`](ToolPlugin::invoke_with_context), adding
+/// the current session's user-interaction bridge for `ask_user` (`docs/CLI.md`
+/// §5 P6). The plugin already encodes success and recoverable failure in its
+/// [`ToolResult`] status, so the executor is infallible from the facade's point
+/// of view.
+fn facade_tool(
+    plugin: Arc<dyn ToolPlugin>,
+    user_interaction: Arc<dyn UserInteractionBridge>,
+) -> Tool {
     let declaration = plugin.declaration();
     Tool::function_with_schema(
         declaration.name,
@@ -1214,7 +1311,11 @@ fn facade_tool(plugin: Arc<dyn ToolPlugin>) -> Tool {
         declaration.input_schema,
         move |ctx: ToolContext, args: Value| {
             let plugin = Arc::clone(&plugin);
-            async move { Ok::<ToolResult, Infallible>(plugin.invoke(ctx, args).await) }
+            let user_interaction = Arc::clone(&user_interaction);
+            async move {
+                let invocation = ToolInvocation::new(ctx).with_user_interaction(user_interaction);
+                Ok::<ToolResult, Infallible>(plugin.invoke_with_context(invocation, args).await)
+            }
         },
     )
 }
@@ -1746,7 +1847,10 @@ enabled = false
                 .iter()
                 .map(|tool| tool.name.as_str())
                 .collect();
-            assert_eq!(names, vec!["read_file", "list_dir", "grep", "shell"]);
+            assert_eq!(
+                names,
+                vec!["read_file", "list_dir", "grep", "shell", "ask_user"]
+            );
         });
     }
 

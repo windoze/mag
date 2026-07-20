@@ -13,8 +13,9 @@
 //! that executes calls by dispatching to the matching plugin.
 //!
 //! The first-version tool set is [`ReadFileTool`], [`ListDirTool`], and
-//! [`GrepTool`] (read-only, path-constrained to the worktree, auto-allowed) plus
-//! [`ShellTool`] (gated behind approval, cancellable).
+//! [`GrepTool`] (read-only, path-constrained to the worktree, auto-allowed),
+//! [`ShellTool`] (gated behind approval, cancellable), and [`AskUserTool`]
+//! (`docs/CLI.md` §5 P6, asks the interface user through a host bridge).
 
 mod path;
 mod plugin;
@@ -22,6 +23,9 @@ mod registry;
 mod tools;
 
 pub use path::{PathError, safe_join};
-pub use plugin::{PermissionSpec, ToolCategory, ToolPlugin, ToolRisk};
+pub use plugin::{
+    PermissionSpec, ToolCategory, ToolInvocation, ToolPlugin, ToolRisk, UserInteractionBridge,
+    UserInteractionError, UserInteractionRequest, UserInteractionResponse,
+};
 pub use registry::{PluginToolRegistry, ToolRegistry};
-pub use tools::{GrepTool, ListDirTool, ReadFileTool, ShellTool, builtin_tools};
+pub use tools::{AskUserTool, GrepTool, ListDirTool, ReadFileTool, ShellTool, builtin_tools};

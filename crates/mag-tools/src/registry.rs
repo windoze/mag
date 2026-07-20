@@ -9,9 +9,11 @@
 //! cancellation) up front: [`ToolRegistry::bind`] stamps a
 //! [`ToolContextParts`] onto the plugins to yield a [`PluginToolRegistry`] that
 //! implements the agent-lib trait and dispatches each call to the matching
-//! plugin by name.
+//! plugin by name. Tools such as `ask_user` can additionally receive a
+//! host-provided user-interaction bridge via
+//! [`ToolRegistry::bind_with_user_interaction`] (`docs/CLI.md` §5 P6).
 
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use agent_lib::agent::{
     ToolRegistry as AgentToolRegistry, ToolRuntimeError, ToolSetId, ToolSetRef,
@@ -21,7 +23,7 @@ use agent_lib::facade::{ToolContext, ToolContextParts};
 use agent_lib::model::tool::{Tool, ToolCall, ToolResponse};
 use async_trait::async_trait;
 
-use crate::plugin::{PermissionSpec, ToolPlugin};
+use crate::plugin::{PermissionSpec, ToolInvocation, ToolPlugin, UserInteractionBridge};
 use crate::tools::builtin_tools;
 
 /// A collection of [`ToolPlugin`]s assembled by mag.
@@ -42,7 +44,7 @@ impl ToolRegistry {
     }
 
     /// Creates a registry populated with the built-in minimal tool set
-    /// (`read_file`, `list_dir`, `grep`, `shell`).
+    /// (`read_file`, `list_dir`, `grep`, `shell`, `ask_user`).
     #[must_use]
     pub fn with_builtins() -> Self {
         Self {
@@ -100,6 +102,25 @@ impl ToolRegistry {
         PluginToolRegistry {
             plugins: self.plugins.clone(),
             context,
+            user_interaction: None,
+        }
+    }
+
+    /// Binds run-scoped context plus a host user-interaction bridge.
+    ///
+    /// This is the direct registry path for `ask_user` (`docs/CLI.md` §5 P6).
+    /// mag-core's facade-tool projection supplies the same bridge while building
+    /// typed facade tools, so both execution paths share one plugin contract.
+    #[must_use]
+    pub fn bind_with_user_interaction(
+        &self,
+        context: ToolContextParts,
+        bridge: Arc<dyn UserInteractionBridge>,
+    ) -> PluginToolRegistry {
+        PluginToolRegistry {
+            plugins: self.plugins.clone(),
+            context,
+            user_interaction: Some(bridge),
         }
     }
 }
@@ -111,10 +132,28 @@ impl ToolRegistry {
 /// collector, and [`execute`](AgentToolRegistry::execute) dispatches a model tool
 /// call to the matching plugin, building a fresh [`ToolContext`] from the bound
 /// parts for each call.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PluginToolRegistry {
     plugins: Vec<Arc<dyn ToolPlugin>>,
     context: ToolContextParts,
+    user_interaction: Option<Arc<dyn UserInteractionBridge>>,
+}
+
+impl fmt::Debug for PluginToolRegistry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PluginToolRegistry")
+            .field(
+                "plugins",
+                &self
+                    .plugins
+                    .iter()
+                    .map(|plugin| plugin.name())
+                    .collect::<Vec<_>>(),
+            )
+            .field("has_user_interaction", &self.user_interaction.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl PluginToolRegistry {
@@ -127,6 +166,15 @@ impl PluginToolRegistry {
             worktree: self.context.worktree.clone(),
             cancel: self.context.cancel.clone(),
             trace: self.context.trace.clone(),
+        }
+    }
+
+    /// Builds the extended mag invocation context for one tool call.
+    fn invocation_for(&self, tool_call_id: ToolCallId) -> ToolInvocation {
+        let invocation = ToolInvocation::new(self.context_for(tool_call_id));
+        match &self.user_interaction {
+            Some(bridge) => invocation.with_user_interaction(Arc::clone(bridge)),
+            None => invocation,
         }
     }
 }
@@ -154,7 +202,9 @@ impl AgentToolRegistry for PluginToolRegistry {
         };
 
         let provider_call_id = call.id.clone();
-        let result = plugin.invoke(self.context_for(call_id), call.input).await;
+        let result = plugin
+            .invoke_with_context(self.invocation_for(call_id), call.input)
+            .await;
         Ok(ToolResponse {
             tool_call_id: provider_call_id,
             content: result.content().to_vec(),
