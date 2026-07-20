@@ -293,6 +293,42 @@ pub struct SessionInfo {
     pub id: SessionId,
     /// Configuration the session was created with.
     pub config: SessionConfig,
+    /// User-facing title derived from the first user message, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Last activity timestamp using the service's Unix-epoch millisecond convention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_active_at: Option<u64>,
+    /// Current live status of the session.
+    #[serde(default)]
+    pub status: SessionStatusWire,
+}
+
+impl SessionInfo {
+    /// Builds a session listing entry with default optional metadata.
+    #[must_use]
+    pub fn new(id: SessionId, config: SessionConfig) -> Self {
+        Self {
+            id,
+            config,
+            title: None,
+            last_active_at: None,
+            status: SessionStatusWire::Idle,
+        }
+    }
+}
+
+/// Wire status for a listed session.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStatusWire {
+    /// No run is currently active and no interaction is waiting.
+    #[default]
+    Idle,
+    /// A run is in progress.
+    Running,
+    /// The active run is parked waiting for an interaction response.
+    AwaitingInteraction,
 }
 
 /// Neutral, serializable event produced by a [`MagService`] and observed through
@@ -796,6 +832,36 @@ mod tests {
             let mut events = service.subscribe(Some(id));
             assert!(events.next().await.is_none());
         });
+    }
+
+    #[test]
+    fn session_info_legacy_json_defaults_new_metadata() {
+        let legacy = json!({
+            "id": session_id(),
+            "config": config(),
+        });
+
+        let decoded = serde_json::from_value::<SessionInfo>(legacy)
+            .expect("legacy SessionInfo without web metadata");
+
+        assert_eq!(decoded, SessionInfo::new(session_id(), config()));
+    }
+
+    #[test]
+    fn session_info_metadata_round_trips_with_stable_status_tags() {
+        let mut info = SessionInfo::new(session_id(), config());
+        info.title = Some("first prompt".to_owned());
+        info.last_active_at = Some(1_721_234_567_890);
+        info.status = SessionStatusWire::AwaitingInteraction;
+
+        let json = serde_json::to_value(&info).expect("serialize SessionInfo");
+        assert_eq!(
+            json.get("status"),
+            Some(&Value::String("awaiting_interaction".to_owned()))
+        );
+
+        let decoded = serde_json::from_value::<SessionInfo>(json).expect("deserialize SessionInfo");
+        assert_eq!(decoded, info);
     }
 
     fn assert_round_trip(value: ServiceEvent, expected_tag: &str) {

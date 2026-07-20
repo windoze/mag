@@ -119,7 +119,7 @@
 - 已检查 `Command` 消费点：仓内仍无 `mag_service::Command` dispatcher 消费点；无需同步执行分发。
 - 验证通过：`cargo test -p mag-service`、`cargo test -p mag-core get_session_history_restores_messages_tools_and_delegations_after_restart`、`cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`、`cargo doc --no-deps --workspace`。
 
-### W1-3 [TODO] `SessionInfo` 增强（P4）
+### W1-3 [DONE] `SessionInfo` 增强（P4）
 
 - **上下文**：`docs/WEB.md` §3 P4。左栏需要标题/时间/状态。
 - **实现要求**：`SessionInfo` 补 `#[serde(default)]` 字段：`title`（首条 user message 截断，无则
@@ -128,6 +128,14 @@
   在 list_sessions 填充真实值（Engine 内有 run/交互状态）；旧 JSON 兼容单测。
 - **验证条件**：`cargo test -p mag-service` + mag-core 聚焦（running/awaiting 状态断言）；
   默认验证序列全过。
+
+完成记录（2026-07-21）：
+
+- `SessionInfo` 向后兼容新增 `title: Option<String>`、`last_active_at: Option<u64>`、`status: SessionStatusWire`，旧 JSON 缺字段默认解码为 `None`/`Idle`；新增 `SessionStatusWire::{Idle,Running,AwaitingInteraction}` snake_case wire 枚举。
+- `mag-core` 的 `list_sessions` 以持久化 session 列表为源，填充创建/提交时间作为 `last_active_at`；从最新 committed snapshot 的首条 user message 派生标题；对 live actor 叠加 running/awaiting interaction 状态和未提交首条 user message 标题。
+- `SessionManager` 新增只读 runtime metadata 投影，actor 在 run start/terminal/interaction response 时维护活动时间与运行状态，approval pending map 用于判定 `AwaitingInteraction`。
+- 测试覆盖：`mag-service` 旧 `SessionInfo` JSON 兼容与新字段 roundtrip；`mag-core` running 状态、awaiting interaction 状态、持久化标题/活动时间断言。
+- 验证通过：`cargo fmt --all`、`cargo test -p mag-service`、`cargo test -p mag-core list_sessions_reports_running_status_and_live_title`、`cargo test -p mag-core gated_tool_pauses_then_runs_after_approve`、`cargo test -p mag-core committed_run_persists_a_snapshot_to_the_store`、`cargo clippy --all-targets -- -D warnings`、`cargo fmt --all -- --check`、`cargo test --workspace`、`cargo doc --no-deps --workspace`。
 
 ### W1-4 [TODO] ts-rs 生成管线 + `@mag/protocol`
 

@@ -10,7 +10,7 @@ use std::{
     },
 };
 
-use agent_lib::client::LlmClient;
+use agent_lib::{client::LlmClient, facade::AgentSnapshot};
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
 use mag_config::{ConfigError, ConfigSnapshot, ResolvedExternalAgent, ResolvedProvider};
@@ -28,7 +28,7 @@ use crate::{
     config::ConfigService,
     history::entries_from_snapshot,
     persistence::{Persistence, PersistenceError},
-    session::SessionManager,
+    session::{SessionManager, session_title_from_user_text},
     turn_complete::{TurnCompleteHub, TurnCompleteListener},
 };
 
@@ -233,10 +233,37 @@ impl MagService for Engine {
         // The durable store is the source of truth for known sessions, so the
         // listing includes sessions persisted by an earlier process that have not
         // been resumed yet (`docs/DESIGN.md` §3.6).
-        self.inner
+        let mut sessions = self
+            .inner
             .store
             .list_sessions()
-            .map_err(persistence_backend)
+            .map_err(persistence_backend)?;
+        let live = self.inner.manager.runtime_infos();
+
+        for session in &mut sessions {
+            if session.title.is_none()
+                && let Some(snapshot) = self
+                    .inner
+                    .store
+                    .load_snapshot(session.id)
+                    .map_err(persistence_backend)?
+            {
+                session.title = session_title_from_snapshot(&snapshot)?;
+            }
+
+            if let Some(info) = live.get(&session.id) {
+                if session.title.is_none() {
+                    session.title.clone_from(&info.title);
+                }
+                session.last_active_at = match (session.last_active_at, info.last_active_at) {
+                    (Some(stored), Some(runtime)) => Some(stored.max(runtime)),
+                    (stored, runtime) => stored.or(runtime),
+                };
+                session.status = info.status;
+            }
+        }
+
+        Ok(sessions)
     }
 
     async fn resume_session(&self, id: SessionId) -> Result<(), ServiceError> {
@@ -624,6 +651,16 @@ fn persistence_backend(error: PersistenceError) -> ServiceError {
     ServiceError::Backend {
         message: error.to_string(),
     }
+}
+
+/// Derives the list-session title from the first committed user message.
+fn session_title_from_snapshot(snapshot: &AgentSnapshot) -> Result<Option<String>, ServiceError> {
+    for entry in entries_from_snapshot(snapshot)? {
+        if let HistoryEntry::UserMessage { text, .. } = entry {
+            return Ok(session_title_from_user_text(&text));
+        }
+    }
+    Ok(None)
 }
 
 /// Maps a [`ConfigError`] into the service-level [`ServiceError::Config`].
@@ -1603,7 +1640,10 @@ mod session {
 
     use agent_lib::{client::LlmClient, model::usage::Usage};
     use futures::stream::BoxStream;
-    use mag_service::{MagService, RoutingMode, ServiceEvent, SessionConfig, SessionId, UserInput};
+    use mag_service::{
+        MagService, RoutingMode, ServiceEvent, SessionConfig, SessionId, SessionStatusWire,
+        UserInput,
+    };
     use tokio::time::{Duration, timeout};
 
     use crate::test_support::{
@@ -1739,6 +1779,43 @@ mod session {
     }
 
     #[tokio::test]
+    async fn list_sessions_reports_running_status_and_live_title() {
+        let fake = FakeLlmClient::scripted_streams(vec![stalling_text_stream(&["wait"])]);
+        let engine = engine_with_fake(fake);
+        let session = create_session(&engine, "fake-running").await;
+        let mut events = engine.subscribe(Some(session));
+
+        let run_id = engine
+            .send_message(session, UserInput::text("summarize the workspace"))
+            .await
+            .expect("send message");
+        assert!(matches!(
+            next_event(&mut events).await,
+            ServiceEvent::RunStarted { id, run_id: started } if id == session && started == run_id
+        ));
+        assert!(matches!(
+            next_event(&mut events).await,
+            ServiceEvent::TextDelta { id, text } if id == session && text == "wait"
+        ));
+
+        let listed = engine.list_sessions().await.expect("list sessions");
+        let info = listed
+            .iter()
+            .find(|info| info.id == session)
+            .expect("session is listed");
+
+        assert_eq!(info.status, SessionStatusWire::Running);
+        assert_eq!(info.title.as_deref(), Some("summarize the workspace"));
+        assert!(info.last_active_at.is_some());
+
+        engine.cancel(session).await.expect("cancel stalled run");
+        assert!(matches!(
+            next_event(&mut events).await,
+            ServiceEvent::RunError { id, .. } if id == session
+        ));
+    }
+
+    #[tokio::test]
     async fn cancel_mid_run_terminates_and_session_stays_usable() {
         let fake = FakeLlmClient::scripted_streams(vec![
             // Session S's first run stalls after one delta so a cancel can land.
@@ -1834,7 +1911,8 @@ mod tool_turn {
     use futures::stream::BoxStream;
     use mag_service::{
         ApprovalDecisionWire, InteractionKindWire, InteractionResponseWire, MagService,
-        RoutingMode, ServiceEvent, SessionConfig, SessionId, StepIdWire, ToolCallIdWire, UserInput,
+        RoutingMode, ServiceEvent, SessionConfig, SessionId, SessionStatusWire, StepIdWire,
+        ToolCallIdWire, UserInput,
     };
     use mag_tools::{PermissionSpec, ToolCategory, ToolPlugin, ToolRegistry, ToolRisk};
     use serde_json::{Value, json};
@@ -1999,6 +2077,14 @@ mod tool_turn {
             other => panic!("expected interaction_requested, got {other:?}"),
         };
 
+        let listed = engine.list_sessions().await.expect("list sessions");
+        let info = listed
+            .iter()
+            .find(|info| info.id == session)
+            .expect("session is listed");
+        assert_eq!(info.status, SessionStatusWire::AwaitingInteraction);
+        assert_eq!(info.title.as_deref(), Some("run shell"));
+
         engine
             .respond_interaction(session, request_id, approval(ApprovalDecisionWire::Approve))
             .await
@@ -2156,7 +2242,7 @@ mod persist {
     use mag_service::{
         ApprovalDecisionWire, DelegationStatusWire, HistoryEntry, InteractionKindWire,
         InteractionResponseWire, MagService, RoutingMode, ServiceEvent, SessionConfig, SessionId,
-        StepIdWire, ToolCallIdWire, ToolStatusWire, UserInput,
+        SessionStatusWire, StepIdWire, ToolCallIdWire, ToolStatusWire, UserInput,
     };
     use mag_sources::SourceRegistry;
     use mag_tools::{PermissionSpec, ToolCategory, ToolPlugin, ToolRegistry, ToolRisk};
@@ -2368,6 +2454,16 @@ mod persist {
         let mut events = engine.subscribe(Some(session));
 
         // Before any run there is no snapshot; a committed run writes one.
+        let before = engine.list_sessions().await.expect("list sessions");
+        let before_info = before
+            .iter()
+            .find(|info| info.id == session)
+            .expect("created session is listed");
+        assert!(before_info.title.is_none());
+        assert_eq!(before_info.status, SessionStatusWire::Idle);
+        let created_at = before_info
+            .last_active_at
+            .expect("created sessions carry an activity timestamp");
         assert!(
             engine
                 .inner
@@ -2379,6 +2475,17 @@ mod persist {
         );
 
         run_message(&engine, session, &mut events, "hello").await;
+
+        let after = engine.list_sessions().await.expect("list sessions");
+        let after_info = after
+            .iter()
+            .find(|info| info.id == session)
+            .expect("created session is listed");
+        assert_eq!(after_info.title.as_deref(), Some("hello"));
+        assert!(
+            after_info.last_active_at.expect("activity timestamp") >= created_at,
+            "last_active_at must not move backwards: before={before_info:?}, after={after_info:?}",
+        );
 
         assert!(
             engine

@@ -20,14 +20,16 @@ use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex, PoisonError},
     thread,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use agent_lib::{
     client::LlmClient,
-    facade::{AgentSnapshot, CancelHandle, FacadeError},
+    facade::{AgentSnapshot, CancelHandle},
 };
 use mag_service::{
     Event, InteractionResponseWire, RequestId, RunId, ServiceError, SessionConfig, SessionId,
+    SessionStatusWire,
 };
 use mag_tools::ToolRegistry;
 use tokio::{
@@ -56,6 +58,25 @@ use crate::{
 /// standard-library mutex.
 fn lock_recovering<'a, T>(mutex: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+const SESSION_TITLE_MAX_CHARS: usize = 80;
+
+/// Derives a compact sidebar title from a user message.
+pub(crate) fn session_title_from_user_text(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().take(SESSION_TITLE_MAX_CHARS).collect())
+}
+
+/// Milliseconds since the Unix epoch, matching the persistence timestamp unit.
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 /// A command delivered to a single session's actor.
@@ -109,6 +130,57 @@ enum DriverState {
     Failed(String),
 }
 
+/// Live metadata maintained by a session actor for `list_sessions` projection.
+#[derive(Clone, Debug)]
+pub(crate) struct SessionRuntimeInfo {
+    /// Title derived from the first user message observed by the live actor.
+    pub(crate) title: Option<String>,
+    /// Last actor-observed activity timestamp in Unix-epoch milliseconds.
+    pub(crate) last_active_at: Option<u64>,
+    /// Live run status, before the approval pending overlay is applied.
+    pub(crate) status: SessionStatusWire,
+}
+
+impl Default for SessionRuntimeInfo {
+    fn default() -> Self {
+        Self {
+            title: None,
+            last_active_at: None,
+            status: SessionStatusWire::Idle,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SessionRuntimeState {
+    info: Mutex<SessionRuntimeInfo>,
+}
+
+impl SessionRuntimeState {
+    fn snapshot(&self) -> SessionRuntimeInfo {
+        lock_recovering(&self.info).clone()
+    }
+
+    fn mark_run_started(&self, text: &str) {
+        let mut info = lock_recovering(&self.info);
+        if info.title.is_none() {
+            info.title = session_title_from_user_text(text);
+        }
+        info.last_active_at = Some(now_millis());
+        info.status = SessionStatusWire::Running;
+    }
+
+    fn mark_activity(&self) {
+        lock_recovering(&self.info).last_active_at = Some(now_millis());
+    }
+
+    fn mark_idle(&self) {
+        let mut info = lock_recovering(&self.info);
+        info.last_active_at = Some(now_millis());
+        info.status = SessionStatusWire::Idle;
+    }
+}
+
 /// One session's actor: owns the driver and serializes the session's commands.
 struct SessionActor {
     session_id: SessionId,
@@ -117,6 +189,8 @@ struct SessionActor {
     /// Shared approval handler: injected into the driver's agent and used here to
     /// resolve `RespondInteraction` commands (`docs/DESIGN.md` §3.3).
     approval: Arc<IpcApproval>,
+    /// Shared live metadata read by `SessionManager::runtime_infos`.
+    runtime: Arc<SessionRuntimeState>,
     /// Durable store: each committed run writes its snapshot here (`docs/DESIGN.md`
     /// §3.6).
     store: Arc<Persistence>,
@@ -144,44 +218,6 @@ struct SessionActor {
 }
 
 impl SessionActor {
-    /// Builds an actor from a freshly created (or failed) driver.
-    ///
-    /// `applied_generation` is the config-apply generation read synchronously
-    /// when the actor was spawned (`docs/CLI.md` §4.4): a session created
-    /// after an `apply_config` counts as up-to-date, while a session whose
-    /// spawn raced the bump still honors the `ApplyConfig` command carrying
-    /// that generation.
-    fn new(
-        session_id: SessionId,
-        events: EventBus,
-        driver: Result<SessionDriver, FacadeError>,
-        approval: Arc<IpcApproval>,
-        store: Arc<Persistence>,
-        config_apply: Option<ConfigApplyState>,
-        applied_generation: u64,
-    ) -> Self {
-        let (run_done_tx, run_done_rx) = mpsc::unbounded_channel();
-        let state = match driver {
-            Ok(driver) => DriverState::Idle(Box::new(driver)),
-            Err(error) => DriverState::Failed(error.to_string()),
-        };
-        Self {
-            session_id,
-            events,
-            state,
-            approval,
-            store,
-            cancel: None,
-            pivots: None,
-            deferred: VecDeque::new(),
-            run_done_tx,
-            run_done_rx,
-            config_apply,
-            pending_apply: None,
-            applied_generation,
-        }
-    }
-
     /// Runs the actor loop until its command channel closes.
     ///
     /// The loop interleaves fresh commands with the reclaimed driver from a
@@ -226,6 +262,7 @@ impl SessionActor {
                     }
                     self.state = DriverState::Idle(driver);
                     self.cancel = None;
+                    self.runtime.mark_idle();
                     // Turn boundary: land a pending config apply *before* any
                     // deferred command starts the next run (`docs/CLI.md`
                     // §4.4: the actor checks between runs).
@@ -284,7 +321,11 @@ impl SessionActor {
                 response,
                 reply,
             } => {
-                let _ = reply.send(self.approval.respond(request_id, response));
+                let result = self.approval.respond(request_id, response);
+                if result.is_ok() {
+                    self.runtime.mark_activity();
+                }
+                let _ = reply.send(result);
             }
             SessionCommand::ApplyConfig(apply) => self.apply_config_for(apply),
         }
@@ -359,6 +400,7 @@ impl SessionActor {
         };
 
         let run_id = driver.next_run_id();
+        self.runtime.mark_run_started(&text);
         let _ = self.events.emit(Event::RunStarted {
             id: self.session_id,
             run_id,
@@ -404,6 +446,8 @@ fn session_thread(
     event_bus: EventBus,
     store: Arc<Persistence>,
     restore: Option<AgentSnapshot>,
+    approval: Arc<IpcApproval>,
+    runtime_state: Arc<SessionRuntimeState>,
     config_apply: Option<ConfigApplyState>,
     applied_generation: u64,
     turn_complete: TurnCompleteHub,
@@ -418,11 +462,6 @@ fn session_thread(
     let local = LocalSet::new();
     // Shared approval handler bridges the driver's paused interactions to the
     // event bus and back through `RespondInteraction` (`docs/DESIGN.md` §3.3).
-    let approval = Arc::new(IpcApproval::new(
-        session_id,
-        event_bus.clone(),
-        Arc::new(AskFrontendDecider),
-    ));
     let driver = match restore {
         Some(snapshot) => SessionDriver::restore(
             &config,
@@ -445,15 +484,27 @@ fn session_thread(
             &overrides,
         ),
     };
-    let actor = SessionActor::new(
+    let (run_done_tx, run_done_rx) = mpsc::unbounded_channel();
+    let state = match driver {
+        Ok(driver) => DriverState::Idle(Box::new(driver)),
+        Err(error) => DriverState::Failed(error.to_string()),
+    };
+    let actor = SessionActor {
         session_id,
-        event_bus,
-        driver,
+        events: event_bus,
+        state,
         approval,
+        runtime: runtime_state,
         store,
+        cancel: None,
+        pivots: None,
+        deferred: VecDeque::new(),
+        run_done_tx,
+        run_done_rx,
         config_apply,
+        pending_apply: None,
         applied_generation,
-    );
+    };
     local.block_on(&runtime, actor.run(commands));
 }
 
@@ -461,6 +512,10 @@ fn session_thread(
 struct SessionHandle {
     /// Entry point for the session's actor commands.
     commands: mpsc::UnboundedSender<SessionCommand>,
+    /// Approval bridge shared with the actor, used to detect parked interactions.
+    approval: Arc<IpcApproval>,
+    /// Live metadata shared with the actor.
+    runtime: Arc<SessionRuntimeState>,
     /// The actor thread, joined when the session is deleted or the manager drops.
     thread: thread::JoinHandle<()>,
 }
@@ -560,6 +615,12 @@ impl SessionManager {
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let event_bus = self.event_bus.clone();
         let store = self.store.clone();
+        let approval = Arc::new(IpcApproval::new(
+            session_id,
+            event_bus.clone(),
+            Arc::new(AskFrontendDecider),
+        ));
+        let runtime = Arc::new(SessionRuntimeState::default());
         let config_apply = self.config_apply.clone();
         let turn_complete = self.turn_complete.clone();
         let snapshot = config_apply.as_ref().map(|state| state.service().current());
@@ -577,6 +638,8 @@ impl SessionManager {
             .and_then(ConfigApplyState::pending)
             .map_or(0, |apply| apply.generation());
         let commands_tx_for_race = commands_tx.clone();
+        let approval_for_thread = approval.clone();
+        let runtime_for_thread = runtime.clone();
         let thread = thread::Builder::new()
             .name(format!("mag-session-{session_id}"))
             .spawn(move || {
@@ -588,6 +651,8 @@ impl SessionManager {
                     event_bus,
                     store,
                     restore,
+                    approval_for_thread,
+                    runtime_for_thread,
                     config_apply,
                     applied_generation,
                     turn_complete,
@@ -601,6 +666,8 @@ impl SessionManager {
             session_id,
             SessionHandle {
                 commands: commands_tx,
+                approval,
+                runtime,
                 thread,
             },
         );
@@ -742,6 +809,20 @@ impl SessionManager {
             drop(handle.commands);
             let _ = handle.thread.join();
         }
+    }
+
+    /// Returns live metadata for every actor currently hosted by this manager.
+    pub(crate) fn runtime_infos(&self) -> HashMap<SessionId, SessionRuntimeInfo> {
+        lock_recovering(&self.handles)
+            .iter()
+            .map(|(session_id, handle)| {
+                let mut info = handle.runtime.snapshot();
+                if handle.approval.has_pending() {
+                    info.status = SessionStatusWire::AwaitingInteraction;
+                }
+                (*session_id, info)
+            })
+            .collect()
     }
 
     /// Clones the command sender for `session_id`, if an actor exists.

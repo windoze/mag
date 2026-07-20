@@ -28,7 +28,9 @@ use uuid::Uuid;
 mod service;
 
 pub use mag_config::ConfigDto;
-pub use service::{MagService, ServiceError, ServiceEvent, SessionInfo, UserInput};
+pub use service::{
+    MagService, ServiceError, ServiceEvent, SessionInfo, SessionStatusWire, UserInput,
+};
 
 macro_rules! define_id {
     ($(#[$meta:meta])* $name:ident) => {

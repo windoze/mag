@@ -221,21 +221,30 @@ impl Persistence {
     /// config cannot be parsed.
     pub(crate) fn list_sessions(&self) -> Result<Vec<SessionInfo>, PersistenceError> {
         let connection = lock_recovering(&self.connection);
-        let mut statement =
-            connection.prepare("SELECT id, config_json FROM sessions ORDER BY created_at, id")?;
+        let mut statement = connection.prepare(
+            "SELECT sessions.id, sessions.config_json, sessions.created_at, snapshots.committed_at
+             FROM sessions
+             LEFT JOIN snapshots ON snapshots.session_id = sessions.id
+             ORDER BY sessions.created_at, sessions.id",
+        )?;
         let rows = statement.query_map([], |row| {
             let id: String = row.get(0)?;
             let config_json: String = row.get(1)?;
-            Ok((id, config_json))
+            let created_at: i64 = row.get(2)?;
+            let committed_at: Option<i64> = row.get(3)?;
+            Ok((id, config_json, created_at, committed_at))
         })?;
 
         let mut sessions = Vec::new();
         for row in rows {
-            let (id, config_json) = row?;
+            let (id, config_json, created_at, committed_at) = row?;
             let id = SessionId::parse_str(&id)
                 .map_err(|_| PersistenceError::InvalidSessionId(id.clone()))?;
             let config = serde_json::from_str(&config_json)?;
-            sessions.push(SessionInfo { id, config });
+            let mut info = SessionInfo::new(id, config);
+            let last_active_at = committed_at.unwrap_or(created_at).max(created_at);
+            info.last_active_at = Some(u64::try_from(last_active_at).unwrap_or(0));
+            sessions.push(info);
         }
         Ok(sessions)
     }

@@ -327,14 +327,14 @@ impl MagService for ScriptedService {
     async fn list_sessions(&self) -> Result<Vec<SessionInfo>, ServiceError> {
         *self.list_sessions_calls.lock().expect("lock") += 1;
         Ok(vec![
-            SessionInfo {
-                id: SessionId::parse_str(SESSION_A).expect("valid session id"),
-                config: scripted_session_config("openai", "gpt-5-codex"),
-            },
-            SessionInfo {
-                id: SessionId::parse_str(SESSION_B).expect("valid session id"),
-                config: scripted_session_config("anthropic", "claude-sonnet"),
-            },
+            SessionInfo::new(
+                SessionId::parse_str(SESSION_A).expect("valid session id"),
+                scripted_session_config("openai", "gpt-5-codex"),
+            ),
+            SessionInfo::new(
+                SessionId::parse_str(SESSION_B).expect("valid session id"),
+                scripted_session_config("anthropic", "claude-sonnet"),
+            ),
         ])
     }
 

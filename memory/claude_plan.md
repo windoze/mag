@@ -1,35 +1,26 @@
-# Execution Plan
+# 执行计划
 
-This file records the externally reviewable plan and progress for the current invocation. It avoids private chain-of-thought and focuses on concrete steps, decisions, and validation status.
+本文件记录本次调用的可公开执行计划与进度。不会记录私有推理过程。
 
-## Current Objective
+## 初始计划
 
-- Follow `TODO.md` as the authoritative task list.
-- Complete `W1-2 [DONE] get_session_history + HistoryEntry`, the first task whose heading was not prefixed with `[DONE]` at invocation start.
-- Stop after committing that task or, if blocked, after recording the minimum required prerequisite task and committing that bookkeeping.
+1. 读取 `TODO.md`，按文档顺序识别第一个标题未以 `[DONE]` 开头的任务。
+2. 检查该任务的要求、依赖、验证方式和完成记录；必要时查看最新提交是否明确提到与该任务直接相关的未完成问题。
+3. 在不做开放式历史问题清扫的前提下，收集完成当前任务所需的最小代码上下文。
+4. 实现当前任务；若遇到阻塞当前任务的规格不匹配或缺失前置条件，则将最小必要前置任务插入 `TODO.md`，提交后停止。
+5. 按要求运行格式化、lint 和相关测试；若观察到未被排期的失败测试，修复或在 `TODO.md` 中排期到当前任务完成之前。
+6. 任务完成后，在 `TODO.md` 中将任务标题加上 `[DONE]` 并更新完成记录；仅当阶段计划实际变化时才更新 `PLAN.md`。
+7. 检查 git 状态和差异，提交本次任务相关全部变更，然后停止，不继续下一个任务。
 
-## Step-by-Step Plan
+## 进度
 
-1. Read `TODO.md` and identify the first incomplete task by heading prefix.
-2. Check the latest commit message for any explicitly unfinished issue directly relevant to that selected task.
-3. Read the selected task details, dependencies, validation requirements, and completion record.
-4. Inspect only the code and documentation needed to implement the selected task correctly.
-5. Make the smallest complete implementation changes required by the task, without workarounds or scope narrowing.
-6. Run formatting first, then linting, then the relevant or full tests required by the task and repository policy.
-7. If tests reveal unscheduled failures, either fix them if in scope or add the minimum prerequisite/follow-up task before marking the selected task done.
-8. Update `TODO.md` by prefixing the completed task heading with `[DONE]` and filling in its completion record.
-9. Update this file when key steps complete or the plan changes.
-10. Review `git status`, `git diff`, and recent commit history, then commit all task-related changes with a clear task-specific message.
-
-## Progress Log
-
-- Started invocation and recorded the initial execution plan.
-- Read `TODO.md`; selected `W1-2 [TODO] get_session_history + HistoryEntry` as the only task for this invocation.
-- Checked latest commit `149dffb [W1-1] Add service command variants and error kinds`; it does not mention an unfinished issue that blocks W1-2.
-- Inspected `mag-service`, `mag-core`, and the sibling `agent-lib` snapshot/conversation APIs. `AgentSnapshot.supervisor` can be restored through the public `Conversation::restore` API, so history projection can use validated turns/messages instead of private JSON parsing.
-- Found a W1-2-relevant contract gap: `HistoryEntry::Delegation` has no event variant to carry terminal state, while the existing `DelegationTrace` lacks status/usage. The implementation will add backward-compatible trace fields and map event/history terminal status explicitly.
-- Implemented the service contract changes: `HistoryEntry`, `Command::GetSessionHistory`, `MagService::get_session_history`, and `DelegationStatusWire` plus optional delegation usage.
-- Implemented `mag-core` history projection from restored `AgentSnapshot.supervisor` conversation turns, including terminal tool call and delegation entries.
-- Added a focused persistence test that drives a tool turn and a delegation turn, restarts/resumes the session, then asserts restored history order and serde roundtrip.
-- Validation passed: `cargo test -p mag-service`, `cargo test -p mag-core get_session_history_restores_messages_tools_and_delegations_after_restart`, `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace`, and `cargo doc --no-deps --workspace`.
-- Updated `TODO.md` to mark W1-2 `[DONE]` and recorded the completion details.
+- 已创建初始执行计划，下一步读取 `TODO.md` 识别当前任务。
+- 已读取 `TODO.md`，本次执行目标确定为首个未完成任务：`W1-3 [TODO] SessionInfo 增强（P4）`。
+- 下一步只检查与 `SessionInfo`、`list_sessions`、运行/交互状态直接相关的实现与最新提交信息，避免开放式历史问题清扫。
+- 已确认最新提交 `[W1-2] Add session history retrieval` 未直接声明 W1-3 的未完成问题。
+- 实施方案：在 `mag-service` 为 `SessionInfo` 向后兼容新增 `title: Option<String>`、`last_active_at: Option<u64>`、`status: SessionStatusWire`；在 `mag-core` 的 `list_sessions` 中以持久化列表为基底，叠加会话历史标题/活跃时间与 live session actor 状态快照。
+- 测试方案：补 `mag-service` 旧 JSON 兼容与新字段 roundtrip；补 `mag-core` running、awaiting interaction、历史标题/时间的聚焦断言，再运行任务要求和默认验证序列。
+- 已完成代码实现与新增聚焦测试，并已运行 `cargo fmt --all`。
+- 下一步运行 `cargo test -p mag-service` 与 mag-core 聚焦测试；若通过，再运行 clippy、workspace test、doc。
+- 验证已通过：`cargo test -p mag-service`、三个 mag-core 聚焦测试、`cargo clippy --all-targets -- -D warnings`、`cargo fmt --all -- --check`、`cargo test --workspace`、`cargo doc --no-deps --workspace`。
+- 已将 `TODO.md` 中 `W1-3` 标记为 `[DONE]` 并补完成记录；下一步检查 git 差异并提交本次任务变更。

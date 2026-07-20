@@ -221,6 +221,11 @@ impl IpcApproval {
             })
     }
 
+    /// Returns whether this session currently has an unanswered interaction.
+    pub(crate) fn has_pending(&self) -> bool {
+        !lock_recovering(&self.pending).is_empty()
+    }
+
     /// Removes a still-pending entry (used when a parked request is cancelled).
     fn discard_pending(&self, request_id: RequestId) {
         lock_recovering(&self.pending).remove(&request_id);
