@@ -996,7 +996,7 @@ GUI/web/CLI 无需感知多个会话通道。
     3) `cargo clippy --all-targets -- -D warnings` ✅ 4) `cargo test --workspace` ✅（全绿，1 ignored
     为既有 zed 联调测试）5) `cargo doc --no-deps --workspace` ✅（0 warning）。
 
-### M4-3 [TODO] 委派审批 + restore 重注册 delegate
+### M4-3 [DONE] 委派审批 + restore 重注册 delegate
 
 - **上下文**：`docs/CLI.md` §5 P7；`ApprovalPolicy::ask_tool("ask_<name>")` 走 IpcApproval
   （`crates/mag-core/src/approval.rs`）；**已知陷阱**：restore 必须重注册全部 delegate，否则审批策略静默
@@ -1009,6 +1009,32 @@ GUI/web/CLI 无需感知多个会话通道。
 - **验证条件**：聚焦测试：(a) 委派触发审批，deny 时 `DelegationFailed`/工具拒绝路径正确；(b) resume 后
   `ask_<name>` 仍出现在 tool surface 且审批策略生效（断言不回落 auto_allow）；(c) approve 后委派正常
   执行。默认验证序列全过。
+
+  **完成记录**（2026-07-20）：
+  - 实现要点：`driver::tool_surface` 在 fresh 与 restore 共用路径中新增默认 delegate start 审批层：
+    对 `SessionBinding` 解析出的全部 local delegate 与 external ACP delegate 统一生成 `ask_<name>`，并在
+    应用 `[tools.<name>].approval` 前先 `ApprovalPolicy::ask_tool("ask_<name>")`。因此委派启动默认经
+    root 会话注入的 `IpcApproval` 发 `InteractionRequested{kind:Approval}`，批准后才执行；显式
+    `[tools.ask_<name>] approval = "allow" | "deny" | "ask"` 仍是最终覆盖。external ACP 的 start gate
+    走 agent-lib drive-layer async parent handler，local delegate start 走普通 tool approval gate；两者共用
+    root `IpcApproval`。
+  - restore 路径：`SessionDriver::restore` 已在 M4-2 路径中按 `binding.delegates()` 与
+    `binding.external_delegates()` 重注册 local + external delegate；本任务补默认 start 审批后，restore 与
+    fresh build 自动共享同一 `tool_surface` 策略，防止 snapshot 中 data-only delegate 恢复为
+    agent-lib 默认 `auto_allow`。新增回归测试证明 resume 后 `ask_researcher` 仍在 tool surface 且先弹审批，
+    不会静默回落 auto_allow。
+  - 测试（全部离线）：新增 4 个 delegation e2e：
+    `delegate_start_denial_does_not_drive_the_local_delegate`（deny 后不驱动 child LLM，supervisor 收到拒绝
+    工具结果后继续）、`delegate_start_approval_allows_the_local_delegate_to_run`（approve 后
+    `DelegationStarted`→`DelegationFinished` 且 child 运行）、
+    `resume_re_registers_local_delegate_and_start_approval_policy`（持久化重启后 tool surface 含
+    `ask_researcher` 且审批仍生效）、`external_acp_delegate_start_approval_runs_only_after_approval`（fake ACP
+    在批准前不收到 prompt，批准后正常 `DelegationStarted`→`DelegationFinished`）。旧 M4-1/M4-2 生命周期测试
+    对 `ask_researcher`/`ask_peer` 显式配置 `allow`，保持原测试焦点。
+  - 门禁结果：1) `cargo fmt --all` ✅ 2) `cargo test -p mag-core delegation` ✅（13 passed）
+    3) `cargo fmt --all -- --check` ✅ 4) `cargo clippy --all-targets -- -D warnings` ✅
+    5) `cargo test --workspace` ✅（全绿，1 ignored 为既有 zed 联调测试）
+    6) `cargo doc --no-deps --workspace` ✅（0 warning）。
 
 ### M4-R [TODO] M4 review
 

@@ -3618,9 +3618,9 @@ mod delegation {
     use async_trait::async_trait;
     use futures::stream::BoxStream;
     use mag_service::{
-        ApprovalDecisionWire, InteractionKindWire, InteractionResponseWire, MagService,
-        RoutingMode, ServiceEvent, SessionConfig, SourceKindWire, StepIdWire, ToolCallIdWire,
-        UserInput,
+        ApprovalDecisionWire, ApprovalRequirementWire, InteractionKindWire,
+        InteractionResponseWire, MagService, RequestId, RoutingMode, ServiceEvent, SessionConfig,
+        SourceKindWire, StepIdWire, ToolCallIdWire, UserInput,
     };
     use mag_tools::{PermissionSpec, ToolCategory, ToolPlugin, ToolRegistry, ToolRisk};
     use serde_json::{Value, json};
@@ -3777,6 +3777,47 @@ mod delegation {
         }
     }
 
+    /// Waits for the next approval interaction and verifies its attribution and
+    /// reason mention the expected delegate start tool.
+    async fn next_approval_request(
+        events: &mut BoxStream<'static, ServiceEvent>,
+        expected_delegate: Option<&str>,
+        reason_fragment: &str,
+    ) -> RequestId {
+        loop {
+            match next_event(events).await {
+                ServiceEvent::InteractionRequested {
+                    request_id,
+                    kind,
+                    origin,
+                    ..
+                } => {
+                    assert_eq!(
+                        origin.delegate.as_deref(),
+                        expected_delegate,
+                        "approval origin matches the expected producer"
+                    );
+                    match kind {
+                        InteractionKindWire::Approval { requirement, .. } => match requirement {
+                            ApprovalRequirementWire::RequireApproval { reason } => {
+                                let reason = reason.unwrap_or_default();
+                                assert!(
+                                    reason.contains(reason_fragment),
+                                    "approval reason `{reason}` mentions `{reason_fragment}`"
+                                );
+                            }
+                            other => panic!("approval should require a decision, got {other:?}"),
+                        },
+                        other => panic!("expected an approval interaction, got {other:?}"),
+                    }
+                    return request_id;
+                }
+                ServiceEvent::RunStarted { .. } | ServiceEvent::DelegationStarted { .. } => {}
+                other => panic!("unexpected event before approval: {other:?}"),
+            }
+        }
+    }
+
     /// Config with a bound `default` entry and one `researcher` delegate
     /// carrying a pinned model, a system prompt, and a narrowed tool list.
     const CONFIG_WITH_RESEARCHER: &str = r#"
@@ -3788,6 +3829,9 @@ model = "model-r"
 system_prompt = "Research thoroughly."
 role = "Researches topics and reports findings."
 tools = ["read_file"]
+
+[tools.ask_researcher]
+approval = "allow"
 "#;
 
     #[cfg(unix)]
@@ -3843,6 +3887,18 @@ done
     }
 
     fn external_acp_config(script: &Path, log: &Path, mode: &str) -> String {
+        external_acp_config_with_start_policy(script, log, mode, Some("allow"))
+    }
+
+    fn external_acp_config_with_start_policy(
+        script: &Path,
+        log: &Path,
+        mode: &str,
+        start_approval: Option<&str>,
+    ) -> String {
+        let start_approval = start_approval
+            .map(|approval| format!("\n[tools.ask_peer]\napproval = \"{approval}\"\n"))
+            .unwrap_or_default();
         format!(
             r#"
 [agents.default]
@@ -3857,12 +3913,13 @@ capabilities = ["streaming", "graceful_shutdown"]
 MAG_FAKE_ACP_LOG = "{}"
 MAG_FAKE_ACP_MODE = "{}"
 MAG_FAKE_ACP_SESSION = "mag-fake-acp-session"
-"#,
+{}"#,
             toml_string(script),
             toml_string(log),
             mode,
             toml_string(log),
             mode,
+            start_approval,
         )
     }
 
@@ -3975,6 +4032,9 @@ model = "model-d"
 [agents.researcher]
 model = "model-r"
 tools = ["shell"]
+
+[tools.ask_researcher]
+approval = "allow"
 "#,
             vec![
                 tool_use_stream("ask_researcher", "del-1", json!({ "task": "inspect" })),
@@ -4059,6 +4119,301 @@ tools = ["shell"]
                 Some(ServiceEvent::RunFinished { output, .. }) if output.text == "final answer"
             ),
             "the run finishes: {rest:?}"
+        );
+    }
+
+    /// M4-3: starting a local delegation is an approval point by default. A
+    /// denied `ask_researcher` call never drives the child agent; the denied tool
+    /// result is instead fed back to the supervisor, which can continue.
+    #[tokio::test]
+    async fn delegate_start_denial_does_not_drive_the_local_delegate() {
+        let (_dir, engine, fake) = engine_with_config(
+            r#"
+[agents.default]
+model = "model-d"
+
+[agents.researcher]
+model = "model-r"
+"#,
+            vec![
+                tool_use_stream("ask_researcher", "del-1", json!({ "task": "inspect" })),
+                text_stream_with_usage(&["delegation denied"], usage()),
+            ],
+        );
+        let session = engine
+            .create_session(session_config("default", "fake-chat"))
+            .await
+            .expect("create session");
+        let mut events = engine.subscribe(Some(session));
+        engine
+            .send_message(session, UserInput::text("inspect"))
+            .await
+            .expect("send message");
+
+        let request_id = next_approval_request(&mut events, None, "ask_researcher").await;
+        engine
+            .respond_interaction(session, request_id, approval(ApprovalDecisionWire::Deny))
+            .await
+            .expect("deny the delegation start");
+
+        let rest = collect_until_terminal(&mut events).await;
+        assert!(
+            !rest.iter().any(|event| matches!(
+                event,
+                ServiceEvent::DelegationStarted { .. }
+                    | ServiceEvent::DelegationFinished { .. }
+                    | ServiceEvent::DelegationFailed { .. }
+            )),
+            "a denied local start is a rejected tool call, not a driven delegation: {rest:?}"
+        );
+        assert!(
+            matches!(
+                rest.last(),
+                Some(ServiceEvent::RunFinished { output, .. }) if output.text == "delegation denied"
+            ),
+            "the supervisor continues after the rejected tool result: {rest:?}"
+        );
+        assert!(
+            fake.chat_requests().is_empty(),
+            "the denied delegate must not consume a child LLM request"
+        );
+    }
+
+    /// M4-3: approving the default start approval lets the local delegate run and
+    /// preserves the existing `DelegationStarted` → `DelegationFinished` mapping.
+    #[tokio::test]
+    async fn delegate_start_approval_allows_the_local_delegate_to_run() {
+        let (_dir, engine, fake) = engine_with_config(
+            r#"
+[agents.default]
+model = "model-d"
+
+[agents.researcher]
+model = "model-r"
+"#,
+            vec![
+                tool_use_stream("ask_researcher", "del-1", json!({ "task": "inspect" })),
+                text_stream_with_usage(&["research summary"], usage()),
+                text_stream_with_usage(&["final answer"], usage()),
+            ],
+        );
+        let session = engine
+            .create_session(session_config("default", "fake-chat"))
+            .await
+            .expect("create session");
+        let mut events = engine.subscribe(Some(session));
+        engine
+            .send_message(session, UserInput::text("inspect"))
+            .await
+            .expect("send message");
+
+        let request_id = next_approval_request(&mut events, None, "ask_researcher").await;
+        engine
+            .respond_interaction(session, request_id, approval(ApprovalDecisionWire::Approve))
+            .await
+            .expect("approve the delegation start");
+
+        let rest = collect_until_terminal(&mut events).await;
+        let started = rest
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    ServiceEvent::DelegationStarted { trace, .. } if trace.delegate == "researcher"
+                )
+            })
+            .expect("a DelegationStarted event");
+        let finished = rest
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    ServiceEvent::DelegationFinished { trace, .. } if trace.delegate == "researcher"
+                )
+            })
+            .expect("a DelegationFinished event");
+        assert!(started < finished, "started precedes finished: {rest:?}");
+        assert!(
+            matches!(
+                rest.last(),
+                Some(ServiceEvent::RunFinished { output, .. }) if output.text == "final answer"
+            ),
+            "the approved delegation finishes the supervisor run: {rest:?}"
+        );
+        assert_eq!(fake.chat_requests().len(), 1, "the child delegate ran once");
+    }
+
+    /// M4-3 restore regression: after a restart, the restored facade must
+    /// re-register the local delegate and its approval policy instead of falling
+    /// back to agent-lib's snapshot default (`auto_allow`).
+    #[tokio::test]
+    async fn resume_re_registers_local_delegate_and_start_approval_policy() {
+        let dir = TempConfigDir::new();
+        let db = dir.0.join("sessions.sqlite");
+        fs::write(
+            dir.config_path(),
+            r#"
+[agents.default]
+model = "model-d"
+
+[agents.researcher]
+model = "model-r"
+"#,
+        )
+        .expect("write config");
+
+        let service1 =
+            Arc::new(ConfigService::load_or_default(dir.config_path()).expect("load config"));
+        let fake1 = FakeLlmClient::scripted(vec![text_stream_with_usage(&["ready"], usage())]);
+        let client1: Arc<dyn LlmClient> = fake1;
+        let engine1 = Engine::assemble(
+            Some(client1),
+            Arc::new(registry()),
+            Arc::new(crate::persistence::Persistence::open(&db).expect("open store")),
+            Some(service1),
+            mag_sources::SourceRegistry::new(),
+        );
+        let session = engine1
+            .create_session(session_config("default", "fake-chat"))
+            .await
+            .expect("create session");
+        let mut events1 = engine1.subscribe(Some(session));
+        engine1
+            .send_message(session, UserInput::text("warm up"))
+            .await
+            .expect("send warmup");
+        collect_until_terminal(&mut events1).await;
+        drop(events1);
+        drop(engine1);
+
+        let service2 =
+            Arc::new(ConfigService::load_or_default(dir.config_path()).expect("reload config"));
+        let fake2 = FakeLlmClient::scripted(vec![
+            tool_use_stream(
+                "ask_researcher",
+                "del-1",
+                json!({ "task": "resume inspect" }),
+            ),
+            text_stream_with_usage(&["research summary"], usage()),
+            text_stream_with_usage(&["resumed final"], usage()),
+        ]);
+        let client2: Arc<dyn LlmClient> = fake2.clone();
+        let engine2 = Engine::assemble(
+            Some(client2),
+            Arc::new(registry()),
+            Arc::new(crate::persistence::Persistence::open(&db).expect("reopen store")),
+            Some(service2),
+            mag_sources::SourceRegistry::new(),
+        );
+        engine2
+            .resume_session(session)
+            .await
+            .expect("resume session");
+        let mut events2 = engine2.subscribe(Some(session));
+        engine2
+            .send_message(session, UserInput::text("after resume"))
+            .await
+            .expect("send after resume");
+
+        let request_id = next_approval_request(&mut events2, None, "ask_researcher").await;
+        let first_request = fake2
+            .stream_requests()
+            .into_iter()
+            .next()
+            .expect("the resumed supervisor made an LLM request");
+        let tool_names: Vec<&str> = first_request
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert!(
+            tool_names.contains(&"ask_researcher"),
+            "the restored tool surface still advertises ask_researcher: {tool_names:?}"
+        );
+        engine2
+            .respond_interaction(session, request_id, approval(ApprovalDecisionWire::Approve))
+            .await
+            .expect("approve restored delegation");
+        let rest = collect_until_terminal(&mut events2).await;
+        assert!(
+            rest.iter().any(|event| matches!(
+                event,
+                ServiceEvent::DelegationFinished { trace, .. } if trace.delegate == "researcher"
+            )),
+            "the restored delegate runs after approval: {rest:?}"
+        );
+        assert_eq!(
+            fake2.chat_requests().len(),
+            1,
+            "the restored child ran once"
+        );
+    }
+
+    /// M4-3 external path: without an explicit `[tools.ask_peer] allow`, a
+    /// managed ACP delegate start first asks the root session. Approval then
+    /// allows the fake ACP process to run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_acp_delegate_start_approval_runs_only_after_approval() {
+        let dir = TempConfigDir::new();
+        let script = fake_acp_script(&dir);
+        let log = dir.0.join("fake-acp-approval.log");
+        let config = external_acp_config_with_start_policy(&script, &log, "success", None);
+        fs::write(dir.config_path(), config).expect("write config");
+        let service =
+            Arc::new(ConfigService::load_or_default(dir.config_path()).expect("load config"));
+        let fake = FakeLlmClient::scripted(vec![
+            tool_use_stream("ask_peer", "del-1", json!({ "task": "inspect" })),
+            text_stream_with_usage(&["final answer"], usage()),
+        ]);
+        let client: Arc<dyn LlmClient> = fake;
+        let engine = Engine::with_config_service(client, registry(), service);
+        let session = engine
+            .create_session(session_config("default", "fake-chat"))
+            .await
+            .expect("create session");
+        let mut events = engine.subscribe(Some(session));
+
+        engine
+            .send_message(session, UserInput::text("delegate externally"))
+            .await
+            .expect("send message");
+        let request_id = next_approval_request(&mut events, Some("peer"), "ask_peer").await;
+        let log_before_approval = fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            !log_before_approval.contains(r#""method":"session/prompt""#),
+            "the ACP process must not receive the prompt before approval: {log_before_approval}"
+        );
+
+        engine
+            .respond_interaction(session, request_id, approval(ApprovalDecisionWire::Approve))
+            .await
+            .expect("approve external start");
+        let collected = collect_until_terminal(&mut events).await;
+        let started = collected
+            .iter()
+            .position(|event| {
+                matches!(event, ServiceEvent::DelegationStarted { trace, .. } if trace.delegate == "peer")
+            })
+            .expect("external DelegationStarted");
+        let finished = collected
+            .iter()
+            .position(|event| {
+                matches!(event, ServiceEvent::DelegationFinished { trace, .. } if trace.delegate == "peer")
+            })
+            .expect("external DelegationFinished");
+        assert!(
+            started < finished,
+            "started precedes finished: {collected:?}"
+        );
+        assert!(
+            matches!(collected.last(), Some(ServiceEvent::RunFinished { output, .. }) if output.text == "final answer"),
+            "the supervisor continues after the approved external summary: {collected:?}"
+        );
+        let log_after_approval = fs::read_to_string(&log).expect("fake ACP log after approval");
+        assert!(
+            log_after_approval.contains(r#""method":"session/prompt""#),
+            "the approved ACP process receives the prompt: {log_after_approval}"
         );
     }
 

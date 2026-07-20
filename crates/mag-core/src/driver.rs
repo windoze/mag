@@ -931,8 +931,12 @@ fn map_wire_event(
 ///    injected [`IpcApproval`](crate::engine::approval::IpcApproval), while a
 ///    permission-free (read-only) plugin stays on the policy default tier
 ///    (`docs/DESIGN.md` §3.2/§3.3).
-/// 4. `overrides`' per-tool tiers (`[tools.<name>].approval`) replace the
-///    derived tier for their tool.
+/// 4. Every registered local or external delegate start tool (`ask_<name>`) is
+///    made an approval point by default (`docs/CLI.md` §5 P7 / TODO M4-3), so
+///    starting a delegation goes through the root session's `IpcApproval`.
+/// 5. `overrides`' per-tool tiers (`[tools.<name>].approval`) replace the
+///    derived tier for their tool, including explicit `ask_<name>` allow/deny
+///    overrides.
 ///
 /// Tier mapping: `ask` → [`ApprovalPolicy::ask_tool`], `allow` →
 /// [`ApprovalPolicy::allow_tool`], `deny` → [`ApprovalPolicy::deny_tool`].
@@ -968,6 +972,7 @@ fn tool_surface(
             }
         }
     }
+    policy = apply_delegate_start_tiers(policy, binding);
     policy = apply_per_tool_tiers(policy, overrides);
     (facade_tools, policy)
 }
@@ -1107,6 +1112,32 @@ fn external_worktree_root() -> std::path::PathBuf {
         "mag-external-worktrees-{}-{unique}",
         std::process::id()
     ))
+}
+
+/// Requires approval before any model-routed delegate start tool (`ask_<name>`)
+/// runs (`docs/CLI.md` §5 P7, TODO M4-3).
+///
+/// This covers both local LLM subagents and managed external ACP agents. The
+/// call happens before [`apply_per_tool_tiers`], so an explicit
+/// `[tools.ask_<name>] approval = "allow" | "deny" | "ask"` entry remains the
+/// final policy for that delegate start.
+fn apply_delegate_start_tiers(
+    mut policy: ApprovalPolicy,
+    binding: &SessionBinding,
+) -> ApprovalPolicy {
+    for delegate in binding.delegates() {
+        policy = policy.ask_tool(delegate_start_tool_name(delegate.name()));
+    }
+    for delegate in binding.external_delegates() {
+        policy = policy.ask_tool(delegate_start_tool_name(delegate.name()));
+    }
+    policy
+}
+
+/// Returns the model-routed delegation tool name synthesized by agent-lib for a
+/// delegate registered as `name`.
+fn delegate_start_tool_name(name: &str) -> String {
+    format!("ask_{name}")
 }
 
 /// Applies the configured `[tools.<name>].approval` tiers on top of `policy`
