@@ -272,7 +272,10 @@ DTO）相关类型加 `#[derive(TS)]`（feature-gated 依赖），`cargo test -p
   （「发送」/「插入 pivot…」）。
 - run 进行中显示 **cancel** 按钮（`POST .../cancel`）；pending 交互时 composer 不阻塞输入，但提示
   有未决交互。
-- 附件：`MessageAttachment` 已在 wire 上，首版 UI 只做最小文件附加（路径文本），富附件留后。
+- 附件：`MessageAttachment` 已在 wire 上，但引擎当前不消费附件（`send_message`/`pivot` 只取文本、
+  history 的 attachments 恒空，CLI 同样未消费）。因此首版 UI **不做附件入口**——发出会被引擎静默
+  丢弃的附件是死功能；待引擎真正消费附件后再加 UI（`@mag/client` store 与 `MessageBubble` 已具备
+  附件载体，届时只需接 composer 入口）。富附件留后。
 - `@` 提及 / 斜杠命令：不做——web 的命令面就是 GUI 元素与 REST 路由（决策 D7）。
 
 ### 5.5 Config 与 Sources 页（Q5 拍板）

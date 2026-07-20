@@ -286,6 +286,7 @@ fn web_serve_options(cli: &Cli) -> mag_web::ServeOptions {
         port: cli.web_port,
         token_policy: web_token_policy(cli),
         static_assets_dir: None,
+        heartbeat_interval: None,
     }
 }
 

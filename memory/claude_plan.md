@@ -1,51 +1,56 @@
-# 执行计划 — W4-R [TODO] W4 review
+# 执行计划 — W5-1 [TODO] 端到端加固 + Storybook 补全
 
-## 任务定义（TODO.md W4-R）
-- 对照 `docs/WEB.md` §5 全节逐项核对 CLI 能力在 web 的呈现覆盖（§0 目标清单）。
-- 检查 origin 归因、pivot 回落、D2 语义文案。
-- 发现问题直接修复并补测试。
-- 验证：`pnpm -r test`/`pnpm -r build` 绿 + 默认验证序列；完成记录逐项列出 §0 清单结论。
-
-## 范围
-- W4-1 (`b2b00ba`) delegation 可视化：client `selectDelegationGroups`、ui `DelegationCard`/`DelegateThreadPanel`、app-web 右栏 drill-down + 折叠。
-- W4-2 (`6e52ab5`) pivot/cancel 完备 + run 状态：pivot 三态系统消息、RunErrorKind 分类渲染、composer 三态、全局 running 列表跨会话跳转。
-- W4-3 (`6603ffc`) ConfigEditor（文本形态）+ Sources 页：TOML 转换、Save/Reload/Apply、secret 引用纪律、D2 生效时机文案、Sources 表格 + Probe。
+## 任务定义（TODO.md W5-1）
+1. 协议级 e2e 补场景（`crates/mag/tests/web_e2e.rs`，真实 Engine + 回环 server）：
+   - SSE 断连重连全量对齐（杀连接→重连→history 对齐无重复无丢失）
+   - 多连接（双标签模拟）各自收全量事件互不干扰
+   - 长 run 中 heartbeat 保活
+2. 前端 e2e：可选 Playwright；若成本高则 scripted store 级覆盖 + 手动联调说明（完成记录注明取舍）。
+   路径：建会话→对话→审批→委派→pivot→cancel→config→sources。
+3. Storybook 视觉态补全：错误态/空态/长会话性能基线（大列表虚拟化视需要，不过度设计）。
+4. 真实浏览器联调 `#[ignore]` 脚本与说明。
+5. 裁决 §5.4「最小文件附加（路径文本）」：要么实现最小路径文本附件 UI，要么修订 `docs/WEB.md`
+   §5.4 移除该承诺；不允许悬空。前提调查：wire `send_message` 是否有 attachments 字段、引擎是否消费。
 
 ## 执行步骤
-1. [x] 读 `docs/WEB.md` §0 目标清单、§5 全节（5.1–5.5）、D2/D5/D6 决策。
-2. [ ] 派 review 子代理并行分块核查（对照 spec 逐项，找 bug 级/偏差级问题）：
-   - 块 A：§5.2/§5.3 delegation + origin 归因（W4-1 diff + store 分组 selector + 徽标）。
-   - 块 B：§5.2/§5.4 pivot 回落（409→send_message）、run 状态条、composer 三态、全局 running 列表（W4-2）。
-   - 块 C：§5.5 ConfigEditor（TOML 转换正确性、Save/Reload/Apply、secret 引用不物化、D2 文案）+ Sources 页（W4-3）。
-   - 块 D：§0 目标清单逐项覆盖核查（§5 全节 vs 实现）。
-3. [ ] 汇总发现；bug 级问题当场修复并补回归测试。
-4. [ ] 验证序列：
-   - `pnpm format` / `pnpm lint` / `pnpm -r test` / `pnpm -r build` / `build-storybook`
-   - `cargo fmt --all -- --check` / `cargo clippy --all-targets -- -D warnings`
-   - 若 Rust 源码零改动（git 实证），`cargo test --workspace`/`cargo doc` 复用最近全绿结果并注明；否则重跑。
-5. [ ] TODO.md：W4-R 标题加 `[DONE]`，完成记录逐项列出 §0 清单结论 + 发现/修复清单。
-6. [ ] 提交（含 memory/claude_plan.md 更新），停止。
-
-## 已知记录在案偏差（review 时复核，不阻塞）
-- W3-R：§5.2「批准/拒绝（+ always）」与 wire 不符（wire 无 always 变体，mag-acp 已拍板）→ 随 F-R 复核文档。
-- W4-1：wire 工具事件无 origin 字段，delegate 内部工具卡无法在 root 事件流归因（D5 origin 仅定义在交互上）→ ToolCallCard origin 徽标渲染已就绪。
-- W4-2 之前各任务完成记录：Rust 源码自 W3-4 (`0fe4985`) 起零改动，cargo 全量测试复用其全绿结果。
+1. [ ] 探索现状：
+   - `crates/mag/tests/web_e2e.rs` 现有 e2e 结构与 SSE 客户端 helper
+   - `crates/mag-web` SSE heartbeat 间隔/测试方式（heartbeat ~15s，e2e 怎么等？）
+   - mag-service wire `send_message`/UserInput 是否含 attachments；mag-core 是否消费
+   - app-web 现有壳级测试覆盖 vs 全路径清单（委派覆盖？）
+   - Storybook 现有 stories 清单（错误态/空态缺口）
+   - `ui/README.md` 手动 smoke 说明现状
+2. [ ] Rust e2e 补三场景（重连对齐 / 多连接 / 长 run heartbeat）。
+3. [ ] 前端：补齐全路径 scripted 覆盖缺口（如有）；Storybook 补错误/空态。
+4. [ ] §5.4 附件裁决并闭环（实现 UI 或修订 WEB.md）。
+5. [ ] 真实浏览器联调说明（`#[ignore]` 或手动脚本）。
+6. [ ] 验证序列：cargo fmt → clippy -D warnings → 聚焦测试 → cargo test --workspace →
+   cargo doc；pnpm format/lint/-r test/-r build/build-storybook。
+7. [ ] TODO.md：W5-1 标记 [DONE] + 完成记录；提交并停止。
 
 ## 进度日志
-- 2026-07-20/21：读取 TODO.md 确认首个未完成任务为 W4-R；已读 docs/WEB.md §0–§10 全文。
-- 4 个 review 子代理已完成分块核查，汇总发现：
-  - **Bug 级（修）**：①replaceHistory 抹掉 delegation 消息（子线程在 resume/reconnect 后变空，client 侧保留消息如同 pendingInteractions）；②pivot 成功无本地用户回声（D6 与 CLI 不一致）；③syncSessionInfos 对 awaiting_interaction 不做 idle 校正；④probeSources/local_agents_probed 用局部列表整体替换导致 provider 行消失（改 merge）；⑤stripUnsupported 丢空数组/空表改变 `tools=[]` 语义；⑥tomlToConfigDto 静默丢弃未知 key（加 client 白名单校验）。
-  - **小修**：pivot 回落条件加 409 校验 + 负分支测试；DelegateThreadPanel 去掉逐消息 origin 徽标（spec 只要求交互/工具卡）；delegationGroups 渲染期直读 mutable store（改 snapshot 派生）；delegation "latest status" 按更新序；ConfigPage Reload 前 dirty 确认；SourcesPage role="alert"；Composer Cancel 无回调不渲染；composer draft 按会话隔离；sidebar 徽标文案 "awaiting-interaction"；ToolCallCard started 态 spinner；config.ts params 类型漂移注释；选中清理 effect 补测试。
-  - **记录在案（不修）**：wire 工具事件无 origin；wire 无 always；delegation 消息不入 history（跨页面加载丢失，wire 限制）；pending 交互在 run 终态后残留（wire 无 resolved 事件）；xl 以下右栏不可达（§0 非目标移动端）；删除确认为 hover 按钮+confirm 两步（满足二次确认意图）；§5.4 最小附件 UI 未做 → 加入 W5-1 范围显式跟踪。
-- 下一步：读相关源码，逐项修复 + 补测试。
-- 2026-07-21 修复完成：config.ts（空数组/表保留、白名单校验、params 注释、TDZ 修正）、
-  store.ts（delegation 消息跨 replace 保留、pivot 本地回声、awaiting idle 校正、probe merge、
-  delegationGroups 入 SessionView snapshot、updatedSeq）、App.tsx（409+kind 双判、per-session
-  草稿、groups 从 snapshot 派生、latest 按更新序）、ui 四组件（逐消息徽标移除/Cancel 条件渲染/
-  started spinner/awaiting-interaction 文案）、ConfigPage dirty confirm、SourcesPage role=alert、
-  ConfigEditor stories 虚构 key 修正。
-- 测试：client 29→36、ui 28→29、app-web 7→11，全绿；`pnpm -r test`/`pnpm -r build`/
-  `build-storybook`/fmt/lint 全过；cargo fmt --check + clippy -D warnings 过；Rust 零改动，
-  workspace 测试/doc 复用 W3-4 (0fe4985) 结果。
-- TODO.md：W4-R 标记 [DONE] 并写完成记录（§0 逐项 + 修复清单 12 项 + 记录在案偏差 7 项）；
-  W5-1 新增 §5.4 附件裁决子项。提交后停止。
+- 2026-07-21：确认首个未完成任务为 W5-1；git 工作区干净，HEAD=e2afc5c（W4-R）。
+- 调查结论：wire `UserInput.attachments` 存在但引擎丢弃（`engine.rs:343` 只取 text，history
+  attachments 恒空，CLI 同样未消费）→ §5.4 裁决为**修订 docs/WEB.md 移除首版附件承诺**（做 UI
+  等于发死功能）；前端壳级测试已覆盖全路径八环；Playwright 不引入（成本高+违离线纪律），
+  取舍记完成记录；heartbeat 通过给 `ServeOptions` 加 `heartbeat_interval: Option<Duration>`
+  公开旋钮（默认 None→15s）供 e2e 加速。
+- 已完成实现：
+  - mag-web：`ServeOptions.heartbeat_interval`；main.rs 与三处测试字面量同步。
+  - web_e2e.rs 新增 3 测试：`reconnects_and_aligns_history_without_loss`（断连→run 完成→
+    history 轮询对齐 exactly-once→重连后新 run 事件正常）、
+    `broadcasts_full_event_stream_to_multiple_connections`（双连接事件序列完全相等）、
+    `keeps_long_runs_alive_with_heartbeat_comments`（200ms heartbeat + stall run + cancel
+    收尾）。修复一处竞态：history 轮询先于新 SSE 订阅，避免吃到第一个 run 的迟到终态事件。
+  - cli.rs 新增 bin 级 web smoke（真实二进制、离线、非 ignored）：401 无 token/错 token、
+    200 对 token、SPA 占位页免 auth。ui/README.md Manual Web Smoke 扩为 7 步并引用该 smoke。
+  - 前端（子代理 + 本人）：ThreadView `LongThread` story（300 条渲染基线，不虚拟化）；
+    App.test.tsx 壳级重连对齐测试；SourcesView 错误行从 app 层下沉为组件 `error` prop
+    （补 `ProbeFailed` story + 组件测试），SourcesPage 同步。
+  - docs/WEB.md §5.4 附件条目修订。
+- 聚焦测试全绿：web_e2e 4/4（0.42s）、cli web_binary（2s）、pnpm 各包（子代理门禁全绿）。
+- 2026-07-21 全量验证序列全绿：cargo fmt --check / clippy -D warnings / cargo test --workspace
+  （唯一 ignored 为既有 ACP 骨架）/ cargo doc；pnpm format / lint / -r test（client 36 + ui 30 +
+  app-web 12）/ -r build / build-storybook。
+- TODO.md：W5-1 标记 [DONE] 并写完成记录（含 Playwright 取舍与 §5.4 附件裁决证据）。提交后停止。
+

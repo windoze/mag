@@ -13,6 +13,8 @@ export interface SourcesViewProps {
   readonly onProbe: () => void;
   /** Disables the Probe button while a probe is in flight. */
   readonly busy?: boolean;
+  /** Last list/probe failure, rendered as an alert row. */
+  readonly error?: string;
   /** Called when the back button is clicked. */
   readonly onBack?: () => void;
   /** Additional class names. */
@@ -23,6 +25,7 @@ export interface SourcesViewProps {
 export function SourcesView({
   busy = false,
   className,
+  error,
   onBack,
   onProbe,
   sources
@@ -44,6 +47,15 @@ export function SourcesView({
           {busy ? "Probing..." : "Probe"}
         </Button>
       </div>
+
+      {error !== undefined ? (
+        <p
+          className="rounded-lg border border-destructive/20 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+          role="alert"
+        >
+          {error}
+        </p>
+      ) : null}
 
       {sources.length === 0 ? (
         <div className="rounded-xl border border-dashed border-border bg-card p-6 text-center text-sm text-muted-foreground">

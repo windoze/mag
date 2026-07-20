@@ -393,6 +393,14 @@ impl Drop for TestServer {
 
 /// Starts `mag-web` with API auth enabled on a loopback listener.
 async fn spawn_web_server(engine: Engine) -> TestServer {
+    spawn_web_server_with_heartbeat(engine, None).await
+}
+
+/// Starts `mag-web` with an explicit SSE heartbeat interval.
+async fn spawn_web_server_with_heartbeat(
+    engine: Engine,
+    heartbeat_interval: Option<Duration>,
+) -> TestServer {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .expect("bind loopback web listener");
@@ -405,6 +413,7 @@ async fn spawn_web_server(engine: Engine) -> TestServer {
             port: 0,
             token_policy: mag_web::TokenPolicy::Provided(WEB_TOKEN.to_owned()),
             static_assets_dir: None,
+            heartbeat_interval,
         },
     )
     .expect("prepare web router");
@@ -598,6 +607,13 @@ impl SseClient {
                 return event;
             }
         }
+    }
+
+    /// Reads the next raw SSE frame, including heartbeat comment frames.
+    async fn next_raw_frame(&mut self) -> String {
+        timeout(Duration::from_secs(5), self.read_frame())
+            .await
+            .expect("SSE frame timed out")
     }
 
     async fn read_frame(&mut self) -> String {
@@ -994,4 +1010,270 @@ async fn web_protocol_e2e_drives_engine_over_http_and_sse() {
             .any(|request| format!("{:?}", request.messages).contains("pivot text")),
         "pivot text entered the follow-up model context: {stream_requests:?}"
     );
+}
+
+/// Creates a session through the REST API and returns its id.
+async fn create_session(server: &TestServer) -> SessionId {
+    let response = http_request(
+        server,
+        "POST",
+        "/api/sessions",
+        Some(serde_json::to_value(session_config()).expect("session config serializes")),
+    )
+    .await;
+    assert_eq!(response.status, 200, "create session response");
+    let created = response_json(&response);
+    SessionId::parse_str(created["id"].as_str().expect("created id is string"))
+        .expect("created id parses")
+}
+
+/// Sends a user message through the REST API.
+async fn post_message(server: &TestServer, session: SessionId, text: &str) {
+    let response = http_request(
+        server,
+        "POST",
+        &format!("/api/sessions/{session}/messages"),
+        Some(serde_json::to_value(UserInput::text(text)).expect("input serializes")),
+    )
+    .await;
+    assert_eq!(response.status, 200, "send message response");
+}
+
+/// Fetches the committed history for a session.
+async fn fetch_history(server: &TestServer, session: SessionId) -> Vec<HistoryEntry> {
+    let response = http_request(
+        server,
+        "GET",
+        &format!("/api/sessions/{session}/history"),
+        None,
+    )
+    .await;
+    assert_eq!(response.status, 200, "history response");
+    serde_json::from_slice(&response.body).expect("history JSON")
+}
+
+/// Polls the history until `predicate` holds or the deadline expires.
+async fn wait_for_history(
+    server: &TestServer,
+    session: SessionId,
+    context: &str,
+    predicate: impl Fn(&[HistoryEntry]) -> bool,
+) -> Vec<HistoryEntry> {
+    for _ in 0..100 {
+        let history = fetch_history(server, session).await;
+        if predicate(&history) {
+            return history;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("timed out waiting for {context}");
+}
+
+/// Counts history entries matching `predicate`.
+fn history_count(history: &[HistoryEntry], predicate: impl Fn(&HistoryEntry) -> bool) -> usize {
+    history.iter().filter(|entry| predicate(entry)).count()
+}
+
+/// Returns whether a raw SSE frame is a heartbeat comment (no data payload).
+fn is_heartbeat_frame(frame: &str) -> bool {
+    !frame.lines().any(|line| line.starts_with("data:"))
+        && frame.lines().any(|line| line.starts_with(':'))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn web_protocol_e2e_reconnects_and_aligns_history_without_loss() {
+    let dir = TempDir::new("reconnect");
+    let hold_gate = Gate::new();
+    let fake = FakeLlmClient::scripted(vec![
+        tool_use_stream("hold", "hold-1", json!({})),
+        text_stream(&["final answer"]),
+        text_stream(&["after reconnect"]),
+    ]);
+    let engine = engine_with_config(&dir, CONFIG, fake.clone(), registry(hold_gate.clone()));
+    let server = spawn_web_server(engine).await;
+    let mut sse = SseClient::connect(&server).await;
+
+    let session = create_session(&server).await;
+    wait_for_event(&mut sse, "session_created", |event| {
+        matches!(
+            event,
+            ServiceEvent::SessionCreated { id, .. } if *id == session
+        )
+    })
+    .await;
+    post_message(&server, session, "hold the run").await;
+    wait_for_event(&mut sse, "hold tool started", |event| {
+        matches!(
+            event,
+            ServiceEvent::ToolStarted { id, trace } if *id == session && trace.name == "hold"
+        )
+    })
+    .await;
+
+    // Drop the connection mid-run; the server does not replay events (§2.2), so
+    // the rest of the run completes unseen by any client.
+    drop(sse);
+    hold_gate.open();
+
+    // Align from the authoritative history: everything the run committed while
+    // disconnected is present exactly once. Polling goes over plain HTTP so no
+    // new subscription can observe the first run's terminal event.
+    let history = wait_for_history(&server, session, "committed run history", |history| {
+        history.iter().any(|entry| {
+            matches!(
+                entry,
+                HistoryEntry::AssistantMessage { text } if text == "final answer"
+            )
+        })
+    })
+    .await;
+    assert_eq!(
+        history_count(&history, |entry| matches!(
+            entry,
+            HistoryEntry::UserMessage { text, .. } if text == "hold the run"
+        )),
+        1,
+        "user message appears exactly once: {history:?}"
+    );
+    assert_eq!(
+        history_count(&history, |entry| matches!(
+            entry,
+            HistoryEntry::ToolCall { trace }
+                if trace.name == "hold" && trace.status == ToolStatusWire::Finished
+        )),
+        1,
+        "tool call appears exactly once in terminal state: {history:?}"
+    );
+    assert_eq!(
+        history_count(&history, |entry| matches!(
+            entry,
+            HistoryEntry::AssistantMessage { text } if text == "final answer"
+        )),
+        1,
+        "assistant reply appears exactly once: {history:?}"
+    );
+
+    // The reconnected connection keeps receiving live events. A late terminal
+    // event of the first run may still land on the new subscription, so match
+    // the second run's events explicitly instead of assuming a clean slate.
+    let mut sse = SseClient::connect(&server).await;
+    post_message(&server, session, "ping after reconnect").await;
+    wait_for_event(&mut sse, "reconnected text delta", |event| {
+        matches!(
+            event,
+            ServiceEvent::TextDelta { id, text } if *id == session && text == "after reconnect"
+        )
+    })
+    .await;
+    wait_for_event(&mut sse, "reconnected run_finished", |event| {
+        matches!(
+            event,
+            ServiceEvent::RunFinished { id, output, .. }
+                if *id == session && output.text == "after reconnect"
+        )
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn web_protocol_e2e_broadcasts_full_event_stream_to_multiple_connections() {
+    let dir = TempDir::new("broadcast");
+    let fake = FakeLlmClient::scripted(vec![text_stream(&["hello both"])]);
+    let engine = engine_with_config(&dir, CONFIG, fake.clone(), registry(Gate::new()));
+    let server = spawn_web_server(engine).await;
+    let mut sse_a = SseClient::connect(&server).await;
+    let mut sse_b = SseClient::connect(&server).await;
+
+    let session = create_session(&server).await;
+    post_message(&server, session, "hi all").await;
+
+    // Each connection carries an independent copy of the full broadcast
+    // sequence (session_created included, since both connected first).
+    let events_a = collect_until_terminal(&mut sse_a, session).await;
+    let events_b = collect_until_terminal(&mut sse_b, session).await;
+    assert_eq!(
+        events_a, events_b,
+        "both connections observe the identical event stream"
+    );
+    for (name, events) in [("a", &events_a), ("b", &events_b)] {
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                ServiceEvent::SessionCreated { id, .. } if *id == session
+            )),
+            "connection {name} sees session_created: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                ServiceEvent::RunStarted { id, .. } if *id == session
+            )),
+            "connection {name} sees run_started: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                ServiceEvent::TextDelta { id, text } if *id == session && text == "hello both"
+            )),
+            "connection {name} sees the text delta: {events:?}"
+        );
+        assert!(
+            matches!(
+                events.last(),
+                Some(ServiceEvent::RunFinished { output, .. }) if output.text == "hello both"
+            ),
+            "connection {name} sees run_finished: {events:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn web_protocol_e2e_keeps_long_runs_alive_with_heartbeat_comments() {
+    let dir = TempDir::new("heartbeat");
+    let fake = FakeLlmClient::scripted(vec![stalling_text_stream(&["working"])]);
+    let engine = engine_with_config(&dir, CONFIG, fake.clone(), registry(Gate::new()));
+    let server = spawn_web_server_with_heartbeat(engine, Some(Duration::from_millis(200))).await;
+    let mut sse = SseClient::connect(&server).await;
+
+    let session = create_session(&server).await;
+    wait_for_event(&mut sse, "session_created", |event| {
+        matches!(
+            event,
+            ServiceEvent::SessionCreated { id, .. } if *id == session
+        )
+    })
+    .await;
+    post_message(&server, session, "long run").await;
+    wait_for_event(&mut sse, "stalled text", |event| {
+        matches!(
+            event,
+            ServiceEvent::TextDelta { id, text } if *id == session && text == "working"
+        )
+    })
+    .await;
+
+    // The run now stalls with no events flowing; heartbeat comments keep the
+    // connection alive instead of the stream going silent.
+    for attempt in 1..=2 {
+        let frame = sse.next_raw_frame().await;
+        assert!(
+            is_heartbeat_frame(&frame),
+            "heartbeat comment #{attempt} while the run is stalled: {frame:?}"
+        );
+    }
+
+    // Cancel the stalled run so the engine shuts down cleanly.
+    let response = http_request(
+        &server,
+        "POST",
+        &format!("/api/sessions/{session}/cancel"),
+        None,
+    )
+    .await;
+    assert_eq!(response.status, 204, "cancel response");
+    wait_for_event(&mut sse, "cancelled run_error", |event| matches!(
+        event,
+        ServiceEvent::RunError { id, kind, .. } if *id == session && *kind == RunErrorKind::Cancelled
+    ))
+    .await;
 }

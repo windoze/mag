@@ -43,7 +43,9 @@ from the repository root and refreshes `packages/protocol/src/generated/`.
 
 ## Manual Web Smoke
 
-The app shell is covered by vitest with a scripted transport. For a real `mag-web`
+The app shell is covered by vitest with a scripted transport. The server half
+(binary startup, bearer-auth gate, SPA placeholder) is covered by the offline
+bin-level smoke `cargo test -p mag --test cli web_binary`. For a real `mag-web`
 smoke against the W2 server, run from the repository root:
 
 ```sh
@@ -52,6 +54,20 @@ npx --yes pnpm@10.14.0 --dir ui -r build
 cargo run -p mag -- --web --host 127.0.0.1 --port 3000
 ```
 
-Open the printed URL, including the `#t=<token>` fragment when auth is enabled.
-Create or select a session, send a message, approve any interaction card, try a
-pivot while a run is active, and press cancel to verify the REST+SSE loop.
+Open the printed URL, including the `#t=<token>` fragment when auth is enabled,
+then walk the full loop:
+
+1. Create a session with **New chat**, send a message, and watch the streamed
+   reply render.
+2. Reload the page, reselect the session from the sidebar to verify resume +
+   history, then delete it with the sidebar delete action.
+3. Approve (or deny) a tool-approval interaction card when one appears.
+4. If a local agent delegate is configured (prerequisite: a probed local agent
+   with the `delegate` capability, e.g. Claude Code), open the delegation card
+   to drill into the sub-thread in the right rail.
+5. While a run is active, try a pivot via **Insert pivot...**, then press
+   **Cancel** to stop the run.
+6. Open **Config** from the sidebar: edit the TOML, **Save**, **Reload**
+   (confirm the dirty-editor prompt), and **Apply**.
+7. Open **Sources** from the sidebar and press **Probe** to re-detect local
+   agents.

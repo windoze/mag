@@ -670,7 +670,7 @@ client 36 + ui 29 + app-web 11 全绿）、`pnpm -r build`、`build-storybook`�
 
 ## Milestone W5 — e2e 加固（`docs/WEB.md` §8）
 
-### W5-1 [TODO] 端到端加固 + Storybook 补全
+### W5-1 [DONE] 端到端加固 + Storybook 补全
 
 - **上下文**：`docs/WEB.md` §8。
 - **实现要求**：
@@ -685,6 +685,44 @@ client 36 + ui 29 + app-web 11 全绿）、`pnpm -r build`、`build-storybook`�
     UI（store/`MessageBubble` 已支持附件载体），要么正式修订 `docs/WEB.md` §5.4 移除该承诺；
     不允许继续悬空。
 - **验证条件**：上述测试全绿；默认验证序列 + `pnpm -r test`/`pnpm -r build` 全绿。
+
+完成记录（2026-07-21）：
+
+- **协议级 e2e 三场景**（`crates/mag/tests/web_e2e.rs`，真实 Engine + 回环 server，全离线）：
+  ①`reconnects_and_aligns_history_without_loss`——SSE 连接在 run 中断开后，run 在无人收听下
+  跑完（§2.2 不重放），经 HTTP 轮询 history 完成全量对齐：user 消息/终态 tool call/assistant
+  回复均 exactly-once 无重复无丢失；重连后的连接继续正常接收新 run 事件（对齐轮询先于新订阅，
+  避开第一个 run 迟到的终态事件竞态）。②`broadcasts_full_event_stream_to_multiple_connections`
+  ——双连接（双标签模拟）收到完全相同的事件序列（含 session_created/run_started/text_delta/
+  run_finished 逐事件相等断言）。③`keeps_long_runs_alive_with_heartbeat_comments`——stall run
+  无事件流动期间连续收到 heartbeat comment 帧，cancel 收尾。为支撑③，`ServeOptions` 向后兼容
+  新增 `heartbeat_interval: Option<Duration>`（默认 None→15s，符合 §2.2「~15s」；部署调优与
+  测试加速共用），bin 传 None 不改变现网行为。
+- **bin 级 web smoke**（`crates/mag/tests/cli.rs`，真实二进制、全离线、非 ignored）：
+  `web_binary_serves_placeholder_and_enforces_bearer_auth` 覆盖无 token/错 token→401、正确
+  token→200、SPA 占位页免 auth。真实浏览器半区为手动联调：`ui/README.md`「Manual Web Smoke」
+  扩为 7 步全路径清单（建会话/流式、恢复/删除、审批、delegation 右栏（注明 delegate 前置）、
+  pivot/cancel、Config 编辑/Save/Reload/Apply、Sources Probe）并引用上述 bin smoke。
+- **前端 e2e 取舍（按任务授权二选一）**：不引入 Playwright——浏览器驱动下载与离线测试纪律冲突、
+  成本高；全路径「建会话→对话→审批→委派→pivot→cancel→config→sources」此前已被壳级 vitest
+  （scripted transport）逐环覆盖，本轮再补壳级 `reconnects after a stream failure and realigns
+  without duplicate bubbles`（SSE 断流→store 自动重连→list_sessions+history 全量对齐→气泡无
+  重复、断流窗口 delta 不残留），叠加既有 client 层重连对齐测试形成双层覆盖；真实浏览器验证走
+  README 手动清单。
+- **Storybook 补全**：`Core/ThreadView` 新增 `LongThread`（程序化 300 条混合消息渲染基线；
+  首版不做虚拟化，story 注释注明取舍，不引入虚拟化库）；`SourcesView` 错误行自 app 层下沉为
+  组件 `error` prop（组件库职责归位），新增 `ProbeFailed` story 与组件测试，`SourcesPage`
+  改为传 prop。其余组件逐一核对 props 后确认现有 stories 已覆盖全部有意义状态（Composer/
+  InteractionCard 无组件层错误态语义，ConfigEditor 已有 SaveError），未为 story 扭曲组件 API。
+- **§5.4 附件裁决（闭环）**：选「修订 spec」。证据：`Engine::send_message`/`pivot_message` 只取
+  `input.text`（engine.rs:343/365），history 的 attachments 恒空，CLI 同样未消费——此时做附件
+  UI 只会发出被引擎静默丢弃的 dead feature。已正式修订 `docs/WEB.md` §5.4：首版 UI 不做附件
+  入口，待引擎真正消费附件后再接（store/`MessageBubble` 附件载体已就绪）。
+- **验证通过**：`cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、
+  聚焦（`cargo test -p mag --test web_e2e` 4/4、`cargo test -p mag --test cli web_binary`）、
+  `cargo test --workspace` 全绿（唯一 ignored 为既有 ACP 真客户端骨架）、
+  `cargo doc --no-deps --workspace`、`pnpm format`/`lint`/`-r test`（protocol 门禁 + client 36 +
+  ui 30 + app-web 12 全绿）、`pnpm -r build`、`build-storybook`。
 
 ### F-R [TODO] 全计划 review
 

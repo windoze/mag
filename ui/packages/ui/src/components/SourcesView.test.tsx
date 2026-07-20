@@ -72,6 +72,20 @@ describe("SourcesView", () => {
     expect(host.querySelectorAll("tbody tr")).toHaveLength(0);
     expect(host.textContent).toContain("No sources yet");
   });
+
+  it("renders a list/probe failure as an alert row", () => {
+    const host = render(
+      <SourcesView
+        error="probe failed: backend unavailable"
+        sources={sources}
+        onProbe={() => undefined}
+      />
+    );
+
+    const alert = host.querySelector('[role="alert"]');
+    expect(alert?.textContent).toContain("probe failed: backend unavailable");
+    expect(host.querySelectorAll("tbody tr")).toHaveLength(2);
+  });
 });
 
 function render(element: ReactElement): HTMLDivElement {

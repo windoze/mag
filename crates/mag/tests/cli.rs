@@ -441,3 +441,118 @@ enabled = false
         "MAG_LOG=info surfaces the info diagnostic: {verbose_stderr}"
     );
 }
+
+/// Picks a currently free loopback port for the web smoke server.
+fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .expect("bind ephemeral port");
+    listener
+        .local_addr()
+        .expect("ephemeral listener has a local address")
+        .port()
+}
+
+/// Sends one HTTP/1.1 GET over a std loopback connection and reads the full
+/// response after the server closes it.
+fn http_get(port: u16, path: &str, token: Option<&str>) -> String {
+    let auth = token
+        .map(|value| format!("Authorization: Bearer {value}\r\n"))
+        .unwrap_or_default();
+    let mut stream = std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+        .expect("connect to the web smoke server");
+    stream
+        .write_all(
+            format!(
+                "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}Connection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .expect("write smoke request");
+    let mut response = Vec::new();
+    std::io::Read::read_to_end(&mut stream, &mut response).expect("read smoke response");
+    String::from_utf8_lossy(&response).into_owned()
+}
+
+/// Bin-level web smoke (`TODO.md` W5-1): the real `mag --web` binary is spawned
+/// fully offline (assembly never calls the provider) and probed over loopback
+/// HTTP for the auth gate and the SPA placeholder. The browser half of the
+/// smoke is the manual checklist in `ui/README.md` (Manual Web Smoke).
+#[test]
+fn web_binary_serves_placeholder_and_enforces_bearer_auth() {
+    let dir = TempDir::new("web");
+    fs::write(
+        dir.config_path(),
+        r#"
+[providers.anthropic]
+wire = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key = { env = "MAG_BIN_WEB_API_KEY" }
+
+[agents.default]
+provider = "anthropic"
+model = "claude-sonnet-4-5"
+"#,
+    )
+    .expect("write web smoke config");
+
+    let port = free_port();
+    let mut child = mag()
+        .arg("--web")
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--token")
+        .arg("web-smoke-token")
+        .arg("--config")
+        .arg(dir.config_path())
+        .env("MAG_BIN_WEB_API_KEY", "sk-bin-web")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mag --web");
+
+    let deadline = Instant::now() + CHILD_TIMEOUT;
+    let listening = loop {
+        if std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).is_ok() {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    if !listening {
+        let output = child.wait_with_output().expect("collect web smoke output");
+        panic!(
+            "mag --web did not start listening: status {:?}, stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let unauthorized = http_get(port, "/api/sessions", None);
+    assert!(
+        unauthorized.starts_with("HTTP/1.1 401"),
+        "API requires the bearer token: {unauthorized}"
+    );
+    let wrong_token = http_get(port, "/api/sessions", Some("wrong-token"));
+    assert!(
+        wrong_token.starts_with("HTTP/1.1 401"),
+        "a wrong token is rejected: {wrong_token}"
+    );
+    let authorized = http_get(port, "/api/sessions", Some("web-smoke-token"));
+    assert!(
+        authorized.starts_with("HTTP/1.1 200"),
+        "the provided token unlocks the API: {authorized}"
+    );
+    let index = http_get(port, "/", None);
+    assert!(
+        index.starts_with("HTTP/1.1 200"),
+        "the SPA (or its build placeholder) is served without auth: {index}"
+    );
+
+    child.kill().expect("kill mag --web");
+    let _ = child.wait();
+}

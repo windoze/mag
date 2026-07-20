@@ -1,5 +1,5 @@
 import type { ITransport } from "@mag/client";
-import { TransportError } from "@mag/client";
+import { SessionStore, TransportError } from "@mag/client";
 import * as React from "react";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -19,6 +19,7 @@ const config = {
 
 type TransportCommand = Parameters<ITransport["send"]>[0];
 type TransportEvent = Parameters<Parameters<ITransport["subscribe"]>[0]>[0];
+type TransportSubscribeOptions = Parameters<ITransport["subscribe"]>[1];
 
 describe("App", () => {
   afterEach(() => {
@@ -120,6 +121,48 @@ describe("App", () => {
     await click(getByLabel(rendered.container, "Delete New shell session"));
     expect(confirm).toHaveBeenCalled();
     expect(transport.sent.at(-1)).toMatchObject({ type: "delete_session", id: "session-new" });
+
+    await act(async () => rendered.root.unmount());
+  });
+
+  it("reconnects after a stream failure and realigns without duplicate bubbles", async () => {
+    const transport = new ScriptedTransport();
+    // Zero reconnect delay keeps the store's reconnect timer on real timers.
+    const store = new SessionStore(transport, { reconnectDelayMs: 0 });
+    const rendered = await renderApp(<App storage={new MemoryStorage()} store={store} />);
+
+    await waitFor(() => rendered.container.textContent?.includes("Inspect README") === true);
+    await click(getButton(rendered.container, "Inspect README"));
+    await waitFor(() => rendered.container.textContent?.includes("The README is short.") === true);
+
+    // A partial streaming turn arrives before the SSE stream drops.
+    await act(async () => {
+      transport.emit({ type: "run_started", id: sessionId, run_id: "run-live" });
+      transport.emit({ type: "text_delta", id: sessionId, text: "Working" });
+    });
+    await waitFor(() => rendered.container.textContent?.includes("Working") === true);
+
+    transport.sent.length = 0;
+    await act(async () => {
+      transport.fail(new TransportError("lost stream", { kind: "stream_closed" }));
+    });
+
+    // The store realigns with a full list_sessions + history refresh, then
+    // resubscribes to the event stream.
+    await waitFor(() => transport.subscribeCalls >= 2);
+    expect(transport.sent.map((command) => command.type)).toEqual(
+      expect.arrayContaining(["list_sessions", "get_session_history"])
+    );
+    await waitFor(() => rendered.container.textContent?.includes("The README is short.") === true);
+
+    // Authoritative history replaces the optimistic stream: no bubble renders
+    // twice and the lost delta does not linger.
+    const bubbles = [...rendered.container.querySelectorAll("article")].map(
+      (bubble) => bubble.textContent ?? ""
+    );
+    expect(bubbles.filter((text) => text.includes("Inspect README"))).toHaveLength(1);
+    expect(bubbles.filter((text) => text.includes("The README is short."))).toHaveLength(1);
+    expect(bubbles.filter((text) => text.includes("Working"))).toHaveLength(0);
 
     await act(async () => rendered.root.unmount());
   });
@@ -422,6 +465,7 @@ class ScriptedTransport implements ITransport {
   pivotError: TransportError | undefined;
   subscribeCalls = 0;
   private handler: ((event: TransportEvent) => void) | undefined;
+  private subscribeOptions: TransportSubscribeOptions;
 
   async send(command: TransportCommand): Promise<unknown> {
     this.sent.push(command);
@@ -510,9 +554,13 @@ class ScriptedTransport implements ITransport {
     }
   }
 
-  subscribe(handler: (event: TransportEvent) => void): () => void {
+  subscribe(
+    handler: (event: TransportEvent) => void,
+    options?: TransportSubscribeOptions
+  ): () => void {
     this.subscribeCalls += 1;
     this.handler = handler;
+    this.subscribeOptions = options;
     return () => {
       if (this.handler === handler) {
         this.handler = undefined;
@@ -522,6 +570,10 @@ class ScriptedTransport implements ITransport {
 
   emit(event: TransportEvent): void {
     this.handler?.(event);
+  }
+
+  fail(error: unknown): void {
+    this.subscribeOptions?.onError?.(error);
   }
 }
 

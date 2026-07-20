@@ -56,3 +56,9 @@ export const Probing: Story = {
     busy: true
   }
 };
+
+export const ProbeFailed: Story = {
+  args: {
+    error: "probe failed: backend unavailable"
+  }
+};

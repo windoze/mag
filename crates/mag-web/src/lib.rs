@@ -51,6 +51,8 @@ pub struct ServeOptions {
     pub token_policy: TokenPolicy,
     /// Optional static asset directory reserved for the W2 static resource layer.
     pub static_assets_dir: Option<PathBuf>,
+    /// Optional SSE heartbeat interval; defaults to ~15s (`docs/WEB.md` §2.2).
+    pub heartbeat_interval: Option<Duration>,
 }
 
 impl Default for ServeOptions {
@@ -60,6 +62,7 @@ impl Default for ServeOptions {
             port: 8080,
             token_policy: TokenPolicy::Generate,
             static_assets_dir: None,
+            heartbeat_interval: None,
         }
     }
 }
@@ -148,8 +151,13 @@ pub fn prepare_router(
     service: Arc<dyn MagService>,
     opts: ServeOptions,
 ) -> io::Result<PreparedRouter> {
+    let heartbeat_interval = opts.heartbeat_interval;
     let options = resolve_serve_options(opts)?;
-    let router = router_with_resolved_options(service, options.clone(), SseConfig::default());
+    let sse = SseConfig {
+        heartbeat_interval: heartbeat_interval.unwrap_or(SseConfig::default().heartbeat_interval),
+        ..SseConfig::default()
+    };
+    let router = router_with_resolved_options(service, options.clone(), sse);
 
     Ok(PreparedRouter { router, options })
 }
@@ -1121,6 +1129,7 @@ mod tests {
                 port: 0,
                 token_policy,
                 static_assets_dir,
+                heartbeat_interval: None,
             },
         )
         .expect("router prepares");
@@ -1701,6 +1710,7 @@ mod tests {
             port: 0,
             token_policy: TokenPolicy::Generate,
             static_assets_dir: None,
+            heartbeat_interval: None,
         })
         .expect("options resolve");
 
@@ -1733,6 +1743,7 @@ mod tests {
                 port: 0,
                 token_policy: TokenPolicy::Disabled,
                 static_assets_dir: None,
+                heartbeat_interval: None,
             },
         )
         .expect("router prepares");

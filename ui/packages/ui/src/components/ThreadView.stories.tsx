@@ -93,6 +93,45 @@ export const Empty: Story = {
   }
 };
 
+// Long-session rendering baseline: ~300 mixed items generated programmatically.
+// The first version intentionally does no virtualization; this story exists so
+// render regressions on long threads can be eyeballed before that changes.
+const longThreadItems: ThreadItemView[] = Array.from({ length: 300 }, (_, index) => {
+  if (index % 3 === 2) {
+    const callId = `tool-long-${index}`;
+    return {
+      type: "tool_call",
+      toolCall: {
+        id: callId,
+        trace: {
+          call_id: callId,
+          name: index % 9 === 2 ? "read_file" : "shell",
+          input: { path: `src/module_${index}.ts` },
+          output: { preview: `ok (${index} bytes)` },
+          status: "finished"
+        }
+      }
+    } satisfies ThreadItemView;
+  }
+  const user = index % 3 === 0;
+  return {
+    type: "message",
+    message: {
+      id: `msg-long-${index}`,
+      role: user ? "user" : "assistant",
+      text: user
+        ? `Turn ${index}: please check module ${index}.`
+        : `Turn ${index}: module ${index} looks fine. **No action needed.**`
+    }
+  } satisfies ThreadItemView;
+});
+
+export const LongThread: Story = {
+  args: {
+    items: longThreadItems
+  }
+};
+
 export const PivotAndErrors: Story = {
   args: {
     items: [

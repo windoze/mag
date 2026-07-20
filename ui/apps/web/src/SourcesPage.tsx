@@ -40,17 +40,13 @@ export function SourcesPage({ onBack, sources, store }: SourcesPageProps): React
   };
 
   return (
-    <div className="flex flex-col gap-2">
-      {error !== undefined ? (
-        <p
-          className="mx-4 mt-4 rounded-lg border border-destructive/20 bg-destructive/10 px-3 py-2 text-sm text-destructive"
-          role="alert"
-        >
-          {error}
-        </p>
-      ) : null}
-      <SourcesView busy={busy} sources={sources} onBack={onBack} onProbe={() => void probe()} />
-    </div>
+    <SourcesView
+      busy={busy}
+      error={error}
+      sources={sources}
+      onBack={onBack}
+      onProbe={() => void probe()}
+    />
   );
 }
 
