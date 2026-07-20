@@ -1,20 +1,30 @@
-# 当前执行计划
+# 执行计划
 
-说明：此文件记录可共享的执行计划、关键决策和进度更新；不记录私有推理链。
+## 目标
 
-## 初始计划
+完成 `TODO.md` 中按顺序出现的第一个未完成任务，验证后更新任务记录并提交一次 Git commit，然后停止。
 
-1. 阅读 `TODO.md`，按规则识别第一个标题未带 `[DONE]` 的任务，并确认其要求、依赖、验证方式和完成记录格式。
-2. 如有必要，查看 `PLAN.md`、最近提交和与当前任务直接相关的代码区域；不做开放式历史问题扫查。
-3. 针对第一个未完成任务做最小正确实现；若发现阻塞当前任务的规格不匹配或缺失前置条件，则按要求在 `TODO.md` 插入最小前置任务并停止。
-4. 运行必要验证，顺序为 `cargo fmt`、`cargo clippy --all-targets -- -D warnings`、相关测试和需要时的完整测试套件；若仅文档变更且有可复用绿色结果，则记录跳过原因。
-5. 更新 `TODO.md`：只有任务实际完成并验证通过后，才在任务标题前加 `[DONE]` 并补全完成记录；仅当阶段计划变化时才更新 `PLAN.md`。
-6. 提交所有与本次任务相关的改动，提交信息包含任务编号和简明说明，然后停止，不处理下一个任务。
+## 步骤
 
-## 进度
+1. 读取 `TODO.md`，按标题是否带有 `[DONE]` 判断第一个未完成任务。
+2. 检查该任务的正文、依赖、验证要求和完成记录；必要时查看最新提交是否明确提到与该任务直接相关的未完成问题。
+3. 根据任务内容只收集必要代码上下文，避免开放式历史问题排查。
+4. 实现该任务；如果发现阻塞当前任务的具体前置问题，则将最小必要前置任务插入 `TODO.md`，提交后停止。
+5. 运行格式化、lint 和相关测试；如有未排期失败，修复或把最小必要任务排到当前任务之前。
+6. 将已完成任务标题加上 `[DONE]`，更新其完成记录；仅在阶段级计划改变时更新 `PLAN.md`。
+7. 检查 Git 状态和差异，提交本次任务涉及的全部变更。
+8. 停止，不继续下一个任务。
 
-- 2026-07-20：初始化执行计划，下一步读取 `TODO.md` 确认当前任务。
-- 2026-07-20：已确认首个未完成任务为 `M5-1 [TODO] mag-tools：ask_user ToolPlugin`。执行重点：阅读 `docs/CLI.md` §5 P6 / D6、`mag-tools` 插件接口、`mag-core` 现有交互/approval 注入路径；实现 `ask_user` 工具并注册；补 fake LLM 离线测试覆盖 Question/Choice 回灌与 cancel；完成后运行格式化、聚焦测试、clippy、workspace 测试和文档构建，再更新 `TODO.md`、提交并停止。
-- 2026-07-20：实现已完成到验证前状态：`mag-tools` 增加 `UserInteractionBridge` / `ToolInvocation`、`AskUserTool` 与注册表桥绑定；内置工具集加入 `ask_user`；`mag-core` 在 facade tool 投影处为每个会话注入基于 `IpcApproval` 的用户交互桥；新增 `mag-tools` 单/集成测试与 `mag-core` 端到端测试覆盖 Question、Choice 和 cancel。下一步运行 `cargo fmt --all -- --check`。
-- 2026-07-20：格式化通过；聚焦测试通过：`cargo test -p mag-tools`（23 passed）和 `cargo test -p mag-core ask_user`（3 passed）。下一步运行 clippy、workspace 测试和文档构建。
-- 2026-07-20：完整验证通过：`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`、`cargo doc --no-deps --workspace` 均成功。下一步更新 `TODO.md` 的 M5-1 完成记录并提交。
+## 当前状态
+
+- 已写入初始执行计划。
+- 已读取 `TODO.md`，首个未完成任务为 `M5-R [TODO] M5 review`。
+- 本轮只处理 M5 review：对照 `docs/CLI.md` §5 P6 检查 `ask_user` 的交互桥复用一致性、cancel 语义、tool profile 开关与 rustdoc；发现问题则直接修复并补测试。
+- 已检查最新提交 `[M5-1] Implement ask_user ToolPlugin`，提交说明未列未完成事项。
+- Review 发现：`ask_user` 的桥调用被包进 `tokio::spawn`；取消分支返回时只丢弃 `JoinHandle`，不会取消桥 future。mag-core 的桥会自行观察 cancel，但插件契约层不应依赖桥实现主动退出。
+- 修复计划：改为在 `tokio::select!` 中直接等待 `bridge.ask_user(ctx, request)`，取消时直接 drop 桥 future；新增 mag-tools 运行中取消测试验证桥 future 被 drop；同时补强 mag-core ask_user cancel 测试，断言取消后迟到响应不再命中 pending 交互。
+- 已完成修复：`AskUserTool` 直接 select 桥 future；`IpcApproval::emit_and_await` 增加 pending cleanup guard，确保桥 future 被 drop 时 request id 从 pending map 移除。
+- 已通过验证：`cargo fmt --all -- --check`、`cargo test -p mag-tools ask_user`（5 passed）、`cargo test -p mag-core ask_user`（3 passed）。
+- 已通过完整门禁：`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`（全绿，1 ignored 为既有 zed 联调测试）、`cargo doc --no-deps --workspace`（0 warning）。
+- 已更新 `TODO.md`：`M5-R` 标题标记为 `[DONE]`，完成记录列出 review 结论、修复项与验证结果；`PLAN.md` 未改，因为阶段级计划未变化。
+- 下一步：提交本任务变更后停止。

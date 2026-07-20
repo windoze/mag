@@ -1129,11 +1129,41 @@ GUI/web/CLI 无需感知多个会话通道。
     4) `cargo test --workspace` ✅（全绿，1 ignored 为既有 zed 联调测试）5) `cargo doc --no-deps --workspace` ✅
     （0 warning）。
 
-### M5-R [TODO] M5 review
+### M5-R [DONE] M5 review
 
 - **实现要求**：对照 `docs/CLI.md` §5 P6 检查：交互桥复用一致、cancel 语义、tool profile 开关、rustdoc。
   发现问题直接修复并补测试。
 - **验证条件**：默认验证序列全过；完成记录列出 review 结论。
+
+  **完成记录**（2026-07-20）：
+  - review 范围：对照 `docs/CLI.md` §5 P6 / 决策 D6，复核 `mag-tools` 的 `ask_user` 插件、
+    `ToolInvocation` / `UserInteractionBridge` / registry 注入路径、mag-core `tool_surface` 与
+    `IpcUserInteractionBridge` 接线、ask_user 端到端测试与 rustdoc。
+  - 检查点结论：交互桥复用一致 ✅——fresh/restore 会话用同一个 `Arc<IpcApproval>` 注入 facade
+    `interaction_handler`，并构造 `IpcUserInteractionBridge`；`Question` / `Choice` 通过同一 pending map、
+    `RequestId` 铸造与 `respond_interaction` 唤醒路径回灌，root origin 行为由既有测试覆盖。
+  - 检查点结论：tool profile / 工具面开关 ✅——`ask_user` 作为普通 `ToolPlugin` 注册在 builtins 中，
+    `tool_surface` 按绑定 agent 的工具列表过滤全部插件；既有显式工具子集、disabled 工具、显式空工具面测试
+    同样覆盖 `ask_user` 所属的普通插件路径，未发现特例绕过。
+  - 检查点结论：rustdoc ✅——`AskUserTool`、`UserInteractionRequest` / `Response` / `Bridge`、
+    `ToolRegistry::bind_with_user_interaction`、mag-core `IpcUserInteractionBridge` 与 `facade_tool` 文档均说明
+    §5 P6 / D6 的普通 plugin + 主机桥设计；`cargo doc` 0 warning。
+  - 发现与修复（1 项，已修并补测试）：`AskUserTool` 原先把桥调用包进 `tokio::spawn`，取消分支返回时只丢弃
+    `JoinHandle`，不会取消桥 future；对未主动观察 cancel 的桥实现会遗留后台任务。修复为在
+    `tokio::select!` 中直接等待 `bridge.ask_user(ctx, request)`，取消时直接 drop 桥 future。该修复暴露并一并修复
+    `IpcApproval::emit_and_await` 的 pending 生命周期缺口：当交互等待 future 被 drop（例如 ask_user cancel 抢占）时，
+    pending map 中的 request id 可能残留，迟到响应会命中已失效 sender 并报 Backend。新增 `PendingCleanup` guard，
+    让任意被 drop 的交互等待自动移除 pending 项；正常响应和 cancel 分支下重复移除为 no-op。
+  - 新增/增强测试：`mag-tools` 新增
+    `ask_user_in_flight_cancellation_drops_the_bridge_future`，验证运行中取消会释放桥 future 且快速返回 cancelled；
+    `mag-core` 增强 `ask_user_cancel_unblocks_the_parked_tool`，保存 `request_id` 并断言 cancel 后迟到
+    `respond_interaction` 返回 `InteractionNotFound`，证明 pending 已清理。
+  - 门禁结果：1) `cargo fmt --all -- --check` ✅ 2) 聚焦测试 ✅：`cargo test -p mag-tools ask_user`
+    （5 passed）与 `cargo test -p mag-core ask_user`（3 passed）3) `cargo clippy --all-targets -- -D warnings` ✅
+    4) `cargo test --workspace` ✅（全绿，1 ignored 为既有 zed 联调测试）5)
+    `cargo doc --no-deps --workspace` ✅（0 warning）。
+  - review 结论：M5 的 `ask_user` 普通 ToolPlugin 方案符合 `docs/CLI.md` §5 P6 / 决策 D6；本 review 发现并修复
+    1 处 cancel/pending 生命周期缺陷，交互桥复用、取消语义、工具面开关与文档均满足要求。**M5 通过**。
 
 ---
 

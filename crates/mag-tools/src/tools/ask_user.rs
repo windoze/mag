@@ -85,12 +85,10 @@ impl ToolPlugin for AskUserTool {
             return ToolResult::error("ask_user cancelled");
         }
 
-        let ask = tokio::spawn(async move { bridge.ask_user(ctx, request).await });
         let response = tokio::select! {
-            result = ask => match result {
-                Ok(Ok(response)) => response,
-                Ok(Err(error)) => return ToolResult::error(format!("ask_user failed: {error}")),
-                Err(error) => return ToolResult::error(format!("ask_user task failed: {error}")),
+            result = bridge.ask_user(ctx, request) => match result {
+                Ok(response) => response,
+                Err(error) => return ToolResult::error(format!("ask_user failed: {error}")),
             },
             () = cancel.cancelled() => return ToolResult::error("ask_user cancelled"),
         };

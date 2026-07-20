@@ -98,6 +98,23 @@ struct Pending {
     responder: oneshot::Sender<InteractionResponse>,
 }
 
+/// Removes a pending interaction if the awaiting future is dropped before the
+/// interface answers it.
+///
+/// `ask_user` races the interaction bridge against tool cancellation
+/// (`docs/CLI.md` §5 P6). When cancellation wins, the bridge future is dropped;
+/// this guard keeps the shared pending map from retaining a stale request id.
+struct PendingCleanup<'a> {
+    approval: &'a IpcApproval,
+    request_id: RequestId,
+}
+
+impl Drop for PendingCleanup<'_> {
+    fn drop(&mut self) {
+        self.approval.discard_pending(self.request_id);
+    }
+}
+
 /// Mints monotonic [`RequestId`]s scoped to one session's approval handler.
 #[derive(Debug, Default)]
 struct RequestIdSource {
@@ -226,6 +243,10 @@ impl IpcApproval {
                 responder,
             },
         );
+        let _cleanup = PendingCleanup {
+            approval: self,
+            request_id,
+        };
 
         let _ = self.events.emit(Event::InteractionRequested {
             id: self.session_id,

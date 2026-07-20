@@ -107,6 +107,50 @@ impl UserInteractionBridge for NeverUserBridge {
     }
 }
 
+#[derive(Debug)]
+struct DropAwareUserBridge {
+    entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    dropped: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+
+impl DropAwareUserBridge {
+    fn new(
+        entered: tokio::sync::oneshot::Sender<()>,
+        dropped: tokio::sync::oneshot::Sender<()>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            entered: std::sync::Mutex::new(Some(entered)),
+            dropped: std::sync::Mutex::new(Some(dropped)),
+        })
+    }
+}
+
+struct DropNotify(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl Drop for DropNotify {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+#[async_trait]
+impl UserInteractionBridge for DropAwareUserBridge {
+    async fn ask_user(
+        &self,
+        _ctx: ToolContext,
+        _request: UserInteractionRequest,
+    ) -> Result<UserInteractionResponse, UserInteractionError> {
+        if let Some(sender) = self.entered.lock().expect("entered lock").take() {
+            let _ = sender.send(());
+        }
+        let _drop_notify = DropNotify(self.dropped.lock().expect("dropped lock").take());
+        std::future::pending::<()>().await;
+        unreachable!("pending future never resolves")
+    }
+}
+
 #[tokio::test]
 async fn read_file_returns_file_contents() {
     let dir = TempDir::new().expect("temp dir");
@@ -366,6 +410,44 @@ async fn ask_user_cancellation_returns_promptly() {
         started.elapsed() < std::time::Duration::from_secs(1),
         "pre-cancelled ask_user must not park"
     );
+}
+
+#[tokio::test]
+async fn ask_user_in_flight_cancellation_drops_the_bridge_future() {
+    let dir = TempDir::new().expect("temp dir");
+    let cancel = CancellationToken::new();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+    let bridge = DropAwareUserBridge::new(entered_tx, dropped_tx);
+    let registry = ToolRegistry::with_builtins()
+        .bind_with_user_interaction(parts(dir.path(), cancel.clone()), bridge);
+
+    let execution = tokio::spawn(async move {
+        registry
+            .execute(
+                tool_call_id(),
+                call("ask_user", json!({ "question": "Still there?" })),
+            )
+            .await
+            .expect("ask_user returns a cancellation result")
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), entered_rx)
+        .await
+        .expect("bridge future should be polled")
+        .expect("entered sender should still exist");
+    cancel.cancel();
+
+    let response = tokio::time::timeout(std::time::Duration::from_secs(1), execution)
+        .await
+        .expect("cancelled ask_user should return promptly")
+        .expect("execution task should not panic");
+    assert_eq!(response.status, ToolStatus::Error);
+    assert!(text_of(&response.content).contains("cancelled"));
+    tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+        .await
+        .expect("cancelling ask_user should drop the bridge future")
+        .expect("dropped sender should still exist");
 }
 
 #[tokio::test]

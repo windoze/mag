@@ -963,7 +963,7 @@ mod chat {
     use futures::stream::BoxStream;
     use mag_service::{
         InteractionKindWire, InteractionResponseWire, MagService, RoutingMode, RunErrorKind,
-        ServiceEvent, SessionConfig, SessionId, UsageInfo, UserInput,
+        ServiceError, ServiceEvent, SessionConfig, SessionId, UsageInfo, UserInput,
     };
     use tokio::time::{Duration, timeout};
 
@@ -1488,21 +1488,22 @@ mod chat {
             .await
             .expect("send message");
 
-        loop {
+        let request_id = loop {
             match next_event(&mut events).await {
                 ServiceEvent::InteractionRequested {
+                    request_id,
                     kind: InteractionKindWire::Question { prompt },
                     ..
                 } => {
                     assert_eq!(prompt, "Should I wait?");
-                    break;
+                    break request_id;
                 }
                 ServiceEvent::RunError { message, .. } => {
                     panic!("run failed before ask_user parked: {message}")
                 }
                 _ => continue,
             }
-        }
+        };
 
         engine.cancel(session).await.expect("cancel run");
 
@@ -1519,6 +1520,21 @@ mod chat {
                 _ => continue,
             }
         }
+
+        let late_response = engine
+            .respond_interaction(
+                session,
+                request_id,
+                InteractionResponseWire::Answer {
+                    text: "too late".to_owned(),
+                },
+            )
+            .await
+            .expect_err("cancelled ask_user should discard the pending interaction");
+        assert_eq!(
+            late_response,
+            ServiceError::InteractionNotFound { request_id }
+        );
     }
 }
 
