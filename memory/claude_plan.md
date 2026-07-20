@@ -1,43 +1,35 @@
-# M6-4 执行计划
+# Execution Plan
 
-当前任务：`M6-4 [TODO] /config 命令`。
+I will follow `TODO.md` as the authoritative task list and complete exactly the first task whose heading is not prefixed with `[DONE]`.
 
-## 目标
+Planned steps:
+1. Read `TODO.md` to identify the first incomplete task and its validation requirements.
+2. Check recent Git context only insofar as it directly affects that task.
+3. Inspect the relevant code and tests for the selected task.
+4. Implement the task without workarounds or scope narrowing.
+5. Run formatting, linting, and the task-required tests in the required order.
+6. Update `TODO.md` with a `[DONE]` prefix and completion record if the task is fully complete.
+7. Commit all relevant changes with a clear task-specific message, then stop.
 
-- 在 `mag-cli` 中实现 `/config show`、`/config reload`、`/config apply`。
-- 渲染 `ConfigChanged{revision}` 事件。
-- 补充 e2e 覆盖三个子命令及配置变更事件。
-- 完成格式化、聚焦测试、clippy、workspace 测试、doc 验证。
-- 将 `TODO.md` 的 `M6-4` 标记为 `[DONE]` 并填写完成记录。
-- 提交本任务全部改动后停止。
+If a concrete blocker prevents completion, I will add the minimum prerequisite task to `TODO.md`, keep the current task incomplete, commit the bookkeeping change, and stop.
 
-## 执行步骤
+## Current Task
 
-1. 检查最近提交是否有与 `M6-4` 直接相关的未完成事项。
-2. 阅读 `mag-cli` 的命令分发、事件渲染与 e2e 测试代码，确认现有 slash 命令和 scripted service 测试结构。
-3. 如 `mag-cli` 已可通过 `mag-service` re-export 使用 `ConfigDto`，直接在 CLI 层序列化 TOML；若需要额外依赖，优先复用 `mag-service` 公开 API，保持 `mag-cli` 不直接依赖 `mag-config`。
-4. 实现 `/config` 命令分发：`show` 调 `get_config()` 并输出 TOML；`reload` 调 `reload_config()` 并打印结果；`apply` 调 `apply_config()` 并打印下一 turn 边界生效提示；未知子命令输出错误和帮助。
-5. 在事件渲染中处理 `ConfigChanged{revision}`，输出一行配置 revision 变更提示。
-6. 扩展 `mag-cli` e2e scripted service，记录配置方法调用并模拟 `ConfigChanged` 事件；新增覆盖三个子命令和事件渲染的测试。
-7. 运行 `cargo fmt --all -- --check`；如有格式差异，运行 `cargo fmt --all` 后复检。
-8. 运行聚焦测试 `cargo test -p mag-cli`。
-9. 运行 `cargo clippy --all-targets -- -D warnings`。
-10. 运行 `cargo test --workspace`。
-11. 运行 `cargo doc --no-deps --workspace`。
-12. 更新 `TODO.md`：将 `M6-4` 标题改为 `[DONE]`，填写实现、测试和门禁完成记录。
-13. 检查 git 状态、diff 与最近提交，提交全部本任务改动。
+Selected task: `M6-5 [TODO] bin 装配 + 端到端验证`.
 
-## 进度记录
+Task-specific plan:
+1. Inspect the latest commit, worktree status, `crates/mag/src/main.rs`, `crates/mag-cli`, `Engine::from_config`, and existing e2e helpers.
+2. Wire the default `mag` binary path to load configuration, build `ConfigService`, create `Engine::from_config`, and run `mag-cli`; preserve `--acp`, `--config`, and add `--resume <id>` behavior.
+3. Add offline e2e coverage using fake/scripted components to validate the binary/CLI/Engine integration required by M6-5.
+4. Run formatting, focused tests, clippy, workspace tests, and docs in the required order.
+5. Mark M6-5 `[DONE]` with a completion record, commit all relevant files, then stop.
 
-- 已读取 `TODO.md` 并确认首个未完成任务为 `M6-4`。
-- 已检查最近提交 `5fa8c82 [M6-3] Implement CLI pivot cancel session commands`，提交信息未提示与 `M6-4` 直接相关的未完成缺口。
-- 已确认 `mag-cli` 可通过 `mag-service::ConfigDto` 使用 `to_string_pretty()`，无需新增 `mag-config` 直接依赖。
-- 已实现 `/config show|reload|apply`、`ConfigChanged{revision}` 渲染，并新增配置命令 e2e 测试。
-- `cargo fmt --all -- --check` 初次发现 rustfmt 差异；已运行 `cargo fmt --all` 并复检通过。
-- `cargo test -p mag-cli` 通过（8 passed）。
-- `cargo clippy --all-targets -- -D warnings` 通过。
-- `cargo test --workspace` 通过（全绿，1 ignored 为既有联调测试）。
-- `cargo doc --no-deps --workspace` 通过（0 warning）。
-- 已将 `TODO.md` 的 `M6-4` 标记为 `[DONE]` 并填写完成记录。后续只做 diff/依赖边界检查与提交。
-- 已检查 `cargo tree -p mag-cli -e normal --depth 1`：直接依赖仍为 `futures`、`mag-service`、`rustyline`、`tokio`。
-- 已检查 git diff/status/log 与 `git diff --check`，准备提交。
+Progress update:
+- Identified that `crates/mag/src/main.rs` still treats `--acp` as mandatory, so M6-5 requires changing the default path to the terminal CLI.
+- Identified that `mag-cli` always creates a new session at startup; `mag --resume <id>` needs a small `CliOptions` extension so startup can resume an existing session.
+- The e2e strategy is to keep production assembly on `Engine::from_config`, and use in-process tests with real `Engine` + `mag-cli` plus local fake `LlmClient` / fake ACP process for offline coverage.
+- Implemented the bin default CLI path and startup resume option, preserving `--acp` and `--config`.
+- Added bin smoke coverage plus real Engine + mag-cli offline e2e coverage for conversation, ask_user, local delegation, external ACP delegation, pivot, cancel, config reload, and resume.
+- Focused checks so far: `cargo test -p mag-cli` passed; `cargo test -p mag` passed after adjusting the resume smoke to use a provider-backed config so driver restore is valid without network calls.
+- Full validation passed: `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace`, and `cargo doc --no-deps --workspace`.
+- `TODO.md` now marks M6-5 as `[DONE]` and records the implementation, tests, dependency boundary notes, and validation results.

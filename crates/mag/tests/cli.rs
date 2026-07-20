@@ -1,15 +1,16 @@
-//! Bin-level smoke tests for the `mag` binary (`TODO.md` M3-6).
+//! Bin-level smoke tests for the `mag` binary (`TODO.md` M6-5).
 //!
 //! All offline: the binary is driven with `--config` pointing at a tempdir
-//! sample, the ACP handshake is answered over piped stdio with a fake API key
-//! injected through the child environment, and no network is touched
-//! (assembly builds the adapter but never calls it).
+//! sample or tempdir default, the CLI path is driven through piped stdio, the
+//! ACP handshake is answered over piped stdio with a fake API key injected
+//! through the child environment, and no network is touched (assembly builds the
+//! adapter but never calls it).
 
 use std::{
     fs,
     io::{BufRead, BufReader, Write},
     path::PathBuf,
-    process::{Child, Command, Stdio},
+    process::{Child, Command, Output, Stdio},
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -67,6 +68,54 @@ fn spawn_acp(config: &std::path::Path, envs: &[(&str, &str)]) -> Child {
     command.spawn().expect("spawn mag --acp")
 }
 
+/// Runs the default terminal CLI with piped stdin/stdout.
+fn run_cli(config: &std::path::Path, extra_args: &[String], input: &str) -> Output {
+    run_cli_with_env(config, extra_args, input, &[])
+}
+
+/// Runs the default terminal CLI with additional environment variables.
+fn run_cli_with_env(
+    config: &std::path::Path,
+    extra_args: &[String],
+    input: &str,
+    envs: &[(&str, &str)],
+) -> Output {
+    let mut command = mag();
+    command.arg("--config").arg(config);
+    for arg in extra_args {
+        command.arg(arg);
+    }
+    for (name, value) in envs {
+        command.env(name, value);
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mag CLI");
+
+    {
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        stdin.write_all(input.as_bytes()).expect("write CLI stdin");
+        stdin.flush().expect("flush CLI stdin");
+    }
+
+    child.wait_with_output().expect("wait for mag CLI")
+}
+
+/// Extracts the first `[session <id>]` line printed by the CLI.
+fn first_session_id(stdout: &str) -> String {
+    stdout
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("[session ")
+                .and_then(|rest| rest.strip_suffix(']'))
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| panic!("stdout did not contain a session line: {stdout}"))
+}
+
 /// Performs the ACP `initialize` handshake against `child`, returning the
 /// response line. Fails the test when no answer arrives within 10 seconds.
 fn initialize_handshake(child: &mut Child) -> String {
@@ -98,10 +147,18 @@ fn help_exits_zero_and_documents_the_flags() {
 
     assert!(output.status.success(), "--help exits 0: {output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("terminal CLI"),
+        "help documents default CLI: {stdout}"
+    );
     assert!(stdout.contains("--acp"), "help documents --acp: {stdout}");
     assert!(
         stdout.contains("--config"),
         "help documents --config: {stdout}"
+    );
+    assert!(
+        stdout.contains("--resume"),
+        "help documents --resume: {stdout}"
     );
 }
 
@@ -115,20 +172,79 @@ fn unknown_argument_is_rejected_with_usage() {
 }
 
 #[test]
-fn invocation_without_acp_prints_usage_and_does_not_load_config() {
-    // `--config` pointing at a tempdir sample parses fine but is only loaded
-    // on the `--acp` startup path; the usage path must not touch it.
-    let dir = TempDir::new("usage");
-    fs::write(dir.config_path(), "not toml = [").expect("write junk config");
-    let output = mag()
-        .arg("--config")
-        .arg(dir.config_path())
-        .output()
-        .expect("run mag without --acp");
+fn default_invocation_runs_the_terminal_cli() {
+    let dir = TempDir::new("default-cli");
 
-    assert_eq!(output.status.code(), Some(2), "usage error exits 2");
+    let output = run_cli(&dir.config_path(), &[], "/quit\n");
+
+    assert!(output.status.success(), "default CLI exits 0: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("[session "),
+        "CLI creates a session: {stdout}"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("usage: mag"), "got: {stderr}");
+    assert!(
+        stderr.contains("built-in defaults"),
+        "missing config uses defaults with an info diagnostic: {stderr}"
+    );
+}
+
+#[test]
+fn default_cli_loads_and_rejects_a_corrupt_config() {
+    let dir = TempDir::new("corrupt-cli");
+    fs::write(dir.config_path(), "not toml = [").expect("write junk config");
+
+    let output = run_cli(&dir.config_path(), &[], "/quit\n");
+
+    assert!(!output.status.success(), "corrupt config exits non-zero");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed to load config"), "got: {stderr}");
+}
+
+#[test]
+fn resume_flag_resumes_a_persisted_cli_session() {
+    let dir = TempDir::new("resume-cli");
+    let persist = dir.0.join("sessions");
+    fs::write(
+        dir.config_path(),
+        format!(
+            r#"
+[providers.openai]
+wire = "openai"
+api_key = {{ env = "MAG_BIN_RESUME_API_KEY" }}
+
+[agents.default]
+provider = "openai"
+model = "gpt-5-codex"
+
+[session]
+persist_path = {:?}
+"#,
+            persist.to_string_lossy()
+        ),
+    )
+    .expect("write config");
+
+    let envs = [("MAG_BIN_RESUME_API_KEY", "sk-bin-resume")];
+    let first = run_cli_with_env(&dir.config_path(), &[], "/quit\n", &envs);
+    assert!(first.status.success(), "first CLI run exits 0: {first:?}");
+    let first_stdout = String::from_utf8_lossy(&first.stdout);
+    let session_id = first_session_id(&first_stdout);
+
+    let second = run_cli_with_env(
+        &dir.config_path(),
+        &["--resume".to_owned(), session_id.clone()],
+        "/quit\n",
+        &envs,
+    );
+
+    assert!(second.status.success(), "resumed CLI exits 0: {second:?}");
+    let second_stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(
+        second_stdout.contains(&format!("[session {session_id} resumed]")),
+        "CLI resumes the persisted session: {second_stdout}"
+    );
 }
 
 #[test]

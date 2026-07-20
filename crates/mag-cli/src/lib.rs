@@ -41,6 +41,8 @@ type SharedOutput<W> = Arc<Mutex<W>>;
 pub struct CliOptions {
     /// Session configuration used at startup and by `/new`.
     pub session: SessionConfig,
+    /// Existing session to resume at startup instead of creating a new session.
+    pub resume: Option<SessionId>,
     /// Prompt displayed before each input line in the pipe-friendly reader.
     pub prompt: String,
 }
@@ -56,6 +58,7 @@ impl Default for CliOptions {
                 routing: RoutingMode::default(),
                 budget: None,
             },
+            resume: None,
             prompt: "mag> ".to_owned(),
         }
     }
@@ -347,8 +350,15 @@ where
     SpawnInput: FnOnce(SharedOutput<W>, String, mpsc::Sender<InputCommand>) -> JoinHandle<()>,
 {
     let output = Arc::new(Mutex::new(output));
-    let mut session_id = service.create_session(opts.session.clone()).await?;
-    write_line(&output, &format!("[session {session_id}]\n")).await?;
+    let mut session_id = if let Some(id) = opts.resume {
+        service.resume_session(id).await?;
+        write_line(&output, &format!("[session {id} resumed]\n")).await?;
+        id
+    } else {
+        let id = service.create_session(opts.session.clone()).await?;
+        write_line(&output, &format!("[session {id}]\n")).await?;
+        id
+    };
 
     let (input_tx, mut input_rx) = mpsc::channel(8);
     let (notice_tx, mut notice_rx) = mpsc::channel(8);

@@ -9,8 +9,9 @@
 //! non-fatal — the built-in default configuration (no providers, no external
 //! agents, default approval tiers) is used and an info line is logged —
 //! while a corrupt or unassemblable configuration exits non-zero with the
-//! diagnostic. The engine is then served as an `Arc<dyn MagService>`; for
-//! `--acp` that is the ACP agent interface over stdio via [`mag_acp::serve`].
+//! diagnostic. The engine is then served as an `Arc<dyn MagService>`; by default
+//! that is the terminal CLI via [`mag_cli::Cli`], while `--acp` keeps serving the
+//! ACP agent interface over stdio via [`mag_acp::serve`].
 //! Being the only crate that depends on both `mag-core` and `mag-acp` keeps
 //! the `mag-acp` library's dependency boundary intact (`docs/ACP.md` §0/§2).
 
@@ -19,8 +20,9 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use agent_client_protocol::Stdio;
+use mag_cli::{Cli as TerminalCli, CliOptions};
 use mag_core::{ConfigService, Engine};
-use mag_service::MagService;
+use mag_service::{MagService, SessionId};
 
 /// Parsed command line.
 struct Cli {
@@ -28,6 +30,8 @@ struct Cli {
     acp: bool,
     /// Explicit `--config <path>` override.
     config: Option<PathBuf>,
+    /// Existing session to resume when running the terminal CLI.
+    resume: Option<SessionId>,
     /// `--help` / `-h` was passed.
     help: bool,
 }
@@ -37,6 +41,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
     let mut cli = Cli {
         acp: false,
         config: None,
+        resume: None,
         help: false,
     };
     let mut args = args.peekable();
@@ -50,6 +55,12 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
                     .ok_or_else(|| "--config expects a path argument".to_owned())?;
                 cli.config = Some(PathBuf::from(value));
             }
+            "--resume" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--resume expects a session id argument".to_owned())?;
+                cli.resume = Some(parse_session_id(&value)?);
+            }
             _ if arg.starts_with("--config=") => {
                 let value = arg.trim_start_matches("--config=");
                 if value.is_empty() {
@@ -57,10 +68,22 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
                 }
                 cli.config = Some(PathBuf::from(value));
             }
+            _ if arg.starts_with("--resume=") => {
+                let value = arg.trim_start_matches("--resume=");
+                if value.is_empty() {
+                    return Err("--resume expects a non-empty session id".to_owned());
+                }
+                cli.resume = Some(parse_session_id(value)?);
+            }
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
     Ok(cli)
+}
+
+/// Parses a wire session id from a command-line argument.
+fn parse_session_id(value: &str) -> Result<SessionId, String> {
+    SessionId::parse_str(value).map_err(|error| format!("invalid --resume session id: {error}"))
 }
 
 /// The default configuration file path (`docs/CLI.md` §4.2, decision D4):
@@ -82,7 +105,11 @@ fn default_config_path() -> PathBuf {
 
 /// Prints the usage text.
 fn usage(write: &mut dyn std::io::Write) {
-    let _ = writeln!(write, "usage: mag [--config <path>] --acp");
+    let _ = writeln!(
+        write,
+        "usage: mag [--config <path>] [--resume <session-id>] [--acp]"
+    );
+    let _ = writeln!(write, "  (no --acp)       run the terminal CLI");
     let _ = writeln!(
         write,
         "  --acp            serve the Agent Client Protocol interface over stdio"
@@ -90,6 +117,10 @@ fn usage(write: &mut dyn std::io::Write) {
     let _ = writeln!(
         write,
         "  --config <path>  runtime configuration file (default: ~/.config/mag/config.toml)"
+    );
+    let _ = writeln!(
+        write,
+        "  --resume <id>    resume an existing CLI session at startup"
     );
     let _ = writeln!(write, "  --help, -h       show this help");
 }
@@ -128,11 +159,11 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    if !cli.acp {
+    if cli.acp && cli.resume.is_some() {
+        eprintln!("mag: --resume is only supported by the terminal CLI, not --acp");
         usage(&mut std::io::stderr());
         return ExitCode::from(2);
     }
-    let _ = std::io::stderr().flush();
 
     let config_path = cli.config.unwrap_or_else(default_config_path);
     let engine = match assemble_engine(&config_path) {
@@ -144,11 +175,26 @@ async fn main() -> ExitCode {
     };
     let service: Arc<dyn MagService> = Arc::new(engine);
 
-    match mag_acp::serve(service, Stdio::new()).await {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("mag --acp: {error}");
-            ExitCode::FAILURE
+    if cli.acp {
+        let _ = std::io::stderr().flush();
+        match mag_acp::serve(service, Stdio::new()).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("mag --acp: {error}");
+                ExitCode::FAILURE
+            }
+        }
+    } else {
+        let opts = CliOptions {
+            resume: cli.resume,
+            ..CliOptions::default()
+        };
+        match TerminalCli::run(service, opts).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("mag: {error}");
+                ExitCode::FAILURE
+            }
         }
     }
 }

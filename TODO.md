@@ -1314,7 +1314,7 @@ GUI/web/CLI 无需感知多个会话通道。
     4) `cargo test --workspace` ✅（全绿，1 ignored 为既有 zed 联调测试）5)
     `cargo doc --no-deps --workspace` ✅（0 warning）。
 
-### M6-5 [TODO] bin 装配 + 端到端验证
+### M6-5 [DONE] bin 装配 + 端到端验证
 
 - **上下文**：`docs/CLI.md` §1.1/§5/§6；bin 在 `crates/mag/src/main.rs`（现有 `--acp`）。
 - **实现要求**：
@@ -1324,6 +1324,32 @@ GUI/web/CLI 无需感知多个会话通道。
     （local + fake external ACP）→ pivot → cancel → `/config reload` → `/resume` 恢复后继续对话。
     可分多个 e2e 测试，全部离线。
 - **验证条件**：上述 e2e 全绿；默认验证序列全过。
+
+  **完成记录**（2026-07-20）：
+  - 实现要点：`crates/mag/src/main.rs` 从“必须 `--acp`”改为默认启动终端 CLI：`mag` / `mag --config
+    <path>` 读配置 → `ConfigService` → `Engine::from_config` → `mag_cli::Cli::run`；`mag --acp` 保持原 ACP
+    stdio 路径不变并共用同一配置装配；新增 `--resume <id>` / `--resume=<id>`，启动时传给 CLI 恢复已有
+    session，且显式拒绝 `--acp --resume`。usage 同步说明默认 CLI、`--config`、`--resume`、`--acp`。
+  - `mag-cli` 接线：`CliOptions` 新增 `resume: Option<SessionId>`；REPL 启动时若给定 resume id，则先调用
+    `resume_session(id)` 并打印 `[session <id> resumed]`，否则沿用原 `create_session` 路径。`/new`、`/resume`
+    slash 命令和既有 pipe/TTY 双任务结构不变；`mag-cli` crate 的 normal 依赖仍仅为 `mag-service` +
+    futures/tokio/rustyline。
+  - bin smoke：更新 `crates/mag/tests/cli.rs` 到 M6-5 语义——默认 `mag` 可用内置默认配置启动 CLI 并 `/quit`；
+    corrupt config 在默认 CLI 路径会被加载并失败；`--resume` 用 provider-backed、env-secret-only（不发送消息、
+    不触网）的持久化配置验证跨进程恢复；既有 `--acp` initialize handshake、missing config 和 secret 诊断测试
+    继续覆盖 ACP 路径不回归。
+  - 真实 Engine + CLI 离线 e2e：新增 `crates/mag/tests/engine_cli.rs`，通过本地 scripted `LlmClient` +
+    `Cli::run_with_io` 管道驱动真实 `mag_core::Engine`，覆盖：普通流式对话、`ask_user` Question 回灌、local
+    `ask_researcher` 委派、`/config reload` 与 `ConfigChanged` 渲染、门控工具场景下 pivot queued/applied、stalling
+    stream 下 Ctrl-C cancel、fake external ACP 进程 `ask_peer` 委派，以及 `/resume <id>` 后继续对话。fake ACP 为本地
+    shell 脚本，测试只读写 tempdir，不依赖网络/真实凭据/真实 LLM。
+  - 依赖边界：`mag` 作为顶层装配 crate 新增 normal 依赖 `mag-cli`；新增测试 dev-deps（agent-lib、mag-tools、
+    futures、serde_json、async-trait、tokio io/time）仅用于离线 fake LLM/工具 e2e；`mag-cli` normal 依赖未增加
+    mag-core/agent-lib/mag-config。
+  - 门禁结果：1) `cargo fmt --all -- --check` ✅ 2) 聚焦测试 `cargo test -p mag-cli` ✅（8 passed）与
+    `cargo test -p mag` ✅（bin smoke 8 passed + Engine/CLI e2e 3 passed）3)
+    `cargo clippy --all-targets -- -D warnings` ✅ 4) `cargo test --workspace` ✅（全绿，1 ignored 为既有 zed 联调
+    测试）5) `cargo doc --no-deps --workspace` ✅（0 warning）。
 
 ### M6-R [TODO] M6 review
 

@@ -410,6 +410,7 @@ fn options() -> CliOptions {
             routing: RoutingMode::default(),
             budget: None,
         },
+        resume: None,
         prompt: "mag> ".to_owned(),
     }
 }

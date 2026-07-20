@@ -1086,9 +1086,15 @@ name = "mag"
 version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
+ "agent-lib",
+ "async-trait",
+ "futures",
  "mag-acp",
+ "mag-cli",
  "mag-core",
  "mag-service",
+ "mag-tools",
+ "serde_json",
  "tokio",
 ]
 
