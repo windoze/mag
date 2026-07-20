@@ -339,6 +339,17 @@ impl SessionDriver {
     /// freshly built one instead of silently falling back to agent-lib's
     /// default allow tier.
     ///
+    /// Re-registration alone would leave a delegate the configuration dropped
+    /// between snapshot and restore registered — resurrected approval-free
+    /// under agent-lib's default merge semantics. The restore therefore also
+    /// enables
+    /// [`AgentRestoreBuilder::prune_unregistered_delegates`](agent_lib::facade::AgentRestoreBuilder::prune_unregistered_delegates):
+    /// the current configuration is the authority over which delegates may
+    /// exist, so a persisted delegate the binding no longer re-registers
+    /// (local or managed external) is pruned together with its synthesized
+    /// `ask_<name>` declaration, which never reaches the restored tool
+    /// surface.
+    ///
     /// # Errors
     ///
     /// Returns any [`FacadeError`] raised while rebuilding the agent (for example
@@ -380,7 +391,17 @@ impl SessionDriver {
             external_handlers.push(handler);
             builder = builder.external_agent(delegate.name().to_owned(), agent);
         }
-        let agent = builder.approval(policy).build()?;
+        // The current configuration is the authority over which delegates may
+        // exist: a persisted delegate the binding no longer re-registers (it
+        // was removed from the configuration between snapshot and restore) is
+        // pruned together with its synthesized `ask_<name>` declaration,
+        // instead of being resurrected with agent-lib's default auto-allow
+        // approval policy (agent-lib
+        // [`AgentRestoreBuilder::prune_unregistered_delegates`]).
+        let agent = builder
+            .prune_unregistered_delegates()
+            .approval(policy)
+            .build()?;
 
         Ok(Self {
             agent,
@@ -594,12 +615,16 @@ impl SessionDriver {
     /// - `tools` → [`ReconfigRequest::ReplaceToolSet`] with the declarations
     ///   of the enabled entries, projected from this driver's executable
     ///   [`ToolRegistry`] (only when the effective name set changed). A config
-    ///   tool name with no registered plugin is skipped with a warn log — the
-    ///   facade would reject the whole set for referencing a tool outside its
-    ///   registry. An agent entry with no tool list imposes no constraint and
-    ///   leaves the current surface untouched; an explicit `tools = []` clears
-    ///   the surface (an empty replacement set passes facade admission — its
-    ///   backing check is vacuous).
+    ///   tool name with no registered plugin is skipped with a warn log. The
+    ///   projection deliberately covers only non-delegate tools: the facade
+    ///   re-synthesizes the `ask_<name>` delegation declarations from the
+    ///   currently registered delegates on every tool-set reconfigure
+    ///   (agent-lib tool-set reconfig resynthesis), so applying a narrowed
+    ///   `tools` list can never strip the delegation surface. An agent entry
+    ///   with no tool list imposes no constraint and leaves the current
+    ///   surface untouched; an explicit `tools = []` clears the non-delegate
+    ///   surface (an empty replacement set passes facade admission — its
+    ///   backing check is vacuous) while the delegation declarations remain.
     /// - `system_prompt` → this driver's config-controlled overlay target. The
     ///   target is queued as [`ReconfigRequest::SetSystemPromptOverlay`] right
     ///   before the next turn starts instead of being stored in the agent's
@@ -1911,7 +1936,9 @@ enabled = false
     /// An explicit `tools = []` on the bound entry clears the session's tool
     /// surface: the replacement set is empty (facade admission is vacuous for
     /// zero declarations), unlike an absent `tools` key which leaves the
-    /// surface untouched.
+    /// surface untouched. This driver registers no delegates; with delegates
+    /// the facade would still re-synthesize their `ask_<name>` declarations
+    /// (see the delegation regression test in `engine.rs`).
     #[test]
     fn apply_config_clears_the_surface_on_an_explicit_empty_tool_list() {
         driver_test_runtime().block_on(async {

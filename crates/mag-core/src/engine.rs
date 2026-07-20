@@ -4688,6 +4688,243 @@ model = "model-r"
         );
     }
 
+    /// B1 regression: applying a config whose bound entry narrows the tool
+    /// surface (`tools = [...]`) projects a `ReplaceToolSet` covering only the
+    /// registry plugins; agent-lib re-synthesizes the delegation declarations
+    /// from the registered delegates (commit 7eaf754), so `ask_researcher`
+    /// survives the apply on the tool surface and the delegation still routes.
+    /// Under the old facade semantics the replacement set stripped
+    /// `ask_researcher`, and the scripted delegation call below would have
+    /// been answered as an unknown tool.
+    #[tokio::test]
+    async fn apply_config_keeps_delegate_tools_on_the_tool_surface() {
+        let (_dir, engine, fake) = engine_with_config(
+            r#"
+[agents.default]
+model = "model-d"
+tools = ["read_file"]
+
+[agents.researcher]
+model = "model-r"
+
+[tools.ask_researcher]
+approval = "allow"
+"#,
+            vec![
+                tool_use_stream("ask_researcher", "del-1", json!({ "task": "inspect" })),
+                text_stream_with_usage(&["research summary"], usage()),
+                text_stream_with_usage(&["final answer"], usage()),
+            ],
+        );
+        let session = engine
+            .create_session(session_config("default", "fake-chat"))
+            .await
+            .expect("create session");
+        let mut events = engine.subscribe(Some(session));
+
+        engine.apply_config().await.expect("apply config");
+
+        engine
+            .send_message(session, UserInput::text("inspect"))
+            .await
+            .expect("send message");
+        let collected = collect_until_terminal(&mut events).await;
+
+        // The narrowed surface applied (no `shell`), yet the delegation
+        // declaration survived the ReplaceToolSet.
+        let requests = fake.stream_requests();
+        assert_eq!(requests.len(), 2, "supervisor turn + continuation");
+        let tool_names: Vec<&str> = requests[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert!(
+            tool_names.contains(&"ask_researcher"),
+            "apply_config must not strip the delegation tool: {tool_names:?}"
+        );
+        assert!(
+            tool_names.contains(&"read_file") && !tool_names.contains(&"shell"),
+            "the narrowed non-delegate surface applied: {tool_names:?}"
+        );
+
+        // The delegation still routes and executes end to end.
+        let started = collected
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    ServiceEvent::DelegationStarted { trace, .. } if trace.delegate == "researcher"
+                )
+            })
+            .expect("a DelegationStarted event");
+        let finished = collected
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    ServiceEvent::DelegationFinished { trace, .. } if trace.delegate == "researcher"
+                )
+            })
+            .expect("a DelegationFinished event");
+        assert!(
+            started < finished,
+            "started precedes finished: {collected:?}"
+        );
+        assert!(
+            matches!(
+                collected.last(),
+                Some(ServiceEvent::RunFinished { output, .. }) if output.text == "final answer"
+            ),
+            "the supervisor continues after the delegation: {collected:?}"
+        );
+        assert_eq!(fake.chat_requests().len(), 1, "the delegate child ran once");
+    }
+
+    /// B4 regression: resuming a session whose configuration no longer
+    /// contains a delegate prunes the persisted delegate instead of
+    /// resurrecting it approval-free (agent-lib commit 21815a6,
+    /// `AgentRestoreBuilder::prune_unregistered_delegates`, wired in
+    /// `SessionDriver::restore`). Without the prune, `ask_x` would stay
+    /// advertised on the restored tool surface under agent-lib's default
+    /// auto-allow policy.
+    #[tokio::test]
+    async fn resume_prunes_delegates_removed_from_the_config() {
+        let dir = TempConfigDir::new();
+        let db = dir.0.join("sessions.sqlite");
+        fs::write(
+            dir.config_path(),
+            r#"
+[agents.default]
+model = "model-d"
+
+[agents.x]
+model = "model-x"
+
+[agents.researcher]
+model = "model-r"
+"#,
+        )
+        .expect("write config");
+
+        let service1 =
+            Arc::new(ConfigService::load_or_default(dir.config_path()).expect("load config"));
+        let fake1 = FakeLlmClient::scripted(vec![text_stream_with_usage(&["ready"], usage())]);
+        let client1: Arc<dyn LlmClient> = fake1;
+        let engine1 = Engine::assemble(
+            Some(client1),
+            Arc::new(registry()),
+            Arc::new(crate::persistence::Persistence::open(&db).expect("open store")),
+            Some(service1),
+            mag_sources::SourceRegistry::new(),
+        );
+        let session = engine1
+            .create_session(session_config("default", "fake-chat"))
+            .await
+            .expect("create session");
+        let mut events1 = engine1.subscribe(Some(session));
+        engine1
+            .send_message(session, UserInput::text("warm up"))
+            .await
+            .expect("send warmup");
+        collect_until_terminal(&mut events1).await;
+        drop(events1);
+        drop(engine1);
+
+        // The delegate `agents.x` is removed from the configuration before
+        // the restart; `agents.researcher` stays.
+        fs::write(
+            dir.config_path(),
+            r#"
+[agents.default]
+model = "model-d"
+
+[agents.researcher]
+model = "model-r"
+"#,
+        )
+        .expect("rewrite config without agents.x");
+
+        let service2 =
+            Arc::new(ConfigService::load_or_default(dir.config_path()).expect("reload config"));
+        let fake2 = FakeLlmClient::scripted(vec![
+            tool_use_stream(
+                "ask_researcher",
+                "del-1",
+                json!({ "task": "resume inspect" }),
+            ),
+            text_stream_with_usage(&["research summary"], usage()),
+            text_stream_with_usage(&["resumed final"], usage()),
+        ]);
+        let client2: Arc<dyn LlmClient> = fake2.clone();
+        let engine2 = Engine::assemble(
+            Some(client2),
+            Arc::new(registry()),
+            Arc::new(crate::persistence::Persistence::open(&db).expect("reopen store")),
+            Some(service2),
+            mag_sources::SourceRegistry::new(),
+        );
+        engine2
+            .resume_session(session)
+            .await
+            .expect("resume session");
+        let mut events2 = engine2.subscribe(Some(session));
+        engine2
+            .send_message(session, UserInput::text("after resume"))
+            .await
+            .expect("send after resume");
+
+        // The pruned delegate never reaches the restored tool surface, while
+        // the still-configured delegate is re-registered and advertised.
+        let request_id = next_approval_request(&mut events2, None, "ask_researcher").await;
+        let first_request = fake2
+            .stream_requests()
+            .into_iter()
+            .next()
+            .expect("the resumed supervisor made an LLM request");
+        let tool_names: Vec<&str> = first_request
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert!(
+            !tool_names.contains(&"ask_x"),
+            "the config-removed delegate is pruned, not resurrected: {tool_names:?}"
+        );
+        assert!(
+            tool_names.contains(&"ask_researcher"),
+            "the surviving delegate is re-registered: {tool_names:?}"
+        );
+
+        // The surviving delegate's start still pauses for approval (the
+        // configured tier is re-supplied, not fallen back to auto-allow), and
+        // approving it drives the delegate to completion.
+        engine2
+            .respond_interaction(session, request_id, approval(ApprovalDecisionWire::Approve))
+            .await
+            .expect("approve restored delegation");
+        let rest = collect_until_terminal(&mut events2).await;
+        assert!(
+            rest.iter().any(|event| matches!(
+                event,
+                ServiceEvent::DelegationFinished { trace, .. } if trace.delegate == "researcher"
+            )),
+            "the restored delegate runs after approval: {rest:?}"
+        );
+        assert!(
+            !rest.iter().any(|event| matches!(
+                event,
+                ServiceEvent::DelegationStarted { trace, .. } if trace.delegate == "x"
+            )),
+            "the pruned delegate never runs: {rest:?}"
+        );
+        assert_eq!(
+            fake2.chat_requests().len(),
+            1,
+            "only the surviving delegate's child ran"
+        );
+    }
+
     /// M4-3 external path: without an explicit `[tools.ask_peer] allow`, a
     /// managed ACP delegate start first asks the root session. Approval then
     /// allows the fake ACP process to run.
