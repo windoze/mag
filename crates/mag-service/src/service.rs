@@ -14,6 +14,7 @@
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
+use mag_config::ConfigDto;
 use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt};
 
@@ -159,6 +160,76 @@ pub trait MagService: Send + Sync {
     ///
     /// Returns a [`ServiceError`] when the probe cannot be performed.
     async fn probe_local_agents(&self) -> Result<Vec<SourceInfo>, ServiceError>;
+
+    // —— Runtime configuration ——
+
+    /// Returns the current runtime configuration projected back to its DTO
+    /// form (`docs/CLI.md` §4.2/§4.3, decision D4).
+    ///
+    /// The returned [`ConfigDto`] mirrors *any* configuration source (the TOML
+    /// file is just one persistence form). Secret fields keep their reference
+    /// shape (`{env = ".."}` / `{keyring = ".."}`); values are never
+    /// materialized through this contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError::Unsupported`] when the implementation has no
+    /// configuration backend, or [`ServiceError::Config`] when the current
+    /// snapshot cannot be projected.
+    async fn get_config(&self) -> Result<ConfigDto, ServiceError>;
+
+    /// Replaces the runtime configuration with `config` (`docs/CLI.md` §4.3).
+    ///
+    /// The DTO is resolved into a new snapshot, written through to the config
+    /// file, and swapped in with a bumped revision; subscribers observe a
+    /// [`ServiceEvent::ConfigChanged`]. Effect timing follows decision D2
+    /// (`docs/CLI.md` §4.4): the new snapshot applies to *new* sessions
+    /// immediately but does **not** affect sessions that already pinned an
+    /// older snapshot — use [`apply_config`](MagService::apply_config) to roll
+    /// it onto live sessions. A failed validation or write leaves the current
+    /// snapshot untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError::Config`] when the DTO fails validation or the
+    /// write-through fails, [`ServiceError::Unsupported`] when the
+    /// implementation has no configuration backend, or another
+    /// [`ServiceError`] on backend failure.
+    async fn update_config(&self, config: ConfigDto) -> Result<(), ServiceError>;
+
+    /// Re-reads the configuration file and swaps in a fresh snapshot
+    /// (`docs/CLI.md` §4.3).
+    ///
+    /// On success the revision is bumped and subscribers observe a
+    /// [`ServiceEvent::ConfigChanged`]. Effect timing follows decision D2
+    /// (`docs/CLI.md` §4.4): the new snapshot applies to *new* sessions
+    /// immediately but does **not** affect sessions that already pinned an
+    /// older snapshot. A missing, corrupt, or invalid file keeps the current
+    /// snapshot and reports the failure — the running process never crashes
+    /// on a bad config.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError::Config`] when the file cannot be read or
+    /// validated, [`ServiceError::Unsupported`] when the implementation has no
+    /// configuration backend, or another [`ServiceError`] on backend failure.
+    async fn reload_config(&self) -> Result<(), ServiceError>;
+
+    /// Requests that the current configuration snapshot be applied to live
+    /// sessions (`docs/CLI.md` §4.4, decision D2).
+    ///
+    /// The application is queued per session and executed at each session's
+    /// **next turn boundary** through the turn-complete mechanism
+    /// (`docs/CLI.md` §4.5); sessions without an in-progress run apply
+    /// immediately. A run that is currently in flight is never mutated
+    /// mid-turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError::Unsupported`] when the implementation has no
+    /// configuration backend (or no turn-complete mechanism), or another
+    /// [`ServiceError`] on backend failure.
+    async fn apply_config(&self) -> Result<(), ServiceError>;
 }
 
 /// Neutral user input supplied to [`MagService::send_message`].
@@ -338,13 +409,27 @@ pub enum ServiceEvent {
         /// terminal run state preempted it).
         reason: String,
     },
+    /// The runtime configuration changed; `revision` is the new snapshot's
+    /// revision (`docs/CLI.md` §4.3, decisions D2/D4).
+    ///
+    /// This is a global event (no session scope), so
+    /// [`session_id`](ServiceEvent::session_id) returns `None` and every
+    /// subscriber — including per-session ones — observes it. The new
+    /// snapshot applies to *new* sessions immediately; existing sessions keep
+    /// their pinned snapshot until [`MagService::apply_config`] lands the
+    /// change at a turn boundary (`docs/CLI.md` §4.4).
+    ConfigChanged {
+        /// Monotonic revision of the newly applied configuration snapshot.
+        revision: u64,
+    },
 }
 
 impl ServiceEvent {
     /// Returns the session this event is scoped to, if any.
     ///
     /// Session-scoped variants return `Some`; global events such as
-    /// [`LocalAgentsProbed`](ServiceEvent::LocalAgentsProbed) return `None`.
+    /// [`LocalAgentsProbed`](ServiceEvent::LocalAgentsProbed) and
+    /// [`ConfigChanged`](ServiceEvent::ConfigChanged) return `None`.
     /// [`MagService::subscribe`] uses this to filter events per session.
     #[must_use]
     pub fn session_id(&self) -> Option<SessionId> {
@@ -364,7 +449,7 @@ impl ServiceEvent {
             | Self::PivotQueued { id, .. }
             | Self::PivotApplied { id, .. }
             | Self::PivotDropped { id, .. } => Some(*id),
-            Self::LocalAgentsProbed { .. } => None,
+            Self::LocalAgentsProbed { .. } | Self::ConfigChanged { .. } => None,
         }
     }
 }
@@ -405,6 +490,7 @@ impl From<Event> for ServiceEvent {
             Event::PivotQueued { id } => Self::PivotQueued { id },
             Event::PivotApplied { id } => Self::PivotApplied { id },
             Event::PivotDropped { id, reason } => Self::PivotDropped { id, reason },
+            Event::ConfigChanged { revision } => Self::ConfigChanged { revision },
         }
     }
 }
@@ -446,6 +532,17 @@ pub enum ServiceError {
         /// Operation name that is not supported.
         operation: String,
     },
+    /// A configuration operation failed (`docs/CLI.md` §4, decisions D2/D4).
+    ///
+    /// Carries configuration errors surfaced by the runtime configuration
+    /// system (validation failures, unreadable or corrupt config files,
+    /// write-through failures) through the service contract. The message
+    /// describes the failure — including the field path or file position when
+    /// known — and never contains materialized secret values.
+    Config {
+        /// Human-readable configuration failure detail.
+        message: String,
+    },
     /// The backing engine failed to complete the operation.
     Backend {
         /// Human-readable failure detail.
@@ -467,6 +564,7 @@ impl fmt::Display for ServiceError {
             Self::Unsupported { operation } => {
                 write!(formatter, "operation `{operation}` is not supported")
             }
+            Self::Config { message } => write!(formatter, "config error: {message}"),
             Self::Backend { message } => write!(formatter, "backend error: {message}"),
         }
     }
@@ -603,6 +701,30 @@ mod tests {
 
         async fn probe_local_agents(&self) -> Result<Vec<SourceInfo>, ServiceError> {
             Ok(Vec::new())
+        }
+
+        async fn get_config(&self) -> Result<ConfigDto, ServiceError> {
+            Err(ServiceError::Unsupported {
+                operation: "get_config".to_owned(),
+            })
+        }
+
+        async fn update_config(&self, _config: ConfigDto) -> Result<(), ServiceError> {
+            Err(ServiceError::Unsupported {
+                operation: "update_config".to_owned(),
+            })
+        }
+
+        async fn reload_config(&self) -> Result<(), ServiceError> {
+            Err(ServiceError::Unsupported {
+                operation: "reload_config".to_owned(),
+            })
+        }
+
+        async fn apply_config(&self) -> Result<(), ServiceError> {
+            Err(ServiceError::Unsupported {
+                operation: "apply_config".to_owned(),
+            })
         }
     }
 
@@ -764,6 +886,10 @@ mod tests {
                 },
                 "pivot_dropped",
             ),
+            (
+                ServiceEvent::ConfigChanged { revision: 7 },
+                "config_changed",
+            ),
         ];
 
         for (event, expected_tag) in cases {
@@ -856,6 +982,10 @@ mod tests {
                     },
                 },
             ),
+            (
+                Event::ConfigChanged { revision: 7 },
+                ServiceEvent::ConfigChanged { revision: 7 },
+            ),
         ];
 
         for (event, expected) in cases {
@@ -895,6 +1025,10 @@ mod tests {
             }
             .session_id(),
             None,
+        );
+        assert_eq!(
+            ServiceEvent::ConfigChanged { revision: 3 }.session_id(),
+            None
         );
     }
 
@@ -975,6 +1109,53 @@ mod tests {
                 ServiceError::Unsupported {
                     operation: "pivot_message".to_owned(),
                 },
+            );
+        });
+    }
+
+    #[test]
+    fn config_error_round_trips_and_displays() {
+        let error = ServiceError::Config {
+            message: "agents.default.provider: unknown provider \"missing\"".to_owned(),
+        };
+        let display = error.to_string();
+        assert!(display.contains("config error"));
+        assert!(display.contains("unknown provider"));
+
+        let json = serde_json::to_value(&error).expect("serialize error");
+        assert_eq!(json.get("type"), Some(&Value::String("config".to_owned())));
+        let decoded = serde_json::from_value::<ServiceError>(json).expect("deserialize error");
+        assert_eq!(decoded, error);
+    }
+
+    #[test]
+    fn config_methods_are_callable_behind_arc_dyn() {
+        futures::executor::block_on(async {
+            let service: Arc<dyn MagService> = Arc::new(DummyService);
+
+            assert_eq!(
+                service.get_config().await,
+                Err(ServiceError::Unsupported {
+                    operation: "get_config".to_owned(),
+                }),
+            );
+            assert_eq!(
+                service.update_config(ConfigDto::default()).await,
+                Err(ServiceError::Unsupported {
+                    operation: "update_config".to_owned(),
+                }),
+            );
+            assert_eq!(
+                service.reload_config().await,
+                Err(ServiceError::Unsupported {
+                    operation: "reload_config".to_owned(),
+                }),
+            );
+            assert_eq!(
+                service.apply_config().await,
+                Err(ServiceError::Unsupported {
+                    operation: "apply_config".to_owned(),
+                }),
             );
         });
     }

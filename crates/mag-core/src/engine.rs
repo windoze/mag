@@ -280,6 +280,37 @@ impl MagService for Engine {
             operation: "probe_local_agents".to_owned(),
         })
     }
+
+    // —— Runtime configuration ——
+    //
+    // Placeholder until the `ConfigService` wiring lands: construction
+    // injection and the broadcast → `ServiceEvent::ConfigChanged` bridge are
+    // M3-5/M3-6 scope (`docs/CLI.md` §4.3–§4.5). Until then the engine reports
+    // the configuration surface as unsupported, matching the `list_sources`
+    // convention.
+    async fn get_config(&self) -> Result<mag_service::ConfigDto, ServiceError> {
+        Err(ServiceError::Unsupported {
+            operation: "get_config".to_owned(),
+        })
+    }
+
+    async fn update_config(&self, _config: mag_service::ConfigDto) -> Result<(), ServiceError> {
+        Err(ServiceError::Unsupported {
+            operation: "update_config".to_owned(),
+        })
+    }
+
+    async fn reload_config(&self) -> Result<(), ServiceError> {
+        Err(ServiceError::Unsupported {
+            operation: "reload_config".to_owned(),
+        })
+    }
+
+    async fn apply_config(&self) -> Result<(), ServiceError> {
+        Err(ServiceError::Unsupported {
+            operation: "apply_config".to_owned(),
+        })
+    }
 }
 
 impl Default for Engine {
@@ -485,6 +516,35 @@ mod skeleton {
             engine.probe_local_agents().await,
             Err(ServiceError::Unsupported {
                 operation: "probe_local_agents".to_owned(),
+            })
+        );
+
+        // Runtime configuration: unsupported until the `ConfigService` wiring
+        // lands (M3-5/M3-6).
+        assert_eq!(
+            engine.get_config().await,
+            Err(ServiceError::Unsupported {
+                operation: "get_config".to_owned(),
+            })
+        );
+        assert_eq!(
+            engine
+                .update_config(mag_service::ConfigDto::default())
+                .await,
+            Err(ServiceError::Unsupported {
+                operation: "update_config".to_owned(),
+            })
+        );
+        assert_eq!(
+            engine.reload_config().await,
+            Err(ServiceError::Unsupported {
+                operation: "reload_config".to_owned(),
+            })
+        );
+        assert_eq!(
+            engine.apply_config().await,
+            Err(ServiceError::Unsupported {
+                operation: "apply_config".to_owned(),
             })
         );
     }

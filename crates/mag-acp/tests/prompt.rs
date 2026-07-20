@@ -119,6 +119,30 @@ impl MagService for ScriptedService {
     async fn probe_local_agents(&self) -> Result<Vec<SourceInfo>, ServiceError> {
         Ok(Vec::new())
     }
+
+    async fn get_config(&self) -> Result<mag_service::ConfigDto, ServiceError> {
+        Err(ServiceError::Unsupported {
+            operation: "get_config".to_owned(),
+        })
+    }
+
+    async fn update_config(&self, _config: mag_service::ConfigDto) -> Result<(), ServiceError> {
+        Err(ServiceError::Unsupported {
+            operation: "update_config".to_owned(),
+        })
+    }
+
+    async fn reload_config(&self) -> Result<(), ServiceError> {
+        Err(ServiceError::Unsupported {
+            operation: "reload_config".to_owned(),
+        })
+    }
+
+    async fn apply_config(&self) -> Result<(), ServiceError> {
+        Err(ServiceError::Unsupported {
+            operation: "apply_config".to_owned(),
+        })
+    }
 }
 
 fn session_id() -> SessionId {

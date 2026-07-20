@@ -571,7 +571,7 @@ GUI/web/CLI 无需感知多个会话通道。
     ✅（全绿，1 ignored 为既有 `#[ignore]` 联调测试）5) `cargo doc --no-deps --workspace` ✅
     （0 warning）。
 
-### M3-4 [TODO] mag-service：配置方法 + `ConfigChanged` 事件
+### M3-4 [DONE] mag-service：配置方法 + `ConfigChanged` 事件
 
 - **上下文**：`docs/CLI.md` §4.3/§5。wire 形态：配置内容本身用 DTO 的 JSON 形态（serde 已就位），
   不在 mag-service 重复定义一套配置 wire 类型——`mag-service` 依赖 `mag-config` 取 DTO 类型（纯数据
@@ -585,6 +585,48 @@ GUI/web/CLI 无需感知多个会话通道。
   - `ServiceEvent` 新增变体 `ConfigChanged{revision: u64}`（全局事件，`session_id() -> None`）。
   - `ServiceError` 如需新增 `Config{message}` 变体承载配置错误。
 - **验证条件**：`cargo test -p mag-service`；事件序列化 roundtrip；默认验证序列全过。
+
+  **完成记录**（2026-07-22）：
+  - 实现要点：mag-service 新增 path 依赖 `mag-config`（合法方向：service → config 纯数据 crate，
+    `cargo tree` 确认无 agent-lib/mag-core 反向依赖），lib.rs re-export `ConfigDto` 使其成为契约
+    类型（mag-cli 只允许依赖 mag-service，`/config show` 渲染经 re-export 取型）。`MagService` 新增
+    「Runtime configuration」段四方法（置于 `probe_local_agents` 之后）：`get_config() ->
+    Result<ConfigDto, ServiceError>`（当前快照投影回 DTO，secret 保持引用形态）、
+    `update_config(ConfigDto)`、`reload_config()`、`apply_config()`。`ServiceEvent` 与 wire `Event`
+    **双枚举同步**新增 `ConfigChanged{revision: u64}`（M1-2 教训），`From<Event> for ServiceEvent`
+    投影同步；`session_id()` 返回 `None`（全局事件，按会话订阅者也能收到）。`ServiceError` 新增
+    `Config{message}`（含 `Display`："config error: .."）。全部只加不改，`Command` 协议未动。
+  - 关键决策：① **四方法均无默认实现**（M1-1 惯例：crate 内方法全部为必需方法，未支持由实现者
+    返回 `ServiceError::Unsupported`），同步更新全部 8 个实现者——mag-core `Engine`（四方法
+    `Unsupported{operation}` stub + 注释注明 M3-5/M3-6 接线点；**未**顺手接 get/update/reload：
+    Engine 尚无 `ConfigService` 字段，构造注入与 broadcast→`ConfigChanged` 桥接属 M3-5/M3-6，
+    本任务接不了三方法中的任何一个而不越界）、mag-service `DummyService`、mag-acp 六个测试
+    fake（`FakeService`/`ScriptedService`/`RoundService`/`BridgeService`/`CancelService`/
+    `TwoRunService`）。② **`get_config` 返回 `Result`**——TODO 任务书原文写 `-> ConfigDto`，但
+    trait 全部 async 方法统一 `Result<_, ServiceError>`（复用锚点明确），且无配置后端的实现者需要
+    `Unsupported` 出口，取 `Result<ConfigDto, ServiceError>`。③ **事件载荷只有 `revision`**——
+    docs/CLI.md §4.3 草稿写 `ConfigChanged{revision, summary}`，以 TODO 任务书
+    `ConfigChanged{revision: u64}` 为准（同 M1-R 对 `Pivot*` 不携带 text 的取舍：事件保持小）。
+    ④ `Config{message}` 只带 message 字符串（serde 友好；`ConfigError` 的行/列/路径信息展平进
+    message，契约不绑定 mag-config 错误类型——secret 纪律由 message 不含物化 secret 值保证，
+    rustdoc 注明）。
+  - rustdoc：四方法注明决策 D2 生效时机——update/reload 立即换快照、revision+1、发
+    `ConfigChanged`，但**不影响已钉住会话**；reload 遇损坏文件保留当前快照不崩；`apply_config`
+    经 turn-complete 机制（§4.5，M3-5）在**各会话下一个 turn 边界**应用、Idle 会话立即应用、
+    在飞 run 绝不 mid-turn 变更。`ConfigChanged`（双枚举）注明全局事件语义与新会话立即生效/
+    旧会话钉住的 D2 语义。
+  - 测试（全部离线；mag-service 19 passed）：`config_changed` tag 纳入双枚举 roundtrip+稳定 tag
+    用例（revision 7）；`event_projects_into_matching_service_event` 新增 `Event::ConfigChanged`
+    投影用例；`session_id()` 新增 `ConfigChanged -> None` 断言；
+    `config_error_round_trips_and_displays`（tag `config` + Display）；
+    `config_methods_are_callable_behind_arc_dyn`（object-safe 下四方法默认 stub 返回对应
+    `Unsupported`）。mag-core `unimplemented_methods_return_unsupported` 扩为覆盖四方法。
+  - 依赖边界：`cargo tree -p mag-service -e normal --depth 1` 为 async-trait/futures/mag-config/
+    serde/serde_json/uuid——无 agent-lib/mag-core，硬约束满足。
+  - 门禁结果：1) `cargo fmt --all -- --check` ✅（初次 3 处 fmt diff，`cargo fmt --all` 修复后复检
+    通过）2) `cargo test -p mag-service` ✅（19 passed）3) `cargo clippy --all-targets --
+    -D warnings` ✅ 4) `cargo test --workspace` ✅（全部测试目标 ok，1 ignored 为既有
+    `#[ignore]` 联调测试）5) `cargo doc --no-deps --workspace` ✅（0 warning）。
 
 ### M3-5 [TODO] mag-core：turn-complete 通知/回调机制 + `apply_config`
 

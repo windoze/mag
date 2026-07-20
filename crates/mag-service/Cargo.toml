@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 async-trait.workspace = true
 futures.workspace = true
+mag-config = { path = "../mag-config" }
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true

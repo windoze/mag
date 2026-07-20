@@ -27,6 +27,7 @@ use uuid::Uuid;
 
 mod service;
 
+pub use mag_config::ConfigDto;
 pub use service::{MagService, ServiceError, ServiceEvent, SessionInfo, UserInput};
 
 macro_rules! define_id {
@@ -300,6 +301,18 @@ pub enum Event {
         id: SessionId,
         /// Human-readable reason the pivot was dropped.
         reason: String,
+    },
+    /// The runtime configuration changed; `revision` is the new snapshot's
+    /// revision (`docs/CLI.md` §4.3, decisions D2/D4).
+    ///
+    /// This is a global event (no session scope): the new snapshot applies to
+    /// *new* sessions immediately, while existing sessions keep their pinned
+    /// snapshot until [`MagService::apply_config`] lands the change at a turn
+    /// boundary (`docs/CLI.md` §4.4). The transport-facing twin of
+    /// [`ServiceEvent::ConfigChanged`].
+    ConfigChanged {
+        /// Monotonic revision of the newly applied configuration snapshot.
+        revision: u64,
     },
 }
 
@@ -1038,6 +1051,7 @@ mod tests {
                 },
                 "pivot_dropped",
             ),
+            (Event::ConfigChanged { revision: 7 }, "config_changed"),
         ];
 
         for (event, expected_tag) in cases {

@@ -95,6 +95,30 @@ impl MagService for FakeService {
     async fn probe_local_agents(&self) -> Result<Vec<SourceInfo>, ServiceError> {
         Ok(Vec::new())
     }
+
+    async fn get_config(&self) -> Result<mag_service::ConfigDto, ServiceError> {
+        Err(ServiceError::Unsupported {
+            operation: "get_config".to_owned(),
+        })
+    }
+
+    async fn update_config(&self, _config: mag_service::ConfigDto) -> Result<(), ServiceError> {
+        Err(ServiceError::Unsupported {
+            operation: "update_config".to_owned(),
+        })
+    }
+
+    async fn reload_config(&self) -> Result<(), ServiceError> {
+        Err(ServiceError::Unsupported {
+            operation: "reload_config".to_owned(),
+        })
+    }
+
+    async fn apply_config(&self) -> Result<(), ServiceError> {
+        Err(ServiceError::Unsupported {
+            operation: "apply_config".to_owned(),
+        })
+    }
 }
 
 /// Drives an `initialize` request from the real ACP client, through an in-memory
