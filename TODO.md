@@ -87,7 +87,7 @@
 mag-core driver 落地 pivot 队列旁路（agent-lib `interject()`）。第二层「不能 pivot 自动转 send_message」
 在 CLI 侧（M6）实现。
 
-### M1-1 [TODO] mag-service：pivot 契约新增
+### M1-1 [DONE] mag-service：pivot 契约新增
 
 - **上下文**：`docs/CLI.md` §3.2（决策 D1 第一层）。只加不改。
 - **实现要求**：
@@ -101,6 +101,30 @@ mag-core driver 落地 pivot 队列旁路（agent-lib `interject()`）。第二�
     in-progress turn 返回 `NotPivotable`），第二层（调用方回落 `send_message`）由调用方实现。
 - **验证条件**：`cargo test -p mag-service`；序列化/反序列化 roundtrip 单测覆盖三个新事件变体与新错误
   变体；默认验证序列全过。
+
+  **完成记录**（2026-07-20）：
+  - 实现要点：`MagService` 新增 `pivot_message(SessionId, UserInput) -> Result<(), ServiceError>`
+    （置于 `cancel` 之后，「Conversation / runs」段）；`ServiceError` 新增
+    `NotPivotable{id, reason}`（含 `Display`）；`ServiceEvent` 新增 `PivotQueued{id}` /
+    `PivotApplied{id}` / `PivotDropped{id, reason}`（追加在 `LocalAgentsProbed` 之后），
+    `session_id()` 三个新变体均返回 `Some(id)`。全部只加不改，`Command`/`Event` wire 协议未动。
+  - 关键决策：trait 新方法**不带默认实现**——crate 内现有方法（`create_session`…
+    `probe_local_agents`）全部为必需方法、无默认实现，且未支持能力由实现者返回
+    `ServiceError::Unsupported`（见 `Engine::list_sources`/`probe_local_agents`），故按既有惯例
+    二选一中的「无默认实现」，并同步更新全部实现者返回 `Unsupported{operation:"pivot_message"}`
+    stub：mag-core `Engine`（真正实现属 M1-2）、mag-service 测试 `DummyService`、mag-acp 五个测试
+    fake（`FakeService`/`ScriptedService`/`BridgeService`/`RoundService`/`CancelService`/
+    `TwoRunService`）。
+  - rustdoc：`pivot_message`、`NotPivotable`、`Pivot*` 变体均引用 `docs/CLI.md` §3.2（决策 D1），
+    注明本方法只负责第一层（仅对 in-progress turn 注入；无则 `NotPivotable`），第二层
+    （回落 `send_message`）由调用方实现。
+  - 测试：三新事件变体纳入 roundtrip+稳定 tag 用例（`pivot_queued`/`pivot_applied`/
+    `pivot_dropped`）；`session_id()` 覆盖三新变体；新增
+    `not_pivotable_error_round_trips_and_displays`（tag `not_pivotable` + Display）与
+    `pivot_message_is_callable_behind_arc_dyn`（object-safe 下默认 stub 返回 Unsupported）。
+  - 门禁结果：1) `cargo fmt --all -- --check` ✅ 2) `cargo test -p mag-service` ✅（14 passed）
+    3) `cargo clippy --all-targets -- -D warnings` ✅ 4) `cargo test --workspace` ✅（全绿，
+    无失败）5) `cargo doc --no-deps --workspace` ✅。
 
 ### M1-2 [TODO] mag-core：driver pivot 队列旁路
 

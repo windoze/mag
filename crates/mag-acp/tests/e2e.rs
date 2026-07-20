@@ -69,6 +69,12 @@ impl MagService for FakeService {
         Ok(())
     }
 
+    async fn pivot_message(&self, _id: SessionId, _input: UserInput) -> Result<(), ServiceError> {
+        Err(ServiceError::Unsupported {
+            operation: "pivot_message".to_owned(),
+        })
+    }
+
     async fn respond_interaction(
         &self,
         _id: SessionId,

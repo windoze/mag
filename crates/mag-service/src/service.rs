@@ -93,6 +93,27 @@ pub trait MagService: Send + Sync {
     /// [`ServiceError`] when cancellation cannot be delivered.
     async fn cancel(&self, id: SessionId) -> Result<(), ServiceError>;
 
+    /// Injects a pivot message into a session's in-progress run.
+    ///
+    /// This is the first layer of the two-layer pivot semantics (`docs/CLI.md`
+    /// §3.2, decision D1): pivot only ever targets a run that is currently in
+    /// progress. The message is queued for the run
+    /// ([`ServiceEvent::PivotQueued`]) and applied at the next step boundary
+    /// ([`ServiceEvent::PivotApplied`]), or reported dropped
+    /// ([`ServiceEvent::PivotDropped`]) when the run ends before the pivot
+    /// lands. The second layer — falling back to
+    /// [`send_message`](MagService::send_message) when no run is in progress —
+    /// is a caller-side convenience and is deliberately never performed here:
+    /// pivot is pivot, and failure is reported as-is.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError::SessionNotFound`] when `id` is unknown,
+    /// [`ServiceError::NotPivotable`] when the session has no in-progress run,
+    /// [`ServiceError::Unsupported`] when the implementation does not support
+    /// pivoting, or another [`ServiceError`] on delivery failure.
+    async fn pivot_message(&self, id: SessionId, input: UserInput) -> Result<(), ServiceError>;
+
     // —— Approval / interaction round-trips ——
 
     /// Resolves a pending interaction (approval, question, choice, permission).
@@ -281,6 +302,31 @@ pub enum ServiceEvent {
         /// Available sources discovered by the probe.
         available: Vec<SourceInfo>,
     },
+    /// A pivot message was accepted into a session's pivot queue.
+    ///
+    /// First layer of the two-layer pivot semantics (`docs/CLI.md` §3.2,
+    /// decision D1): emitted when [`MagService::pivot_message`] queues a pivot
+    /// for an in-progress run; the pivot later lands at a step boundary
+    /// ([`PivotApplied`](ServiceEvent::PivotApplied)) or is reported dropped
+    /// ([`PivotDropped`](ServiceEvent::PivotDropped)) when the run ends first.
+    PivotQueued {
+        /// Session whose in-progress run the pivot targets.
+        id: SessionId,
+    },
+    /// A queued pivot message was injected into the run at a step boundary.
+    PivotApplied {
+        /// Session whose run accepted the pivot.
+        id: SessionId,
+    },
+    /// A queued pivot message was dropped because the run ended (finished,
+    /// failed, or cancelled) before it could be applied at a step boundary.
+    PivotDropped {
+        /// Session whose run the pivot targeted.
+        id: SessionId,
+        /// Human-readable reason the pivot was dropped (for example which
+        /// terminal run state preempted it).
+        reason: String,
+    },
 }
 
 impl ServiceEvent {
@@ -303,7 +349,10 @@ impl ServiceEvent {
             | Self::DelegationStarted { id, .. }
             | Self::DelegationFinished { id, .. }
             | Self::DelegationFailed { id, .. }
-            | Self::DelegationMessage { id, .. } => Some(*id),
+            | Self::DelegationMessage { id, .. }
+            | Self::PivotQueued { id, .. }
+            | Self::PivotApplied { id, .. }
+            | Self::PivotDropped { id, .. } => Some(*id),
             Self::LocalAgentsProbed { .. } => None,
         }
     }
@@ -364,6 +413,18 @@ pub enum ServiceError {
         /// Human-readable rejection reason.
         message: String,
     },
+    /// The session has no in-progress run that could accept a pivot.
+    ///
+    /// First layer of the two-layer pivot semantics (`docs/CLI.md` §3.2,
+    /// decision D1): pivoting never falls back to sending a new message
+    /// implicitly; the caller decides whether to retry as
+    /// [`MagService::send_message`].
+    NotPivotable {
+        /// Session that could not accept a pivot.
+        id: SessionId,
+        /// Human-readable reason the pivot was rejected.
+        reason: String,
+    },
     /// The requested operation is not supported by this implementation.
     Unsupported {
         /// Operation name that is not supported.
@@ -384,6 +445,9 @@ impl fmt::Display for ServiceError {
                 write!(formatter, "interaction `{request_id}` not found")
             }
             Self::InvalidInput { message } => write!(formatter, "invalid input: {message}"),
+            Self::NotPivotable { id, reason } => {
+                write!(formatter, "session `{id}` is not pivotable: {reason}")
+            }
             Self::Unsupported { operation } => {
                 write!(formatter, "operation `{operation}` is not supported")
             }
@@ -492,6 +556,16 @@ mod tests {
 
         async fn cancel(&self, _id: SessionId) -> Result<(), ServiceError> {
             Ok(())
+        }
+
+        async fn pivot_message(
+            &self,
+            _id: SessionId,
+            _input: UserInput,
+        ) -> Result<(), ServiceError> {
+            Err(ServiceError::Unsupported {
+                operation: "pivot_message".to_owned(),
+            })
         }
 
         async fn respond_interaction(
@@ -655,6 +729,21 @@ mod tests {
                 },
                 "local_agents_probed",
             ),
+            (
+                ServiceEvent::PivotQueued { id: session_id() },
+                "pivot_queued",
+            ),
+            (
+                ServiceEvent::PivotApplied { id: session_id() },
+                "pivot_applied",
+            ),
+            (
+                ServiceEvent::PivotDropped {
+                    id: session_id(),
+                    reason: "run finished before the pivot landed".to_owned(),
+                },
+                "pivot_dropped",
+            ),
         ];
 
         for (event, expected_tag) in cases {
@@ -741,6 +830,22 @@ mod tests {
             Some(session_id()),
         );
         assert_eq!(
+            ServiceEvent::PivotQueued { id: session_id() }.session_id(),
+            Some(session_id()),
+        );
+        assert_eq!(
+            ServiceEvent::PivotApplied { id: session_id() }.session_id(),
+            Some(session_id()),
+        );
+        assert_eq!(
+            ServiceEvent::PivotDropped {
+                id: session_id(),
+                reason: "run cancelled".to_owned(),
+            }
+            .session_id(),
+            Some(session_id()),
+        );
+        assert_eq!(
             ServiceEvent::LocalAgentsProbed {
                 available: Vec::new(),
             }
@@ -769,5 +874,42 @@ mod tests {
                 attachments: Vec::new(),
             },
         );
+    }
+
+    #[test]
+    fn not_pivotable_error_round_trips_and_displays() {
+        let error = ServiceError::NotPivotable {
+            id: session_id(),
+            reason: "no in-progress run".to_owned(),
+        };
+        let display = error.to_string();
+        assert!(display.contains("not pivotable"));
+        assert!(display.contains("no in-progress run"));
+
+        let json = serde_json::to_value(&error).expect("serialize error");
+        assert_eq!(
+            json.get("type"),
+            Some(&Value::String("not_pivotable".to_owned())),
+        );
+        let decoded = serde_json::from_value::<ServiceError>(json).expect("deserialize error");
+        assert_eq!(decoded, error);
+    }
+
+    #[test]
+    fn pivot_message_is_callable_behind_arc_dyn() {
+        futures::executor::block_on(async {
+            let service: Arc<dyn MagService> = Arc::new(DummyService);
+
+            let error = service
+                .pivot_message(session_id(), UserInput::text("steer"))
+                .await
+                .expect_err("dummy service reports pivoting as unsupported");
+            assert_eq!(
+                error,
+                ServiceError::Unsupported {
+                    operation: "pivot_message".to_owned(),
+                },
+            );
+        });
     }
 }
