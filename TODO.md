@@ -287,12 +287,39 @@ CI 承载（引入 CI 时列为第一批）；⑥tool 输出为 agent-lib Conten
 - mag-acp/默认 CLI 路径回归通过；`mag-web` 依赖边界未变化，Engine 注入仍只在上层 `mag` bin/test 中发生。
 - 验证通过：`cargo fmt --all`、`cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test -p mag --bin mag`、`cargo test -p mag --test web_e2e`、`cargo test -p mag-web`、`cargo test --workspace`、`cargo doc --no-deps --workspace`。
 
-### W2-R [TODO] W2 review
+### W2-R [DONE] W2 review
 
 - **实现要求**：对照 `docs/WEB.md` §2 全节与 §4 检查：路由表与 §2.1 逐条一致；错误投影完整；SSE
   heartbeat/背压/清理；auth 三态 + 非 loopback 强制；依赖边界（`cargo tree -p mag-web` 无
   mag-core/agent-lib/mag-config）；secret 不物化。发现问题直接修复并补测试。
 - **验证条件**：默认验证序列全过；完成记录列出 review 结论。
+
+**完成记录（2026-07-21）**：通读 W2-1..W2-4 全部 diff（`0758715`/`0fb31da`/`8138f9d`/`38983b1`）
+逐项核查，结论 **W2 放行进入 W3，无 bug 级、无偏差级发现、无需修复项**：
+
+- **REST 路由** ✅：§2.1 路由表 15 条逐条一致（204 空体断言、`POST /sessions` 回 `{id,config}`、
+  `messages` 回 `{run_id}`）；§2.3 错误投影逐条中（404/409/400/501/500，body `{kind,message}` 用
+  `ServiceError::kind()`，pivot 409 kind 确为 `not_pivotable`）；非 ServiceError → 500 通用体不泄漏；
+  路由层纯翻译。
+- **SSE** ✅：帧格式 `id:`+`event:`+`data:`（Event/ServiceEvent 17 变体比对完全相同）；15s
+  heartbeat comment；`subscribe(None)` 全量；多连接各自订阅；慢消费者有界队列（64）溢出断连记日志；
+  `sender.closed()` 清理订阅有测试钉住（active subscription 归零）。
+- **auth + 静态资源** ✅：15 条 API 路由 + `/events` 全部在 auth layer 内（实证 axum 0.8 layer 覆盖
+  fallback_router，未知 /api 路径也 401 + `is_api_path` 双保险）；token 三态齐备；**非 loopback 时
+  `--no-auth` 被忽略并强制生成 + 警告**；静态资源/`/` 免 auth；debug 目录/占位页/release rust-embed/
+  SPA fallback/路径穿越防护齐备；token 不进任何日志（外部 token 不回显，有测试）。
+- **bin + e2e** ✅：参数解析完整（互斥/两式赋值/作用域约束）；同走配置系统；e2e 真实全链路
+  （fake LLM + 真 Engine + 回环 TCP：建会话→流式→审批往返→pivot（断言 pivot 文本进模型上下文）→
+  cancel→history（ToolCall 终态）→config GET/reload/apply→sources）；mag-acp/CLI 回归绿。
+- **通用** ✅：`cargo tree -p mag-web` 依赖恰为白名单（mag-config 仅经 mag-service 传递）；四个
+  commit 未触碰其他 crate 源码；`#![warn(missing_docs)]`、测试全离线、无新增 `#[ignore]`。
+- **门禁**：fmt/clippy(`-D warnings`)/workspace 32 套件全 ok/doc 全过（复跑确认；唯一 ignored 为
+  既有 ACP 真二进制骨架）。
+
+**建议级事项（不阻塞，随 W3-2/W5 顺带）**：①请求体反序列化失败时 axum 原生 rejection 非
+`{kind,message}` 形状——W3-2 的 typed error 解析须容错，或 mag-web 把 JsonRejection 映射为标准错误
+体（400 `invalid_input`）；②`--acp --web` 互斥分支无单测；③loopback `--no-auth` 提示措辞非
+「警告」；④e2e 未覆盖 resume/delete/PUT config（内存单测已覆盖，W5 补）。
 
 ---
 
