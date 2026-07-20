@@ -29,16 +29,23 @@ use std::sync::{
 use std::time::Duration;
 
 use agent_lib::{
-    agent::{ApprovalDecision, BudgetLimits, InteractionHandler, WorktreeRef},
+    agent::external::{
+        AcpAdapter, AcpConfig, ExternalSessionRegistry, ExternalSessionShutdown, GitWorktreeManager,
+    },
+    agent::{
+        AgentId, ApprovalDecision, BudgetLimits, ExternalSessionHandler, ExternalSessionRequest,
+        InteractionHandler, RequirementResult, RunContext, WorktreeRef,
+    },
     client::LlmClient,
     facade::{
         Agent, AgentRunStream, AgentSnapshot, Approval, ApprovalPolicy, CancelHandle,
         DelegationMessage as FacadeDelegationMessage, DelegationTrace as FacadeDelegationTrace,
-        FacadeError, LocalSubagent, ModelRef, ReconfigRequest, Tool, ToolContext, ToolResult,
-        ToolSetId, ToolSetRef, ToolTrace as FacadeToolTrace, UsageSummary, WireRunEvent,
-        WireRunOutput,
+        FacadeError, LocalSubagent, ManagedExternalAgent, ModelRef, ReconfigRequest,
+        RegistryExternalSessionHandler, Tool, ToolContext, ToolResult, ToolSetId, ToolSetRef,
+        ToolTrace as FacadeToolTrace, UsageSummary, WireRunEvent, WireRunOutput,
     },
 };
+use async_trait::async_trait;
 use mag_config::{ApprovalPolicyKind, ConfigSnapshot};
 use mag_service::{
     DelegationMessageWire, DelegationTrace, Event, RunErrorKind, RunId as WireRunId, RunOutput,
@@ -50,7 +57,7 @@ use uuid::Uuid;
 
 use crate::{
     EventBus,
-    assembly::{ApprovalOverrides, DelegateBinding, SessionBinding},
+    assembly::{ApprovalOverrides, DelegateBinding, ExternalDelegateBinding, SessionBinding},
     engine::approval::IpcApproval,
     persistence::Persistence,
     turn_complete::{TurnCompleteHub, TurnCompletion, TurnSummary},
@@ -106,6 +113,68 @@ impl PivotQueue {
     }
 }
 
+/// Registry-backed ACP session handler with child agent-id tracking.
+///
+/// agent-lib keys live external sessions by the external child [`AgentId`]
+/// minted for each delegation drive, not by mag's root session id. The raw
+/// [`RegistryExternalSessionHandler`] sees that id on every
+/// [`ExternalSessionRequest`], so this wrapper records it and delegates all real
+/// IO to the registry handler. [`SessionDriver::cleanup_external_sessions`] then
+/// sweeps exactly those completed child sessions when the mag session ends.
+#[derive(Debug)]
+struct TrackedExternalSessionHandler {
+    inner: Arc<RegistryExternalSessionHandler>,
+    agent_ids: Mutex<Vec<AgentId>>,
+}
+
+impl TrackedExternalSessionHandler {
+    fn new(inner: Arc<RegistryExternalSessionHandler>) -> Self {
+        Self {
+            inner,
+            agent_ids: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn remember(&self, agent_id: AgentId) {
+        let mut ids = self
+            .agent_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !ids.contains(&agent_id) {
+            ids.push(agent_id);
+        }
+    }
+
+    async fn cleanup_seen(&self) -> Vec<ExternalSessionShutdown> {
+        let ids = self
+            .agent_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let mut dispositions = Vec::new();
+        for agent_id in ids {
+            dispositions.extend(self.inner.registry().cleanup_agent(agent_id).await);
+        }
+        dispositions
+    }
+}
+
+#[async_trait]
+impl ExternalSessionHandler for TrackedExternalSessionHandler {
+    async fn fulfill(
+        &self,
+        request: &ExternalSessionRequest,
+        ctx: &RunContext,
+    ) -> RequirementResult {
+        self.remember(request.agent_id);
+        self.inner.fulfill(request, ctx).await
+    }
+
+    async fn cleanup_agent(&self, agent_id: AgentId) -> Vec<ExternalSessionShutdown> {
+        self.inner.registry().cleanup_agent(agent_id).await
+    }
+}
+
 /// One session's stateful facade [`Agent`] plus a run-id source.
 ///
 /// The facade [`Agent`] holds the session's conversation, so reusing one driver
@@ -123,6 +192,10 @@ pub(crate) struct SessionDriver {
     /// The `agents.<name>` entry this session is bound to; `apply_config`
     /// reconfigurations read that entry (`docs/CLI.md` §4.4).
     agent_name: String,
+    /// Registry-backed external ACP handlers owned by this session. Completed
+    /// external sessions stay live for reuse until the host explicitly sweeps
+    /// them; the session actor calls [`cleanup_external_sessions`] before drop.
+    external_handlers: Vec<Arc<TrackedExternalSessionHandler>>,
     run_counter: AtomicU64,
     /// Mints fresh tool-set identities for `apply_config` reconfigurations.
     tool_set_counter: AtomicU64,
@@ -198,6 +271,12 @@ impl SessionDriver {
             let worker = delegate_worker(&tools, delegate, overrides)?;
             builder = builder.subagent(delegate.name().to_owned(), worker);
         }
+        let mut external_handlers = Vec::new();
+        for delegate in binding.external_delegates() {
+            let (agent, handler) = external_acp_delegate(config, delegate)?;
+            external_handlers.push(handler);
+            builder = builder.external_agent(delegate.name().to_owned(), agent);
+        }
         let agent = builder.approval(policy).build()?;
 
         Ok(Self {
@@ -205,6 +284,7 @@ impl SessionDriver {
             tools,
             turn_complete,
             agent_name: binding.agent_name().to_owned(),
+            external_handlers,
             run_counter: AtomicU64::new(1),
             tool_set_counter: AtomicU64::new(1),
         })
@@ -243,6 +323,7 @@ impl SessionDriver {
     /// a snapshot whose state cannot be deserialized).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn restore(
+        config: &SessionConfig,
         client: Arc<dyn LlmClient>,
         tools: Arc<ToolRegistry>,
         approval: Arc<IpcApproval>,
@@ -267,6 +348,12 @@ impl SessionDriver {
             let worker = delegate_worker(&tools, delegate, overrides)?;
             builder = builder.subagent(delegate.name().to_owned(), worker);
         }
+        let mut external_handlers = Vec::new();
+        for delegate in binding.external_delegates() {
+            let (agent, handler) = external_acp_delegate(config, delegate)?;
+            external_handlers.push(handler);
+            builder = builder.external_agent(delegate.name().to_owned(), agent);
+        }
         let agent = builder.approval(policy).build()?;
 
         Ok(Self {
@@ -274,6 +361,7 @@ impl SessionDriver {
             tools,
             turn_complete,
             agent_name: binding.agent_name().to_owned(),
+            external_handlers,
             run_counter: AtomicU64::new(1),
             tool_set_counter: AtomicU64::new(1),
         })
@@ -600,6 +688,29 @@ impl SessionDriver {
     pub(crate) fn next_run_id(&self) -> WireRunId {
         let value = self.run_counter.fetch_add(1, Ordering::Relaxed);
         WireRunId::new(Uuid::from_u128(u128::from(value)))
+    }
+
+    /// Explicitly sweeps completed managed external sessions before the owning
+    /// mag session is dropped (`docs/CLI.md` §5 P7, decision D3).
+    ///
+    /// agent-lib automatically force-closes cancelled/failed external drives;
+    /// completed drives are retained for reuse and require the host to sweep the
+    /// registry. The session actor calls this on graceful actor shutdown so a
+    /// deleted mag session leaves no ACP child process behind.
+    pub(crate) async fn cleanup_external_sessions(&mut self, session_id: SessionId) {
+        if self.external_handlers.is_empty() {
+            return;
+        }
+        for handler in &self.external_handlers {
+            let dispositions = handler.cleanup_seen().await;
+            if !dispositions.is_empty() {
+                tracing::info!(
+                    %session_id,
+                    external_sessions = dispositions.len(),
+                    "cleaned up managed external ACP sessions"
+                );
+            }
+        }
     }
 }
 
@@ -933,6 +1044,69 @@ fn delegate_worker(
         worker = worker.model(model.to_owned());
     }
     worker.build()
+}
+
+/// Builds one managed external ACP delegate from its resolved configuration
+/// (`docs/CLI.md` §5 P7, decision D3).
+///
+/// The facade-facing spec is created through [`ManagedExternalAgent::acp`], which
+/// advertises the delegate as an `ask_<name>` tool. The registry-backed session
+/// handler is attached immediately and uses an [`AcpConfig`] carrying the same
+/// launch line plus the configuration's environment overrides. We construct the
+/// handler directly over the ACP adapter because agent-lib's one-call default
+/// helper has no surface for mag's per-source env overrides; the composition is
+/// the same registry-backed handler the helper returns for ACP.
+fn external_acp_delegate(
+    config: &SessionConfig,
+    delegate: &ExternalDelegateBinding,
+) -> Result<(ManagedExternalAgent, Arc<TrackedExternalSessionHandler>), FacadeError> {
+    let (binary, args) = split_external_command(delegate.command());
+    if binary.as_os_str().is_empty() {
+        tracing::warn!(
+            delegate = delegate.name(),
+            capabilities = ?delegate.capabilities(),
+            "external ACP delegate has no command; delegation will fail when invoked"
+        );
+    }
+
+    let mut acp_config =
+        AcpConfig::new(binary.clone(), args.clone()).with_timeout(Duration::from_secs(120));
+    for (key, value) in delegate.env() {
+        acp_config = acp_config.with_env(key.clone(), value.clone());
+    }
+    if let Some(cwd) = &config.cwd {
+        acp_config = acp_config.with_working_dir(cwd.clone());
+    }
+    let worktrees = Arc::new(GitWorktreeManager::new().with_root(external_worktree_root()));
+    let registry = Arc::new(ExternalSessionRegistry::with_worktree_manager(
+        Arc::new(AcpAdapter::new(acp_config)),
+        worktrees,
+    ));
+    let handler = Arc::new(RegistryExternalSessionHandler::new(registry));
+    let tracked = Arc::new(TrackedExternalSessionHandler::new(handler));
+
+    let mut builder = ManagedExternalAgent::acp(binary, args).session_handler(tracked.clone());
+    if let Some(cwd) = &config.cwd {
+        builder = builder.worktree(cwd.clone());
+    }
+    Ok((builder.build()?, tracked))
+}
+
+/// Splits an argv-form external-agent command into binary + args.
+fn split_external_command(command: &[String]) -> (std::path::PathBuf, Vec<String>) {
+    match command.split_first() {
+        Some((binary, args)) => (binary.into(), args.to_vec()),
+        None => (std::path::PathBuf::new(), Vec::new()),
+    }
+}
+
+fn external_worktree_root() -> std::path::PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "mag-external-worktrees-{}-{unique}",
+        std::process::id()
+    ))
 }
 
 /// Applies the configured `[tools.<name>].approval` tiers on top of `policy`

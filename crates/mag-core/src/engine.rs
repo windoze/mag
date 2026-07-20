@@ -13,10 +13,10 @@ use std::{
 use agent_lib::client::LlmClient;
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
-use mag_config::ConfigError;
+use mag_config::{ConfigError, ConfigSnapshot, ResolvedExternalAgent, ResolvedProvider};
 use mag_service::{
     InteractionResponseWire, MagService, RequestId, RunId, ServiceError, ServiceEvent,
-    SessionConfig, SessionId, SessionInfo, SourceInfo, UserInput,
+    SessionConfig, SessionId, SessionInfo, SourceInfo, SourceKindWire, UserInput,
 };
 use mag_sources::SourceRegistry;
 use mag_tools::ToolRegistry;
@@ -180,7 +180,7 @@ impl Engine {
     /// Engines built by [`from_config`](Engine::from_config) hold one
     /// [`LlmSource`](mag_sources::LlmSource) per `[providers.<name>]` entry and
     /// one reserved local-agent slot per `[external_agents.<name>]` entry
-    /// (decision D3; the M4 delegation wiring consumes those slots). Engines
+    /// (decision D3; session drivers consume those entries for ACP delegation). Engines
     /// built by the other constructors hold an empty registry.
     #[must_use]
     pub fn sources(&self) -> &SourceRegistry {
@@ -355,23 +355,36 @@ impl MagService for Engine {
     }
 
     async fn list_sources(&self) -> Result<Vec<SourceInfo>, ServiceError> {
-        Err(ServiceError::Unsupported {
-            operation: "list_sources".to_owned(),
-        })
+        Ok(self
+            .inner
+            .config_apply
+            .as_ref()
+            .map(|state| source_infos(&state.service().current()))
+            .unwrap_or_default())
     }
 
     async fn probe_local_agents(&self) -> Result<Vec<SourceInfo>, ServiceError> {
-        Err(ServiceError::Unsupported {
-            operation: "probe_local_agents".to_owned(),
-        })
+        let available = self
+            .inner
+            .config_apply
+            .as_ref()
+            .map(|state| local_agent_source_infos(&state.service().current()))
+            .unwrap_or_default();
+        let _ = self
+            .inner
+            .event_bus
+            .emit(mag_service::Event::LocalAgentsProbed {
+                available: available.clone(),
+            });
+        Ok(available)
     }
 
     // —— Runtime configuration ——
     //
     // Live when the engine was assembled with a `ConfigService`
     // (`Engine::with_config_service`, `docs/CLI.md` §4.3–§4.5);
-    // otherwise the configuration surface reports `Unsupported`, matching the
-    // `list_sources` convention.
+    // otherwise the configuration surface reports `Unsupported`; source listing
+    // remains available and simply returns an empty set without configuration.
     async fn get_config(&self) -> Result<mag_service::ConfigDto, ServiceError> {
         let Some(config_apply) = &self.inner.config_apply else {
             return Err(ServiceError::Unsupported {
@@ -565,6 +578,95 @@ fn config_error(error: ConfigError) -> ServiceError {
     }
 }
 
+/// Projects the current configuration snapshot into the service-level source
+/// listing (`docs/CLI.md` §4.6 / §5 P7).
+fn source_infos(snapshot: &ConfigSnapshot) -> Vec<SourceInfo> {
+    let mut infos = Vec::new();
+    infos.extend(
+        snapshot
+            .providers()
+            .values()
+            .map(|provider| provider_source_info(provider)),
+    );
+    infos.extend(local_agent_source_infos(snapshot));
+    infos
+}
+
+/// Projects only local/external agents and performs a lightweight availability
+/// check suitable for `probe_local_agents`.
+fn local_agent_source_infos(snapshot: &ConfigSnapshot) -> Vec<SourceInfo> {
+    snapshot
+        .external_agents()
+        .values()
+        .map(|external| external_agent_source_info(external))
+        .collect()
+}
+
+fn provider_source_info(provider: &ResolvedProvider) -> SourceInfo {
+    SourceInfo {
+        id: provider.name().to_owned(),
+        name: provider.name().to_owned(),
+        kind: SourceKindWire::LlmProvider,
+        available: true,
+        version: None,
+        path: provider.base_url().map(str::to_owned),
+        capabilities: vec![provider.wire().as_str().to_owned()],
+    }
+}
+
+fn external_agent_source_info(external: &ResolvedExternalAgent) -> SourceInfo {
+    let command = external.command();
+    let path = command.first().cloned();
+    let available = path.as_deref().is_some_and(command_available);
+    if !available {
+        tracing::warn!(
+            source = external.name(),
+            command = ?command,
+            "external ACP source is not currently available"
+        );
+    }
+    SourceInfo {
+        id: external.name().to_owned(),
+        name: external.name().to_owned(),
+        kind: SourceKindWire::LocalAgent,
+        available,
+        version: None,
+        path,
+        capabilities: external.capabilities().to_vec(),
+    }
+}
+
+fn command_available(binary: &str) -> bool {
+    if binary.trim().is_empty() {
+        return false;
+    }
+    let path = Path::new(binary);
+    if path.is_absolute() || binary.contains(std::path::MAIN_SEPARATOR) {
+        return executable_file(path);
+    }
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| executable_file(&dir.join(binary)))
+    })
+}
+
+fn executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 impl fmt::Debug for Engine {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.debug_struct("Engine").finish_non_exhaustive()
@@ -702,18 +804,8 @@ mod skeleton {
     async fn unimplemented_methods_return_unsupported() {
         let engine = Engine::new();
 
-        assert_eq!(
-            engine.list_sources().await,
-            Err(ServiceError::Unsupported {
-                operation: "list_sources".to_owned(),
-            })
-        );
-        assert_eq!(
-            engine.probe_local_agents().await,
-            Err(ServiceError::Unsupported {
-                operation: "probe_local_agents".to_owned(),
-            })
-        );
+        assert_eq!(engine.list_sources().await, Ok(Vec::new()));
+        assert_eq!(engine.probe_local_agents().await, Ok(Vec::new()));
 
         // Runtime configuration: unsupported until the `ConfigService` wiring
         // lands (M3-5/M3-6).
@@ -3510,7 +3602,7 @@ mod delegation {
 
     use std::{
         fs,
-        path::PathBuf,
+        path::{Path, PathBuf},
         sync::{
             Arc,
             atomic::{AtomicU64, Ordering},
@@ -3527,7 +3619,8 @@ mod delegation {
     use futures::stream::BoxStream;
     use mag_service::{
         ApprovalDecisionWire, InteractionKindWire, InteractionResponseWire, MagService,
-        RoutingMode, ServiceEvent, SessionConfig, StepIdWire, ToolCallIdWire, UserInput,
+        RoutingMode, ServiceEvent, SessionConfig, SourceKindWire, StepIdWire, ToolCallIdWire,
+        UserInput,
     };
     use mag_tools::{PermissionSpec, ToolCategory, ToolPlugin, ToolRegistry, ToolRisk};
     use serde_json::{Value, json};
@@ -3696,6 +3789,82 @@ system_prompt = "Research thoroughly."
 role = "Researches topics and reports findings."
 tools = ["read_file"]
 "#;
+
+    #[cfg(unix)]
+    fn fake_acp_script(dir: &TempConfigDir) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.0.join("fake-acp.sh");
+        fs::write(
+            &path,
+r#"#!/bin/sh
+set -eu
+if [ "$#" -ge 1 ]; then MAG_FAKE_ACP_LOG="$1"; fi
+: "${MAG_FAKE_ACP_LOG:?}"
+if [ "$#" -ge 2 ]; then mode="$2"; else mode="${MAG_FAKE_ACP_MODE:-success}"; fi
+if [ "$#" -ge 3 ]; then session="$3"; else session="${MAG_FAKE_ACP_SESSION:-mag-fake-acp-session}"; fi
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$MAG_FAKE_ACP_LOG"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}'
+      ;;
+    *'"method":"session/new"'*)
+      if [ "$mode" = "crash_new" ]; then exit 7; fi
+      printf '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"%s"}}\n' "$session"
+      ;;
+    *'"method":"session/prompt"'*)
+      if [ "$mode" = "crash_prompt" ]; then exit 9; fi
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"external summary"}}}}\n' "$session"
+      printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
+      ;;
+    *'"method":"session/cancel"'*)
+      printf '%s\n' 'SESSION_CANCELLED' >> "$MAG_FAKE_ACP_LOG"
+      exit 0
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write fake ACP script");
+        let mut permissions = fs::metadata(&path)
+            .expect("fake ACP script metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("chmod fake ACP script");
+        path
+    }
+
+    fn toml_string(value: &Path) -> String {
+        value
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+    }
+
+    fn external_acp_config(script: &Path, log: &Path, mode: &str) -> String {
+        format!(
+            r#"
+[agents.default]
+model = "model-d"
+
+[external_agents.peer]
+kind = "acp"
+command = ["{}", "{}", "{}", "mag-fake-acp-session"]
+capabilities = ["streaming", "graceful_shutdown"]
+
+[external_agents.peer.env]
+MAG_FAKE_ACP_LOG = "{}"
+MAG_FAKE_ACP_MODE = "{}"
+MAG_FAKE_ACP_SESSION = "mag-fake-acp-session"
+"#,
+            toml_string(script),
+            toml_string(log),
+            mode,
+            toml_string(log),
+            mode,
+        )
+    }
 
     /// M4-1 main path: the supervisor calls `ask_researcher` and the run emits
     /// `DelegationStarted` → `DelegationFinished` in order with a complete
@@ -3890,6 +4059,201 @@ tools = ["shell"]
                 Some(ServiceEvent::RunFinished { output, .. }) if output.text == "final answer"
             ),
             "the run finishes: {rest:?}"
+        );
+    }
+
+    /// M4-2 main path: a configured `external_agents.peer` ACP process is
+    /// advertised as `ask_peer`, driven through a local fake ACP subprocess, and
+    /// explicitly cleaned up when the mag session is deleted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ask_external_acp_delegate_emits_lifecycle_and_cleans_up_on_delete() {
+        let dir = TempConfigDir::new();
+        let script = fake_acp_script(&dir);
+        let log = dir.0.join("fake-acp.log");
+        let config = external_acp_config(&script, &log, "success");
+        fs::write(dir.config_path(), config).expect("write config");
+        let service =
+            Arc::new(ConfigService::load_or_default(dir.config_path()).expect("load config"));
+        let fake = FakeLlmClient::scripted(vec![
+            tool_use_stream("ask_peer", "del-1", json!({ "task": "inspect" })),
+            text_stream_with_usage(&["final answer"], usage()),
+        ]);
+        let client: Arc<dyn LlmClient> = fake.clone();
+        let engine = Engine::with_config_service(client, registry(), service);
+        let session = engine
+            .create_session(session_config("default", "fake-chat"))
+            .await
+            .expect("create session");
+        let mut events = engine.subscribe(Some(session));
+
+        engine
+            .send_message(session, UserInput::text("delegate externally"))
+            .await
+            .expect("send message");
+        let collected = collect_until_terminal(&mut events).await;
+
+        let started = collected
+            .iter()
+            .position(|event| {
+                matches!(event, ServiceEvent::DelegationStarted { trace, .. } if trace.delegate == "peer")
+            })
+            .unwrap_or_else(|| panic!("external DelegationStarted in {collected:?}"));
+        let finished = collected
+            .iter()
+            .position(|event| {
+                matches!(event, ServiceEvent::DelegationFinished { trace, .. } if trace.delegate == "peer")
+            })
+            .unwrap_or_else(|| {
+                let log_text = fs::read_to_string(&log).unwrap_or_else(|error| error.to_string());
+                panic!("external DelegationFinished in {collected:?}; fake log: {log_text}")
+            });
+        assert!(
+            started < finished,
+            "started precedes finished: {collected:?}"
+        );
+        assert!(
+            matches!(collected.last(), Some(ServiceEvent::RunFinished { output, .. }) if output.text == "final answer"),
+            "the supervisor continues after the external summary: {collected:?}"
+        );
+
+        let stream_requests = fake.stream_requests();
+        let tool_names: Vec<&str> = stream_requests[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert!(
+            tool_names.contains(&"ask_peer"),
+            "external delegate appears on the tool surface: {tool_names:?}"
+        );
+        let log_before_delete = fs::read_to_string(&log).expect("fake ACP log");
+        assert!(
+            log_before_delete.contains(r#""method":"initialize""#)
+                && log_before_delete.contains(r#""method":"session/new""#)
+                && log_before_delete.contains(r#""method":"session/prompt""#),
+            "fake ACP process was driven: {log_before_delete}"
+        );
+
+        engine
+            .delete_session(session)
+            .await
+            .expect("delete session");
+        let log_after_delete = fs::read_to_string(&log).expect("fake ACP log after cleanup");
+        assert!(
+            log_after_delete.contains(r#""method":"session/cancel""#)
+                || log_after_delete.contains("SESSION_CANCELLED"),
+            "session deletion sweeps the completed external session: {log_after_delete}"
+        );
+    }
+
+    /// A crashing ACP subprocess does not block engine/session startup. The
+    /// failed delegation is surfaced as `DelegationFailed`, and the supervisor
+    /// can still continue with a normal final answer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn crashing_external_acp_delegate_maps_to_delegation_failed() {
+        let dir = TempConfigDir::new();
+        let script = fake_acp_script(&dir);
+        let log = dir.0.join("fake-acp-crash.log");
+        let config = external_acp_config(&script, &log, "crash_prompt");
+        fs::write(dir.config_path(), config).expect("write config");
+        let service =
+            Arc::new(ConfigService::load_or_default(dir.config_path()).expect("load config"));
+        let fake = FakeLlmClient::scripted(vec![
+            tool_use_stream("ask_peer", "del-1", json!({ "task": "inspect" })),
+            text_stream_with_usage(&["fallback answer"], usage()),
+        ]);
+        let client: Arc<dyn LlmClient> = fake;
+        let engine = Engine::with_config_service(client, registry(), service);
+        let session = engine
+            .create_session(session_config("default", "fake-chat"))
+            .await
+            .expect("create session");
+        let mut events = engine.subscribe(Some(session));
+
+        engine
+            .send_message(session, UserInput::text("delegate externally"))
+            .await
+            .expect("send message");
+        let collected = collect_until_terminal(&mut events).await;
+
+        assert!(
+            collected.iter().any(|event| {
+                matches!(event, ServiceEvent::DelegationFailed { trace, .. } if trace.delegate == "peer")
+            }),
+            "the crashed process maps to DelegationFailed: {collected:?}"
+        );
+        assert!(
+            !collected.iter().any(|event| {
+                matches!(event, ServiceEvent::DelegationFinished { trace, .. } if trace.delegate == "peer")
+            }),
+            "a crashed external delegation never finishes: {collected:?}"
+        );
+        assert!(
+            matches!(collected.last(), Some(ServiceEvent::RunFinished { output, .. }) if output.text == "fallback answer"),
+            "the supervisor continues after a failed delegation: {collected:?}"
+        );
+    }
+
+    /// Source listing/probing reflects configured ACP sources, including a
+    /// lightweight executable check and configured capability labels.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_sources_reports_external_acp_availability_and_capabilities() {
+        let dir = TempConfigDir::new();
+        let script = fake_acp_script(&dir);
+        let log = dir.0.join("fake-acp-source.log");
+        let missing = dir.0.join("missing-acp");
+        let config = format!(
+            r#"
+[external_agents.peer]
+kind = "acp"
+command = ["{}"]
+capabilities = ["streaming", "graceful_shutdown"]
+
+[external_agents.peer.env]
+MAG_FAKE_ACP_LOG = "{}"
+MAG_FAKE_ACP_MODE = "success"
+
+[external_agents.ghost]
+kind = "acp"
+command = ["{}"]
+capabilities = ["streaming"]
+"#,
+            toml_string(&script),
+            toml_string(&log),
+            toml_string(&missing),
+        );
+        fs::write(dir.config_path(), config).expect("write config");
+        let service =
+            Arc::new(ConfigService::load_or_default(dir.config_path()).expect("load config"));
+        let fake = FakeLlmClient::scripted(Vec::new());
+        let client: Arc<dyn LlmClient> = fake;
+        let engine = Engine::with_config_service(client, registry(), service);
+        let mut events = engine.subscribe(None);
+
+        let listed = engine.list_sources().await.expect("list sources");
+        let peer = listed.iter().find(|source| source.id == "peer").unwrap();
+        assert_eq!(peer.kind, SourceKindWire::LocalAgent);
+        assert!(peer.available, "executable fake ACP source is available");
+        assert_eq!(
+            peer.path.as_deref(),
+            Some(script.to_string_lossy().as_ref())
+        );
+        assert_eq!(peer.capabilities, vec!["streaming", "graceful_shutdown"]);
+        let ghost = listed.iter().find(|source| source.id == "ghost").unwrap();
+        assert!(!ghost.available, "missing binary is unavailable");
+
+        let probed = engine
+            .probe_local_agents()
+            .await
+            .expect("probe local agents");
+        assert_eq!(probed.len(), 2);
+        let event = next_event(&mut events).await;
+        assert!(
+            matches!(event, ServiceEvent::LocalAgentsProbed { ref available } if available == &probed),
+            "probe emits the global LocalAgentsProbed event: {event:?}"
         );
     }
 }

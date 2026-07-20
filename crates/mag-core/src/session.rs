@@ -225,6 +225,9 @@ impl SessionActor {
                 }
             }
         }
+        if let DriverState::Idle(driver) = &mut self.state {
+            driver.cleanup_external_sessions(self.session_id).await;
+        }
     }
 
     /// Pops the next deferred command, but only while the driver is idle.
@@ -410,6 +413,7 @@ fn session_thread(
     ));
     let driver = match restore {
         Some(snapshot) => SessionDriver::restore(
+            &config,
             client,
             tools,
             approval.clone(),

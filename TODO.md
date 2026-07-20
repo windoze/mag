@@ -945,7 +945,7 @@ GUI/web/CLI 无需感知多个会话通道。
     （全部目标 ok，0 失败；mag-core 103 过含新增 7；1 ignored 为既有 zed 联调测试）
     5) `cargo doc --no-deps --workspace` ✅（0 warning）。
 
-### M4-2 [TODO] mag-core：external ACP agent 委派（决策 D3，核心）
+### M4-2 [DONE] mag-core：external ACP agent 委派（决策 D3，核心）
 
 - **上下文**：`docs/CLI.md` §5 P7 + 决策 D3；agent-lib `ManagedExternalAgent::acp(binary,args)` +
   `default_external_session_handler`（behind `external-acp` feature）；mag-sources 已有 ACP slot
@@ -962,6 +962,39 @@ GUI/web/CLI 无需感知多个会话通道。
   `docs/CLI.md` §6）：(a) `ask_<ext>` 委派全生命周期事件正确；(b) fake 进程崩溃映射 `DelegationFailed`；
   (c) `list_sources` 反映可用性；(d) 会话结束清扫（断言 fake 进程收到结束/退出）。真实 claude-code-acp
   等联调 `#[ignore]`。默认验证序列全过。
+
+  **完成记录**（2026-07-20）：
+  - 实现要点：mag-core 的 `agent-lib` 依赖开启 `external-acp` feature；`SessionBinding::resolve`
+    新增 `external_delegates`，把 `external_agents.<name>`（kind=acp）解析为
+    `ExternalDelegateBinding{name, command, env, capabilities}`。`SessionDriver::new` 与 `restore`
+    均为每个 external binding 注册 `ManagedExternalAgent::acp(..)`，因此 supervisor tool surface
+    出现 `ask_<name>`；restore 路径同样重注册 external delegate 与 session handler，为 M4-3 的
+    审批/restore 回归打底。
+  - ACP handler：每个 external delegate 注入 registry-backed `ExternalSessionHandler`，底层是
+    `AcpAdapter + ExternalSessionRegistry`，与 agent-lib `default_external_session_handler` 的 ACP 分支
+    同一组合；因默认 helper 没有 mag 配置里 `external_agents.<name>.env` 的注入面，本任务直接构造
+    `AcpConfig` 以保留 env 覆盖。handler 外包一层 `TrackedExternalSessionHandler` 记录 agent-lib
+    为 external child mint 的 `AgentId`，session actor 退出/删除前按这些 id 调
+    `registry.cleanup_agent(..)`，确保已完成 external session 也显式收到 ACP `session/cancel` 并清扫。
+    每个 handler 使用独立 `GitWorktreeManager` root，避免默认全局 temp root 在并行/重复测试中碰撞，
+    仍保留 agent-lib 的 worktree 隔离与 cleanup 策略。
+  - source/probe：`Engine::list_sources()` / `probe_local_agents()` 从当前 `ConfigSnapshot` 投影
+    `SourceInfo`；LLM provider 标为 `LlmProvider` 且 available=true；external ACP source 标为
+    `LocalAgent`，`path` 为 command[0]，capabilities 来自配置，并用绝对/相对路径或 `$PATH` 做轻量
+    executable 检查。`probe_local_agents()` 返回 local/external sources 并发
+    `LocalAgentsProbed{available}` 全局事件。无配置后端的 engine 返回空列表，不再报 Unsupported。
+  - 测试（全部离线，`engine::delegation`）：新增本地 fake ACP shell 进程（响应 initialize / session/new /
+    session/prompt，记录收到的 JSON-RPC 帧）；`ask_external_acp_delegate_emits_lifecycle_and_cleans_up_on_delete`
+    断言 `ask_peer` 出现在 tool surface、`DelegationStarted -> DelegationFinished -> RunFinished`、fake
+    进程收到 initialize/new/prompt，删除 session 后收到 `session/cancel`；
+    `crashing_external_acp_delegate_maps_to_delegation_failed` 断言 fake 进程崩溃映射为
+    `DelegationFailed` 且 supervisor 可继续完成；
+    `list_sources_reports_external_acp_availability_and_capabilities` 断言可执行 fake source available=true、
+    缺失 binary available=false、capabilities/path 正确，并验证 `LocalAgentsProbed` 事件。聚焦测试
+    连跑 3 次无 flake，单测试 < 1s。
+  - 门禁结果：1) `cargo fmt --all -- --check` ✅ 2) `cargo test -p mag-core delegation` ✅（9 passed）
+    3) `cargo clippy --all-targets -- -D warnings` ✅ 4) `cargo test --workspace` ✅（全绿，1 ignored
+    为既有 zed 联调测试）5) `cargo doc --no-deps --workspace` ✅（0 warning）。
 
 ### M4-3 [TODO] 委派审批 + restore 重注册 delegate
 

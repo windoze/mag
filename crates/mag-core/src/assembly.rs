@@ -16,8 +16,8 @@
 //!   registry is the assembly layer's job, per `ConfigSnapshot::resolve`).
 //! - **Source registry** (`mag-sources`): one [`LlmSource`] per
 //!   `[providers.<name>]` entry plus one reserved [`LocalAgentSlot`] per
-//!   `[external_agents.<name>]` entry (decision D3; the ACP delegation wiring
-//!   that consumes those slots is M4 — this task only registers them).
+//!   `[external_agents.<name>]` entry (decision D3). The runtime ACP delegation
+//!   wiring consumes the same config entries when each session driver is built.
 //! - **Persistence** from `[session].persist_path` (a directory holding the
 //!   SQLite database file), falling back to a private in-memory store.
 //!
@@ -199,9 +199,9 @@ pub(crate) fn assemble_tool_registry(snapshot: &ConfigSnapshot) -> ToolRegistry 
 
 /// Builds the `mag-sources` registry from `snapshot` (`docs/CLI.md` §4.2/§4.6):
 /// one [`LlmSource`] per provider entry and one reserved [`LocalAgentSlot`]
-/// per external-agent entry. The external-agent slots are placeholders for the
-/// M4 ACP delegation wiring; [`SourceRegistry::connect_local_agent`] keeps
-/// reporting them as unimplemented until then.
+/// per external-agent entry. The slots make external ACP sources listable; the
+/// live ACP delegation runtime is attached by [`SessionBinding`] and the session
+/// driver from the same snapshot entries.
 pub(crate) fn assemble_source_registry(snapshot: &ConfigSnapshot) -> SourceRegistry {
     let mut registry = SourceRegistry::new();
     for (name, provider) in snapshot.providers() {
@@ -354,6 +354,8 @@ pub(crate) struct SessionBinding {
     /// Local subagent delegates for the session's main agent: every configured
     /// `agents.<name>` entry except the bound one (`docs/CLI.md` §5 P7).
     delegates: Vec<DelegateBinding>,
+    /// Managed external ACP delegates (`external_agents.<name>`, decision D3).
+    external_delegates: Vec<ExternalDelegateBinding>,
 }
 
 /// A local subagent delegate resolved from one `agents.<name>` entry
@@ -381,6 +383,20 @@ pub(crate) struct DelegateBinding {
     /// Enabled tool names constraining the delegate's declaration surface;
     /// `None` is unconstrained (every registered tool's declaration).
     tools: Option<Vec<String>>,
+}
+
+/// A managed external ACP delegate resolved from one `external_agents.<name>`
+/// entry (`docs/CLI.md` §5 P7, decision D3).
+///
+/// The launch line is kept in argv form: the first element is the ACP binary and
+/// the remainder are arguments. Environment overrides are applied to the ACP
+/// process by the driver when it builds the registry-backed session handler.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ExternalDelegateBinding {
+    name: String,
+    command: Vec<String>,
+    env: BTreeMap<String, String>,
+    capabilities: Vec<String>,
 }
 
 impl DelegateBinding {
@@ -411,6 +427,28 @@ impl DelegateBinding {
     }
 }
 
+impl ExternalDelegateBinding {
+    /// The delegate (and `ask_<name>` tool suffix) name.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The configured ACP launch command in argv form.
+    pub(crate) fn command(&self) -> &[String] {
+        &self.command
+    }
+
+    /// Environment overrides for the ACP child process.
+    pub(crate) fn env(&self) -> &BTreeMap<String, String> {
+        &self.env
+    }
+
+    /// Capability labels advertised by configuration.
+    pub(crate) fn capabilities(&self) -> &[String] {
+        &self.capabilities
+    }
+}
+
 impl SessionBinding {
     /// Resolves the binding for `config` against `snapshot` (`None` for an
     /// engine without a configuration backend — every field falls back to the
@@ -424,6 +462,7 @@ impl SessionBinding {
                 system_prompt: None,
                 budget: config.budget,
                 delegates: Vec::new(),
+                external_delegates: Vec::new(),
             };
         };
 
@@ -478,6 +517,18 @@ impl SessionBinding {
             })
             .collect();
 
+        let external_delegates = snapshot
+            .external_agents()
+            .values()
+            .filter(|external| matches!(external.effective_kind(), ExternalAgentKind::Acp))
+            .map(|external| ExternalDelegateBinding {
+                name: external.name().to_owned(),
+                command: external.command().to_vec(),
+                env: external.env().cloned().unwrap_or_default(),
+                capabilities: external.capabilities().to_vec(),
+            })
+            .collect();
+
         Self {
             agent_name,
             model: entry.and_then(|agent| agent.model().map(str::to_owned)),
@@ -485,6 +536,7 @@ impl SessionBinding {
             system_prompt: entry.and_then(|agent| agent.system_prompt().map(str::to_owned)),
             budget,
             delegates,
+            external_delegates,
         }
     }
 
@@ -523,6 +575,13 @@ impl SessionBinding {
     /// backend.
     pub(crate) fn delegates(&self) -> &[DelegateBinding] {
         &self.delegates
+    }
+
+    /// Managed external ACP delegates resolved from `external_agents.<name>`
+    /// (`docs/CLI.md` §5 P7, decision D3); empty for an engine without a
+    /// configuration backend.
+    pub(crate) fn external_delegates(&self) -> &[ExternalDelegateBinding] {
+        &self.external_delegates
     }
 }
 
