@@ -3602,7 +3602,7 @@ mod delegation {
 
     use std::{
         fs,
-        path::{Path, PathBuf},
+        path::PathBuf,
         sync::{
             Arc,
             atomic::{AtomicU64, Ordering},
@@ -3617,13 +3617,17 @@ mod delegation {
     };
     use async_trait::async_trait;
     use futures::stream::BoxStream;
+    #[cfg(all(unix, feature = "external-acp"))]
+    use mag_service::SourceKindWire;
     use mag_service::{
         ApprovalDecisionWire, ApprovalRequirementWire, InteractionKindWire,
         InteractionResponseWire, MagService, RequestId, RoutingMode, ServiceEvent, SessionConfig,
-        SourceKindWire, StepIdWire, ToolCallIdWire, UserInput,
+        StepIdWire, ToolCallIdWire, UserInput,
     };
     use mag_tools::{PermissionSpec, ToolCategory, ToolPlugin, ToolRegistry, ToolRisk};
     use serde_json::{Value, json};
+    #[cfg(all(unix, feature = "external-acp"))]
+    use std::path::Path;
     use tokio::time::{Duration, timeout};
     use uuid::Uuid;
 
@@ -3834,7 +3838,7 @@ tools = ["read_file"]
 approval = "allow"
 "#;
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "external-acp"))]
     fn fake_acp_script(dir: &TempConfigDir) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
 
@@ -3879,6 +3883,7 @@ done
         path
     }
 
+    #[cfg(all(unix, feature = "external-acp"))]
     fn toml_string(value: &Path) -> String {
         value
             .to_string_lossy()
@@ -3886,10 +3891,12 @@ done
             .replace('"', "\\\"")
     }
 
+    #[cfg(all(unix, feature = "external-acp"))]
     fn external_acp_config(script: &Path, log: &Path, mode: &str) -> String {
         external_acp_config_with_start_policy(script, log, mode, Some("allow"))
     }
 
+    #[cfg(all(unix, feature = "external-acp"))]
     fn external_acp_config_with_start_policy(
         script: &Path,
         log: &Path,
@@ -4352,7 +4359,7 @@ model = "model-r"
     /// M4-3 external path: without an explicit `[tools.ask_peer] allow`, a
     /// managed ACP delegate start first asks the root session. Approval then
     /// allows the fake ACP process to run.
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "external-acp"))]
     #[tokio::test]
     async fn external_acp_delegate_start_approval_runs_only_after_approval() {
         let dir = TempConfigDir::new();
@@ -4420,7 +4427,7 @@ model = "model-r"
     /// M4-2 main path: a configured `external_agents.peer` ACP process is
     /// advertised as `ask_peer`, driven through a local fake ACP subprocess, and
     /// explicitly cleaned up when the mag session is deleted.
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "external-acp"))]
     #[tokio::test]
     async fn ask_external_acp_delegate_emits_lifecycle_and_cleans_up_on_delete() {
         let dir = TempConfigDir::new();
@@ -4505,7 +4512,7 @@ model = "model-r"
     /// A crashing ACP subprocess does not block engine/session startup. The
     /// failed delegation is surfaced as `DelegationFailed`, and the supervisor
     /// can still continue with a normal final answer.
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "external-acp"))]
     #[tokio::test]
     async fn crashing_external_acp_delegate_maps_to_delegation_failed() {
         let dir = TempConfigDir::new();
@@ -4553,7 +4560,7 @@ model = "model-r"
 
     /// Source listing/probing reflects configured ACP sources, including a
     /// lightweight executable check and configured capability labels.
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "external-acp"))]
     #[tokio::test]
     async fn list_sources_reports_external_acp_availability_and_capabilities() {
         let dir = TempConfigDir::new();

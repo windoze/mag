@@ -3,8 +3,12 @@ name = "mag-core"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["external-acp"]
+external-acp = ["agent-lib/external-acp"]
+
 [dependencies]
-agent-lib = { workspace = true, features = ["external-acp"] }
+agent-lib.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 mag-config = { path = "../mag-config" }

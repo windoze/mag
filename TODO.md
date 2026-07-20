@@ -1036,12 +1036,48 @@ GUI/web/CLI 无需感知多个会话通道。
     5) `cargo test --workspace` ✅（全绿，1 ignored 为既有 zed 联调测试）
     6) `cargo doc --no-deps --workspace` ✅（0 warning）。
 
-### M4-R [TODO] M4 review
+### M4-R [DONE] M4 review
 
 - **实现要求**：对照 `docs/CLI.md` §5 P7 与决策 D3 检查：两条来源行为一致（事件、审批、origin）、
   external 生命周期清扫、restore 完备性、feature gating 正确（不开 feature 时编译过、external 配置报
   明确错误）。发现问题直接修复并补测试。
 - **验证条件**：默认验证序列全过；完成记录列出 review 结论。
+
+  **完成记录**（2026-07-20）：
+  - review 范围：对照 `docs/CLI.md` §5 P7 与决策 D3，复核 M4-1/M4-2/M4-3 当前实现与测试覆盖，重点检查
+    local LLM subagent 与 external ACP agent 两条来源的事件、审批、origin 归因、external 生命周期清扫、
+    restore 重注册，以及 feature gating。
+  - 检查点结论：
+    1. **两条委派来源事件一致** ✅——local 与 external 均通过 model-routed `ask_<name>` 暴露；driver
+       将 facade `DelegationStarted/Finished/Failed/Message` 映射到 service wire 事件；成功与失败路径均有
+       聚焦测试覆盖。
+    2. **审批与 origin** ✅——delegate start 默认经 `ApprovalPolicy::ask_tool("ask_<name>")` 进入 root
+       `IpcApproval`；`[tools.ask_<name>].approval` 可覆盖；local child 工具审批与 external start 审批均携带
+       M2 origin，root 订阅者可见 delegate 名与 depth。
+    3. **external 生命周期清扫** ✅——external ACP handler 记录 agent-lib minted child `AgentId`，会话删除/actor
+       退出时调用 registry cleanup；fake ACP e2e 断言删除后收到 `session/cancel` 或等价清扫标记。
+    4. **restore 完备性** ✅——restore 路径与 fresh build 共用 delegate 注册与 `tool_surface` 审批策略，恢复后
+       `ask_researcher` 仍在 tool surface 且不会回落 auto_allow；回归测试覆盖。
+    5. **feature gating** ✅（发现 1 项问题并修复）——原实现把 `agent-lib/external-acp` 直接写在依赖上，且
+       `driver.rs` 无条件导入 ACP runtime 类型，无法验证“不启 feature 仍编译”。已修复为 `mag-core` 自身默认
+       开启 `external-acp` feature，并转发到 `agent-lib/external-acp`；external ACP runtime handler、delegate
+       构造、cleanup 字段与 Unix fake ACP e2e 均按 feature 条件编译；关闭 feature 时，`Engine::from_config`
+       遇到 `[external_agents.*] kind="acp"` 返回明确的 `EngineError::ExternalAgentUnsupported`，新增
+       no-default feature 测试覆盖错误消息包含 agent 名、kind 与所需 feature。
+  - 保持的已知限制（确认非本轮缺陷）：local delegate 工具仍是 agent-lib worker 的 declaration-only 语义；
+    delegate 自身 provider、provider params、多 provider 并行仍受 agent-lib 当前共享 client 表面限制；
+    `DelegationMessage/Progress` 生产路径仍取决于 agent-lib 是否发射。上述限制均已在 M4-1/M4-2 完成记录中
+    明确记录，不阻塞 M4-R。
+  - 门禁结果：1) `cargo fmt --all -- --check` ✅ 2) 聚焦测试
+    `cargo test -p mag-core delegation` ✅（13 passed）与
+    `cargo test -p mag-core --no-default-features from_config_rejects_external_acp_config_when_feature_is_disabled`
+    ✅（1 passed）3) no-default 编译/ lint：
+    `cargo check -p mag-core --no-default-features --all-targets` ✅，
+    `cargo clippy -p mag-core --no-default-features --all-targets -- -D warnings` ✅ 4)
+    `cargo clippy --all-targets -- -D warnings` ✅ 5) `cargo test --workspace` ✅（全绿，1 ignored 为既有
+    zed 联调测试）6) `cargo doc --no-deps --workspace` ✅（0 warning）。
+  - review 结论：M4 对 `docs/CLI.md` §5 P7 / 决策 D3 的核心要求已满足；本 review 发现并修复 feature
+    gating 缺口，默认 external ACP 功能保持开启且行为不变，关闭 feature 时编译与诊断均明确。**M4 通过**。
 
 ---
 

@@ -18,6 +18,9 @@
 //!   `[providers.<name>]` entry plus one reserved [`LocalAgentSlot`] per
 //!   `[external_agents.<name>]` entry (decision D3). The runtime ACP delegation
 //!   wiring consumes the same config entries when each session driver is built.
+//!   ACP delegation is compiled behind this crate's default `external-acp`
+//!   feature; disabling that feature makes any `[external_agents.*]` ACP entry a
+//!   clear assembly error instead of a silent no-op.
 //! - **Persistence** from `[session].persist_path` (a directory holding the
 //!   SQLite database file), falling back to a private in-memory store.
 //!
@@ -89,6 +92,17 @@ pub enum EngineError {
     /// The session persistence store could not be opened.
     #[error("session persistence error: {0}")]
     Persistence(#[from] PersistenceError),
+    /// The configuration names an external agent runtime that this build did
+    /// not enable.
+    #[error("external agent `{agent}` of kind `{kind}` requires the mag-core `{feature}` feature")]
+    ExternalAgentUnsupported {
+        /// Name of the `[external_agents.<name>]` entry.
+        agent: String,
+        /// Configured external-agent kind, such as `acp`.
+        kind: String,
+        /// Cargo feature that enables this runtime.
+        feature: &'static str,
+    },
     /// A filesystem operation failed (for example creating the configured
     /// persistence directory).
     #[error("io error: {0}")]
@@ -147,10 +161,14 @@ impl Engine {
     ///
     /// Returns [`EngineError`] when the default provider's secret cannot be
     /// resolved, the provider configuration cannot be built, or the configured
-    /// persistence path cannot be opened. Assembly failure is a diagnosable
-    /// error, never a silent downgrade (`docs/CLI.md` §4.2).
+    /// persistence path cannot be opened. When this crate is built without the
+    /// default `external-acp` feature, an `[external_agents.*]` ACP entry reports
+    /// [`EngineError::ExternalAgentUnsupported`] during assembly. Assembly
+    /// failure is a diagnosable error, never a silent downgrade (`docs/CLI.md`
+    /// §4.2).
     pub fn from_config(config_service: Arc<ConfigService>) -> Result<Self, EngineError> {
         let snapshot = config_service.current();
+        reject_external_agents_without_feature(&snapshot)?;
         let tools = assemble_tool_registry(&snapshot);
         let sources = assemble_source_registry(&snapshot);
         let client = assemble_llm_client(&snapshot, &sources)?;
@@ -163,6 +181,27 @@ impl Engine {
             sources,
         ))
     }
+}
+
+#[cfg(feature = "external-acp")]
+fn reject_external_agents_without_feature(_snapshot: &ConfigSnapshot) -> Result<(), EngineError> {
+    Ok(())
+}
+
+#[cfg(not(feature = "external-acp"))]
+fn reject_external_agents_without_feature(snapshot: &ConfigSnapshot) -> Result<(), EngineError> {
+    if let Some(external) = snapshot
+        .external_agents()
+        .values()
+        .find(|external| matches!(external.effective_kind(), ExternalAgentKind::Acp))
+    {
+        return Err(EngineError::ExternalAgentUnsupported {
+            agent: external.name().to_owned(),
+            kind: "acp".to_owned(),
+            feature: "external-acp",
+        });
+    }
+    Ok(())
 }
 
 /// Builds the tool registry for an engine assembled from `snapshot`
@@ -355,6 +394,7 @@ pub(crate) struct SessionBinding {
     /// `agents.<name>` entry except the bound one (`docs/CLI.md` §5 P7).
     delegates: Vec<DelegateBinding>,
     /// Managed external ACP delegates (`external_agents.<name>`, decision D3).
+    #[cfg(feature = "external-acp")]
     external_delegates: Vec<ExternalDelegateBinding>,
 }
 
@@ -391,6 +431,7 @@ pub(crate) struct DelegateBinding {
 /// The launch line is kept in argv form: the first element is the ACP binary and
 /// the remainder are arguments. Environment overrides are applied to the ACP
 /// process by the driver when it builds the registry-backed session handler.
+#[cfg(feature = "external-acp")]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ExternalDelegateBinding {
     name: String,
@@ -427,6 +468,7 @@ impl DelegateBinding {
     }
 }
 
+#[cfg(feature = "external-acp")]
 impl ExternalDelegateBinding {
     /// The delegate (and `ask_<name>` tool suffix) name.
     pub(crate) fn name(&self) -> &str {
@@ -462,6 +504,7 @@ impl SessionBinding {
                 system_prompt: None,
                 budget: config.budget,
                 delegates: Vec::new(),
+                #[cfg(feature = "external-acp")]
                 external_delegates: Vec::new(),
             };
         };
@@ -517,6 +560,7 @@ impl SessionBinding {
             })
             .collect();
 
+        #[cfg(feature = "external-acp")]
         let external_delegates = snapshot
             .external_agents()
             .values()
@@ -536,6 +580,7 @@ impl SessionBinding {
             system_prompt: entry.and_then(|agent| agent.system_prompt().map(str::to_owned)),
             budget,
             delegates,
+            #[cfg(feature = "external-acp")]
             external_delegates,
         }
     }
@@ -580,6 +625,7 @@ impl SessionBinding {
     /// Managed external ACP delegates resolved from `external_agents.<name>`
     /// (`docs/CLI.md` §5 P7, decision D3); empty for an engine without a
     /// configuration backend.
+    #[cfg(feature = "external-acp")]
     pub(crate) fn external_delegates(&self) -> &[ExternalDelegateBinding] {
         &self.external_delegates
     }
@@ -711,6 +757,7 @@ mod tests {
 
     /// The `docs/CLI.md` §4.2 example config, with the secret pointed at a
     /// test-only environment variable.
+    #[cfg(feature = "external-acp")]
     const SAMPLE_TOML: &str = r#"
 [providers.anthropic]
 wire = "anthropic"
@@ -747,6 +794,7 @@ budget = { max_tokens = 200000 }
     /// Sets a test-only environment variable for the duration of a closure
     /// (unique names per test, so parallel tests never interfere). `unsafe`
     /// because environment mutation is process-global (edition 2024).
+    #[cfg(feature = "external-acp")]
     fn with_env_var<T>(name: &str, value: &str, test: impl FnOnce() -> T) -> T {
         unsafe { std::env::set_var(name, value) };
         let result = test();
@@ -754,6 +802,7 @@ budget = { max_tokens = 200000 }
         result
     }
 
+    #[cfg(feature = "external-acp")]
     #[test]
     fn from_config_assembles_the_sample_config() {
         with_env_var("MAG_ASM_TEST_SAMPLE_API_KEY", "sk-asm-test", || {
@@ -791,6 +840,32 @@ budget = { max_tokens = 200000 }
         });
     }
 
+    #[cfg(not(feature = "external-acp"))]
+    #[test]
+    fn from_config_rejects_external_acp_config_when_feature_is_disabled() {
+        let (_dir, service) = service_for(
+            r#"
+[external_agents.peer]
+kind = "acp"
+command = ["peer-agent", "--acp"]
+"#,
+        );
+
+        let error = Engine::from_config(service).expect_err("external ACP requires a feature");
+
+        let message = error.to_string();
+        assert!(
+            matches!(error, EngineError::ExternalAgentUnsupported { .. }),
+            "expected ExternalAgentUnsupported, got: {message}"
+        );
+        assert!(message.contains("peer"), "agent is named: {message}");
+        assert!(message.contains("acp"), "kind is named: {message}");
+        assert!(
+            message.contains("external-acp"),
+            "required feature is named: {message}"
+        );
+    }
+
     #[tokio::test]
     async fn from_config_with_a_missing_file_yields_a_clientless_engine() {
         let dir = TempDir::new("missing");
@@ -819,11 +894,17 @@ budget = { max_tokens = 200000 }
     #[test]
     fn from_config_reports_a_missing_env_secret_with_the_reference_name() {
         // Deliberately never set: the error must name this variable.
-        let config = SAMPLE_TOML.replace(
-            "MAG_ASM_TEST_SAMPLE_API_KEY",
-            "MAG_ASM_TEST_DEFINITELY_MISSING_SECRET",
-        );
-        let (_dir, service) = service_for(&config);
+        let config = r#"
+[providers.anthropic]
+wire = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key = { env = "MAG_ASM_TEST_DEFINITELY_MISSING_SECRET" }
+
+[agents.default]
+provider = "anthropic"
+model = "claude-sonnet-4-5"
+"#;
+        let (_dir, service) = service_for(config);
 
         let error = Engine::from_config(service).expect_err("missing secret fails assembly");
 

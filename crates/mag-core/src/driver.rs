@@ -28,23 +28,28 @@ use std::sync::{
 
 use std::time::Duration;
 
+#[cfg(feature = "external-acp")]
 use agent_lib::{
     agent::external::{
         AcpAdapter, AcpConfig, ExternalSessionRegistry, ExternalSessionShutdown, GitWorktreeManager,
     },
     agent::{
-        AgentId, ApprovalDecision, BudgetLimits, ExternalSessionHandler, ExternalSessionRequest,
-        InteractionHandler, RequirementResult, RunContext, WorktreeRef,
+        AgentId, ExternalSessionHandler, ExternalSessionRequest, RequirementResult, RunContext,
     },
+    facade::{ManagedExternalAgent, RegistryExternalSessionHandler},
+};
+use agent_lib::{
+    agent::{ApprovalDecision, BudgetLimits, InteractionHandler, WorktreeRef},
     client::LlmClient,
     facade::{
         Agent, AgentRunStream, AgentSnapshot, Approval, ApprovalPolicy, CancelHandle,
         DelegationMessage as FacadeDelegationMessage, DelegationTrace as FacadeDelegationTrace,
-        FacadeError, LocalSubagent, ManagedExternalAgent, ModelRef, ReconfigRequest,
-        RegistryExternalSessionHandler, Tool, ToolContext, ToolResult, ToolSetId, ToolSetRef,
-        ToolTrace as FacadeToolTrace, UsageSummary, WireRunEvent, WireRunOutput,
+        FacadeError, LocalSubagent, ModelRef, ReconfigRequest, Tool, ToolContext, ToolResult,
+        ToolSetId, ToolSetRef, ToolTrace as FacadeToolTrace, UsageSummary, WireRunEvent,
+        WireRunOutput,
     },
 };
+#[cfg(feature = "external-acp")]
 use async_trait::async_trait;
 use mag_config::{ApprovalPolicyKind, ConfigSnapshot};
 use mag_service::{
@@ -55,9 +60,11 @@ use mag_tools::{ToolPlugin, ToolRegistry};
 use serde_json::Value;
 use uuid::Uuid;
 
+#[cfg(feature = "external-acp")]
+use crate::assembly::ExternalDelegateBinding;
 use crate::{
     EventBus,
-    assembly::{ApprovalOverrides, DelegateBinding, ExternalDelegateBinding, SessionBinding},
+    assembly::{ApprovalOverrides, DelegateBinding, SessionBinding},
     engine::approval::IpcApproval,
     persistence::Persistence,
     turn_complete::{TurnCompleteHub, TurnCompletion, TurnSummary},
@@ -121,12 +128,14 @@ impl PivotQueue {
 /// [`ExternalSessionRequest`], so this wrapper records it and delegates all real
 /// IO to the registry handler. [`SessionDriver::cleanup_external_sessions`] then
 /// sweeps exactly those completed child sessions when the mag session ends.
+#[cfg(feature = "external-acp")]
 #[derive(Debug)]
 struct TrackedExternalSessionHandler {
     inner: Arc<RegistryExternalSessionHandler>,
     agent_ids: Mutex<Vec<AgentId>>,
 }
 
+#[cfg(feature = "external-acp")]
 impl TrackedExternalSessionHandler {
     fn new(inner: Arc<RegistryExternalSessionHandler>) -> Self {
         Self {
@@ -159,6 +168,7 @@ impl TrackedExternalSessionHandler {
     }
 }
 
+#[cfg(feature = "external-acp")]
 #[async_trait]
 impl ExternalSessionHandler for TrackedExternalSessionHandler {
     async fn fulfill(
@@ -195,6 +205,7 @@ pub(crate) struct SessionDriver {
     /// Registry-backed external ACP handlers owned by this session. Completed
     /// external sessions stay live for reuse until the host explicitly sweeps
     /// them; the session actor calls [`cleanup_external_sessions`] before drop.
+    #[cfg(feature = "external-acp")]
     external_handlers: Vec<Arc<TrackedExternalSessionHandler>>,
     run_counter: AtomicU64,
     /// Mints fresh tool-set identities for `apply_config` reconfigurations.
@@ -271,7 +282,9 @@ impl SessionDriver {
             let worker = delegate_worker(&tools, delegate, overrides)?;
             builder = builder.subagent(delegate.name().to_owned(), worker);
         }
+        #[cfg(feature = "external-acp")]
         let mut external_handlers = Vec::new();
+        #[cfg(feature = "external-acp")]
         for delegate in binding.external_delegates() {
             let (agent, handler) = external_acp_delegate(config, delegate)?;
             external_handlers.push(handler);
@@ -284,6 +297,7 @@ impl SessionDriver {
             tools,
             turn_complete,
             agent_name: binding.agent_name().to_owned(),
+            #[cfg(feature = "external-acp")]
             external_handlers,
             run_counter: AtomicU64::new(1),
             tool_set_counter: AtomicU64::new(1),
@@ -323,7 +337,7 @@ impl SessionDriver {
     /// a snapshot whose state cannot be deserialized).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn restore(
-        config: &SessionConfig,
+        _config: &SessionConfig,
         client: Arc<dyn LlmClient>,
         tools: Arc<ToolRegistry>,
         approval: Arc<IpcApproval>,
@@ -348,9 +362,11 @@ impl SessionDriver {
             let worker = delegate_worker(&tools, delegate, overrides)?;
             builder = builder.subagent(delegate.name().to_owned(), worker);
         }
+        #[cfg(feature = "external-acp")]
         let mut external_handlers = Vec::new();
+        #[cfg(feature = "external-acp")]
         for delegate in binding.external_delegates() {
-            let (agent, handler) = external_acp_delegate(config, delegate)?;
+            let (agent, handler) = external_acp_delegate(_config, delegate)?;
             external_handlers.push(handler);
             builder = builder.external_agent(delegate.name().to_owned(), agent);
         }
@@ -361,6 +377,7 @@ impl SessionDriver {
             tools,
             turn_complete,
             agent_name: binding.agent_name().to_owned(),
+            #[cfg(feature = "external-acp")]
             external_handlers,
             run_counter: AtomicU64::new(1),
             tool_set_counter: AtomicU64::new(1),
@@ -698,18 +715,25 @@ impl SessionDriver {
     /// registry. The session actor calls this on graceful actor shutdown so a
     /// deleted mag session leaves no ACP child process behind.
     pub(crate) async fn cleanup_external_sessions(&mut self, session_id: SessionId) {
-        if self.external_handlers.is_empty() {
-            return;
-        }
-        for handler in &self.external_handlers {
-            let dispositions = handler.cleanup_seen().await;
-            if !dispositions.is_empty() {
-                tracing::info!(
-                    %session_id,
-                    external_sessions = dispositions.len(),
-                    "cleaned up managed external ACP sessions"
-                );
+        #[cfg(feature = "external-acp")]
+        {
+            if self.external_handlers.is_empty() {
+                return;
             }
+            for handler in &self.external_handlers {
+                let dispositions = handler.cleanup_seen().await;
+                if !dispositions.is_empty() {
+                    tracing::info!(
+                        %session_id,
+                        external_sessions = dispositions.len(),
+                        "cleaned up managed external ACP sessions"
+                    );
+                }
+            }
+        }
+        #[cfg(not(feature = "external-acp"))]
+        {
+            let _ = session_id;
         }
     }
 }
@@ -1061,6 +1085,7 @@ fn delegate_worker(
 /// handler directly over the ACP adapter because agent-lib's one-call default
 /// helper has no surface for mag's per-source env overrides; the composition is
 /// the same registry-backed handler the helper returns for ACP.
+#[cfg(feature = "external-acp")]
 fn external_acp_delegate(
     config: &SessionConfig,
     delegate: &ExternalDelegateBinding,
@@ -1098,6 +1123,7 @@ fn external_acp_delegate(
 }
 
 /// Splits an argv-form external-agent command into binary + args.
+#[cfg(feature = "external-acp")]
 fn split_external_command(command: &[String]) -> (std::path::PathBuf, Vec<String>) {
     match command.split_first() {
         Some((binary, args)) => (binary.into(), args.to_vec()),
@@ -1105,6 +1131,7 @@ fn split_external_command(command: &[String]) -> (std::path::PathBuf, Vec<String
     }
 }
 
+#[cfg(feature = "external-acp")]
 fn external_worktree_root() -> std::path::PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -1128,6 +1155,7 @@ fn apply_delegate_start_tiers(
     for delegate in binding.delegates() {
         policy = policy.ask_tool(delegate_start_tool_name(delegate.name()));
     }
+    #[cfg(feature = "external-acp")]
     for delegate in binding.external_delegates() {
         policy = policy.ask_tool(delegate_start_tool_name(delegate.name()));
     }
