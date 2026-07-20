@@ -19,6 +19,15 @@
 //! [`InteractionKind::Permission`] requests (local-agent / privileged actions)
 //! flow through the same pause, first consulting a [`PermissionDecider`] — the
 //! seam future AI-based permission policies plug into (`docs/DESIGN.md` §8.1).
+//!
+//! Delegated interactions (`docs/CLI.md` §3.3, decision D5): agent-lib routes a
+//! child agent's paused interaction to the handler its supervisor injected —
+//! this same [`IpcApproval`] — annotated with an
+//! [`InteractionOrigin`](agent_lib::agent::InteractionOrigin) (delegate name +
+//! delegation depth). [`IpcApproval`] projects that attribution onto the wire
+//! [`Event::InteractionRequested`] so the interface can render which delegate
+//! is asking, while the single shared pending map routes the interface's
+//! response back to the exact delegate that asked.
 
 use std::{
     collections::HashMap,
@@ -30,9 +39,9 @@ use std::{
 
 use agent_lib::agent::{
     AgentId, ApprovalDecision, ApprovalRequirement, ApprovalResponse, CancellationToken,
-    Interaction, InteractionHandler, InteractionKind, InteractionResponse, PermissionCategory,
-    PermissionDecision, PermissionRequest, PermissionResponse, PermissionRisk, RequirementResult,
-    RunContext,
+    Interaction, InteractionHandler, InteractionKind, InteractionOrigin as AgentInteractionOrigin,
+    InteractionResponse, PermissionCategory, PermissionDecision, PermissionRequest,
+    PermissionResponse, PermissionRisk, RequirementResult, RunContext,
 };
 use agent_lib::conversation::ToolCallId;
 use async_trait::async_trait;
@@ -109,6 +118,15 @@ impl RequestIdSource {
 /// One instance is shared (as `Arc`) between the driver's agent — which reaches
 /// it through the [`InteractionHandler`] trait — and the session actor, which
 /// resolves pending requests through [`respond`](IpcApproval::respond).
+///
+/// The same instance also answers **delegated** interactions: agent-lib routes
+/// a child agent's paused interaction to the handler its supervisor injected
+/// (annotating it with an [`AgentInteractionOrigin`]), so every interaction in
+/// a delegation chain — any depth — lands here (`docs/CLI.md` §3.3, decision
+/// D5). Because this one handler mints every [`RequestId`] of its session, ids
+/// can never collide across concurrently parked delegates, and the pending map
+/// routes each response back to the exact parked `fulfill` — and therefore the
+/// originating delegate — that emitted the request.
 pub(crate) struct IpcApproval {
     session_id: SessionId,
     events: EventBus,
@@ -140,6 +158,15 @@ impl IpcApproval {
     /// The core response is reconstructed from the stored request so the
     /// interface only needs to supply the decision (it never learns the internal
     /// `step_id`); the reconstruction is then validated against the request.
+    ///
+    /// Routing guarantee (`docs/CLI.md` §3.3): every interaction of the session
+    /// — the root agent's own and every delegate's, at any depth — is registered
+    /// in this one handler's pending map under an id minted by its own
+    /// monotonic [`RequestIdSource`], so `request_id` identifies exactly one
+    /// parked `fulfill` no matter how many delegates pause concurrently. Sending
+    /// on the stored oneshot wakes that specific park, which resumes the
+    /// delegate that originated the interaction; responses can never cross over
+    /// to a different delegate's request.
     ///
     /// # Errors
     ///
@@ -204,9 +231,10 @@ impl IpcApproval {
             id: self.session_id,
             request_id,
             kind,
-            // M2-1 adds the attribution field; M2-2 threads the delegate's
-            // real origin here — until then every interaction is root-origin.
-            origin: InteractionOrigin::default(),
+            // Delegate attribution (`docs/CLI.md` §3.3): a child agent's
+            // interaction arrives annotated by agent-lib's routing layer; the
+            // root session's own interactions map to the default root origin.
+            origin: interaction_origin_to_wire(request.origin()),
         });
 
         tokio::select! {
@@ -257,6 +285,25 @@ fn cancelled_response(request: &Interaction) -> InteractionResponse {
         } => InteractionResponse::Permission(PermissionResponse::cancel(
             permission.action_id().to_owned(),
         )),
+    }
+}
+
+/// Maps agent-lib's delegated-interaction attribution onto the wire
+/// [`InteractionOrigin`] (`docs/CLI.md` §3.3, decision D5).
+///
+/// agent-lib's delegation routing annotates a child agent's forwarded
+/// interaction with an [`AgentInteractionOrigin`] — the delegate's name and its
+/// [`RunContext`] depth (already `u32`, so no narrowing is needed). A root
+/// interaction carries no annotation and maps to the wire default
+/// (`delegate: None`, `depth: 0`), keeping the event identical to the
+/// pre-attribution shape for the root's own pauses.
+fn interaction_origin_to_wire(origin: Option<&AgentInteractionOrigin>) -> InteractionOrigin {
+    match origin {
+        Some(origin) => InteractionOrigin {
+            delegate: Some(origin.delegate.clone()),
+            depth: origin.depth,
+        },
+        None => InteractionOrigin::default(),
     }
 }
 
@@ -408,7 +455,7 @@ mod tests {
         convert::Infallible,
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         task::Poll,
     };
@@ -416,19 +463,19 @@ mod tests {
     use agent_lib::{
         agent::{
             AgentId, ApprovalDecision, ApprovalRequirement, BudgetLimits, Interaction,
-            InteractionHandler, InteractionResponse, PermissionCategory, PermissionDecision,
-            PermissionRequest, PermissionResponse, PermissionRisk, RequirementResult, RunContext,
-            RunId, StepId, TraceNodeId,
+            InteractionHandler, InteractionOrigin as AgentInteractionOrigin, InteractionResponse,
+            PermissionCategory, PermissionDecision, PermissionRequest, PermissionResponse,
+            PermissionRisk, RequirementResult, RunContext, RunId, StepId, TraceNodeId,
         },
         client::LlmClient,
         conversation::ToolCallId,
-        facade::{Agent, Approval, CancelHandle, Tool, ToolContext},
+        facade::{Agent, Approval, ApprovalPolicy, CancelHandle, Tool, ToolContext, ToolDecl},
         model::usage::Usage,
     };
     use async_trait::async_trait;
     use futures::StreamExt;
     use mag_service::{
-        ApprovalDecisionWire, ApprovalRequirementWire, InteractionKindWire,
+        ApprovalDecisionWire, ApprovalRequirementWire, InteractionKindWire, InteractionOrigin,
         InteractionResponseWire, PermissionCategoryWire, PermissionDecisionWire,
         PermissionRiskWire, ServiceError, StepIdWire, ToolCallIdWire,
     };
@@ -442,7 +489,8 @@ mod tests {
 
     use super::{
         AskFrontendDecider, Event, IpcApproval, PermissionDecider, RequestId, SessionId,
-        agent_id_to_wire, interaction_kind_to_wire, interaction_response_from_wire,
+        agent_id_to_wire, interaction_kind_to_wire, interaction_origin_to_wire,
+        interaction_response_from_wire,
     };
 
     fn session_id() -> SessionId {
@@ -518,12 +566,12 @@ mod tests {
     }
 
     /// Drives `stream` forward until [`IpcApproval`] emits an
-    /// [`Event::InteractionRequested`], returning its request id. Panics if the
-    /// stream terminates or errors before pausing.
+    /// [`Event::InteractionRequested`], returning its request id and origin
+    /// attribution. Panics if the stream terminates or errors before pausing.
     async fn drive_until_interaction<S>(
         stream: &mut S,
         events: &mut crate::EventStream,
-    ) -> RequestId
+    ) -> (RequestId, InteractionOrigin)
     where
         S: futures::Stream<
                 Item = Result<agent_lib::facade::RunEvent, agent_lib::facade::FacadeError>,
@@ -538,7 +586,9 @@ mod tests {
             }
             if let Poll::Ready(Some(event)) = futures::poll!(events.next()) {
                 match event {
-                    Event::InteractionRequested { request_id, .. } => return request_id,
+                    Event::InteractionRequested {
+                        request_id, origin, ..
+                    } => return (request_id, origin),
                     other => panic!("unexpected event before the interaction: {other:?}"),
                 }
             }
@@ -589,7 +639,12 @@ mod tests {
         let mut subscriber = events.subscribe();
 
         let mut stream = agent.stream("weather?".to_owned()).await.expect("stream");
-        let request_id = drive_until_interaction(&mut stream, &mut subscriber).await;
+        let (request_id, root_origin) = drive_until_interaction(&mut stream, &mut subscriber).await;
+
+        // The root session's own interaction carries the default (root) origin
+        // attribution (`docs/CLI.md` §3.3).
+        assert_eq!(root_origin, InteractionOrigin::default());
+        assert!(root_origin.is_root());
 
         assert_eq!(
             counter.load(Ordering::SeqCst),
@@ -628,7 +683,7 @@ mod tests {
         let mut subscriber = events.subscribe();
 
         let mut stream = agent.stream("weather?".to_owned()).await.expect("stream");
-        let request_id = drive_until_interaction(&mut stream, &mut subscriber).await;
+        let (request_id, _) = drive_until_interaction(&mut stream, &mut subscriber).await;
 
         ipc.respond(request_id, approval_response(ApprovalDecisionWire::Deny))
             .expect("respond deny");
@@ -658,7 +713,7 @@ mod tests {
             .stream_with_cancel("weather?".to_owned(), cancel.clone())
             .await
             .expect("stream");
-        let _request_id = drive_until_interaction(&mut stream, &mut subscriber).await;
+        let (_request_id, _) = drive_until_interaction(&mut stream, &mut subscriber).await;
         assert_eq!(counter.load(Ordering::SeqCst), 0);
 
         // Cancelling the active run must unblock the parked approval (the
@@ -935,6 +990,258 @@ mod tests {
                 },
             ),
             Err(ServiceError::InteractionNotFound { request_id })
+        );
+    }
+
+    #[test]
+    fn interaction_origin_maps_to_wire() {
+        // No attribution = the root session's own interaction.
+        assert_eq!(
+            interaction_origin_to_wire(None),
+            InteractionOrigin::default()
+        );
+
+        let delegated = AgentInteractionOrigin::new("codex", 2);
+        assert_eq!(
+            interaction_origin_to_wire(Some(&delegated)),
+            InteractionOrigin {
+                delegate: Some("codex".to_owned()),
+                depth: 2,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_interaction_origin_surfaces_on_the_wire_event() {
+        let events = EventBus::new();
+        let ipc = IpcApproval::new(session_id(), events.clone(), Arc::new(AskFrontendDecider));
+        let mut subscriber = events.subscribe();
+        // agent-lib's delegation routing annotates the forwarded interaction;
+        // simulate that annotation directly (`docs/CLI.md` §3.3).
+        let interaction =
+            Interaction::question(StepId::new(Uuid::from_u128(5)), "delegate asks".to_owned())
+                .with_origin(AgentInteractionOrigin::new("reviewer", 1));
+        let ctx = run_ctx();
+
+        let mut fulfilled = Box::pin(ipc.fulfill(&interaction, &ctx));
+
+        let request_id = loop {
+            assert!(
+                futures::poll!(fulfilled.as_mut()).is_pending(),
+                "fulfill resolved before the interface responded"
+            );
+            if let Poll::Ready(Some(event)) = futures::poll!(subscriber.next()) {
+                match event {
+                    Event::InteractionRequested {
+                        request_id,
+                        kind: InteractionKindWire::Question { prompt },
+                        origin,
+                        ..
+                    } => {
+                        assert_eq!(prompt, "delegate asks");
+                        assert_eq!(origin.delegate.as_deref(), Some("reviewer"));
+                        assert_eq!(origin.depth, 1);
+                        assert!(!origin.is_root());
+                        break request_id;
+                    }
+                    other => panic!("expected a delegated InteractionRequested, got {other:?}"),
+                }
+            }
+            tokio::task::yield_now().await;
+        };
+
+        ipc.respond(
+            request_id,
+            InteractionResponseWire::Answer {
+                text: "from the interface".to_owned(),
+            },
+        )
+        .expect("respond answer");
+
+        match fulfilled.await {
+            RequirementResult::Interaction(response) => {
+                assert_eq!(
+                    response,
+                    InteractionResponse::answer("from the interface".to_owned())
+                );
+            }
+            other => panic!("expected an interaction result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_delegate_interactions_route_each_response_to_its_own_waiter() {
+        let events = EventBus::new();
+        let ipc = Arc::new(IpcApproval::new(
+            session_id(),
+            events.clone(),
+            Arc::new(AskFrontendDecider),
+        ));
+        let mut subscriber = events.subscribe();
+        let ctx = run_ctx();
+
+        // Two delegates park concurrently on the same session handler
+        // (`docs/CLI.md` §3.3: one handler mints every request id of the
+        // session, so concurrent delegates can never collide).
+        let interaction_a = Interaction::approval(
+            StepId::new(Uuid::from_u128(11)),
+            ToolCallId::new(Uuid::from_u128(21)),
+            ApprovalRequirement::RequireApproval { reason: None },
+        )
+        .with_origin(AgentInteractionOrigin::new("delegate-a", 1));
+        let interaction_b = Interaction::approval(
+            StepId::new(Uuid::from_u128(12)),
+            ToolCallId::new(Uuid::from_u128(22)),
+            ApprovalRequirement::RequireApproval { reason: None },
+        )
+        .with_origin(AgentInteractionOrigin::new("delegate-b", 2));
+
+        let mut fulfill_a = Box::pin(ipc.fulfill(&interaction_a, &ctx));
+        let mut fulfill_b = Box::pin(ipc.fulfill(&interaction_b, &ctx));
+
+        // Collect both requests: distinct ids, each carrying its own origin.
+        let mut requests = std::collections::HashMap::new();
+        for _ in 0..5000 {
+            let _ = futures::poll!(fulfill_a.as_mut());
+            let _ = futures::poll!(fulfill_b.as_mut());
+            while let Poll::Ready(Some(event)) = futures::poll!(subscriber.next()) {
+                match event {
+                    Event::InteractionRequested {
+                        request_id, origin, ..
+                    } => {
+                        requests.insert(request_id, origin);
+                    }
+                    other => panic!("unexpected event before both pauses: {other:?}"),
+                }
+            }
+            if requests.len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let id_of = |delegate: &str| {
+            *requests
+                .iter()
+                .find(|(_, origin)| origin.delegate.as_deref() == Some(delegate))
+                .unwrap_or_else(|| panic!("no parked request from {delegate}"))
+                .0
+        };
+        let id_a = id_of("delegate-a");
+        let id_b = id_of("delegate-b");
+        assert_ne!(id_a, id_b, "concurrent requests get distinct ids");
+
+        // Respond out of order: each parked delegate must receive its own
+        // decision — responses never cross over between delegates.
+        ipc.respond(id_b, approval_response(ApprovalDecisionWire::Deny))
+            .expect("respond delegate-b");
+        match fulfill_b.await {
+            RequirementResult::Interaction(InteractionResponse::Approval(response)) => {
+                assert_eq!(response.decision(), ApprovalDecision::Deny);
+                assert_eq!(response.step_id(), StepId::new(Uuid::from_u128(12)));
+                assert_eq!(response.call_id(), ToolCallId::new(Uuid::from_u128(22)));
+            }
+            other => panic!("expected delegate-b's approval result, got {other:?}"),
+        }
+
+        ipc.respond(id_a, approval_response(ApprovalDecisionWire::Approve))
+            .expect("respond delegate-a");
+        match fulfill_a.await {
+            RequirementResult::Interaction(InteractionResponse::Approval(response)) => {
+                assert_eq!(response.decision(), ApprovalDecision::Approve);
+                assert_eq!(response.step_id(), StepId::new(Uuid::from_u128(11)));
+                assert_eq!(response.call_id(), ToolCallId::new(Uuid::from_u128(21)));
+            }
+            other => panic!("expected delegate-a's approval result, got {other:?}"),
+        }
+    }
+
+    /// Builds the data-only `shell` tool declaration a worker advertises.
+    fn shell_decl() -> ToolDecl {
+        ToolDecl {
+            name: "shell".to_owned(),
+            description: "Run a shell command.".to_owned(),
+            input_schema: json!({ "type": "object" }),
+        }
+    }
+
+    #[tokio::test]
+    async fn delegate_interaction_pops_to_root_with_origin_and_resumes_on_response() {
+        let events = EventBus::new();
+        let ipc = Arc::new(IpcApproval::new(
+            session_id(),
+            events.clone(),
+            Arc::new(AskFrontendDecider),
+        ));
+        let mut subscriber = events.subscribe();
+
+        // Scripted two-level scenario (`docs/CLI.md` §3.3): the supervisor
+        // delegates to `reviewer`; the reviewer's first step calls its gated
+        // `shell` tool, pausing through the supervisor-injected `IpcApproval`;
+        // once answered, the reviewer reports back and the supervisor closes
+        // the turn. Scripts pop strictly in this order.
+        let client = FakeLlmClient::scripted(vec![
+            tool_use_stream(
+                "ask_reviewer",
+                "del-1",
+                json!({ "task": "inspect the tree" }),
+            ),
+            tool_use_stream("shell", "child-shell-1", json!({ "cmd": "ls" })),
+            text_stream_with_usage(&["I could not run shell; reporting from memory."], usage()),
+            text_stream_with_usage(&["Final: done."], usage()),
+        ]);
+
+        // The child's policy gates `shell`; its synchronous fallback decider
+        // must never run because the root session's handler answers the pause.
+        let child_decider_consulted = Arc::new(AtomicBool::new(false));
+        let probe = child_decider_consulted.clone();
+        let child_approval = ApprovalPolicy::new(Approval::ask(move |request| {
+            if request.tool_name == "shell" {
+                probe.store(true, Ordering::SeqCst);
+            }
+            ApprovalDecision::Deny
+        }));
+        let reviewer = Agent::worker()
+            .system("You are the REVIEWER.")
+            .tool_declarations(vec![shell_decl()])
+            .approval(child_approval)
+            .build()
+            .expect("worker builds");
+
+        let mut agent = Agent::builder()
+            .client(client.clone() as Arc<dyn LlmClient>)
+            .model("test-model")
+            .max_tokens(64)
+            .approval(Approval::auto_allow())
+            .interaction_handler(ipc.clone() as Arc<dyn InteractionHandler>)
+            .subagent("reviewer", reviewer)
+            .build()
+            .expect("build supervisor agent");
+
+        let mut stream = agent
+            .stream("Delegate an inspection.".to_owned())
+            .await
+            .expect("stream");
+        let (request_id, origin) = drive_until_interaction(&mut stream, &mut subscriber).await;
+
+        // The delegate's pause pops on the root session's event stream with
+        // full attribution: delegate name and depth 1.
+        assert_eq!(origin.delegate.as_deref(), Some("reviewer"));
+        assert_eq!(origin.depth, 1);
+        assert!(!origin.is_root());
+
+        ipc.respond(request_id, approval_response(ApprovalDecisionWire::Deny))
+            .expect("respond deny");
+
+        drain(&mut stream).await;
+        assert!(
+            !child_decider_consulted.load(Ordering::SeqCst),
+            "the child policy gates the call, but the root handler answers it"
+        );
+        assert_eq!(
+            client.chat_requests().len() + client.stream_requests().len(),
+            4,
+            "the answered delegate resumed, reported back, and the supervisor \
+             consumed every scripted step"
         );
     }
 }

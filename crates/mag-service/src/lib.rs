@@ -508,7 +508,7 @@ pub struct DelegationMessageWire {
 /// session's event stream, and this payload records where they came from so
 /// interfaces can render attribution (for example `[from codex@depth1]`). It
 /// is the wire counterpart of agent-lib's `InteractionOrigin { delegate,
-/// depth }` (the wire keeps the depth as `u32`; agent-lib uses `usize`).
+/// depth }` (both sides keep the depth as `u32`).
 ///
 /// The default is the *root* origin — `delegate: None, depth: 0` — meaning
 /// the interaction was produced by the root session's own agent. Because the

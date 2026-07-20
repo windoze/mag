@@ -281,7 +281,7 @@ GUI/web/CLI 无需感知多个会话通道。
     3) `cargo clippy --all-targets -- -D warnings` ✅ 4) `cargo test --workspace` ✅（18 个测试
     目标全 ok，无失败）5) `cargo doc --no-deps --workspace` ✅。
 
-### M2-2 [TODO] mag-core：子 agent 交互 origin 映射
+### M2-2 [DONE] mag-core：子 agent 交互 origin 映射
 
 - **上下文**：`docs/CLI.md` §3.3；mag-core 把 agent-lib 路由来的子 agent 交互（approval / question /
   choice / permission）统一经 root 会话的 `ServiceEvent::InteractionRequested` 发出。
@@ -294,6 +294,47 @@ GUI/web/CLI 无需感知多个会话通道。
 - **验证条件**：聚焦测试：两级 delegate 场景（fake LLM 驱动 subagent 触发审批），断言 root 订阅者收到
   一条 `InteractionRequested` 且 `origin.delegate == Some(..)`、`depth == 1`；`respond_interaction` 后
   正确的 delegate 恢复执行；无 delegate 时 origin 为 default。默认验证序列全过。
+
+  **完成记录**（2026-07-21）：
+  - 实现要点：`IpcApproval::emit_and_await` 把 M2-1 的 `InteractionOrigin::default()` 占位替换为
+    `interaction_origin_to_wire(request.origin())`——新增映射函数把 agent-lib 路由层标注的
+    `Option<&agent_lib::agent::InteractionOrigin>` 投影到 wire `InteractionOrigin`：`None`（root 会话
+    自身交互）→ wire default（`delegate:None, depth:0`）；`Some(o)` → `delegate:Some(o.delegate),
+    depth:o.depth`。全部改动集中在 `crates/mag-core/src/engine/approval.rs`；driver/session/engine 路径
+    无需变动——注入点本就是「每会话一个共享 `IpcApproval`」，agent-lib 的 `ChildInteractionRouter`
+    自动把任意深度 delegate 的暂停交互转发到这同一实例。
+  - 关键设计：① **origin 传递链**——agent-lib `facade/delegate.rs` 的 `ChildInteractionRouter::fulfill`
+    在转发前 `request.clone().with_origin(InteractionOrigin::new(delegate, ctx.depth()))` 标注
+    （external 路径同构），父级注入 handler（即 `IpcApproval`）从 `Interaction::origin()` 读取；
+    实测 agent-lib `InteractionOrigin{delegate: String, depth: u32}` 与 `RunContext::depth() -> u32`
+    **均为 u32**（任务书按旧文档写的 usize→u32 收窄不需要，直接拷贝），并顺手修正 mag-service
+    `InteractionOrigin` rustdoc 中「agent-lib uses usize」的不准确表述（纯文档）；② **RequestId 路由
+    保证**——会话内全部交互（root + 任意深度的全部 delegate）都汇入同一个 `IpcApproval` 实例，id 由
+    其实例级 `RequestIdSource` 单调铸造，天然唯一；`respond` 按 id 查 pending map，命中项存储的
+    oneshot 精确唤醒发起该请求的那次 parked `fulfill`，应答经 `ChildInteractionRouter` 回到正确的
+    delegate——多 delegate 并发暂停不可能串号。已在 `IpcApproval` 类型级与 `respond` rustdoc 中
+    记录该保证；③ **渲染不丢信息**——wire `Event::InteractionRequested` 即 mag-core 的渲染/trace
+    载体（crate 内无独立日志管道），origin 字段携带 delegate 名与 depth，消费者（CLI M6-2 的
+    `[from <delegate>@depth<n>]` 前缀、未来 GUI）直接取用。
+  - 测试（全部离线，`engine::approval` 模块，新增 4 个 + 1 处既有断言增强）：(a)
+    `delegate_interaction_pops_to_root_with_origin_and_resumes_on_response`——两级 delegate 集成场景：
+    fake LLM 顺序脚本驱动 supervisor `ask_reviewer` 委派 → reviewer 调 gated `shell` 暂停 → 断言 root
+    订阅者收到 `InteractionRequested` 且 `origin.delegate == Some("reviewer")`、`depth == 1`；
+    `respond`(Deny) 后 delegate 恢复执行（4 条脚本全部消费、子级同步 fallback decider 探针未被
+    调用——证明由 root handler 应答）；delegate 装配走 agent-lib 公共 API
+    （`Agent::worker()` + `AgentBuilder::subagent`），成本低于预期，未走降级路径；(b)
+    `delegated_interaction_origin_surfaces_on_the_wire_event`——直接 fulfill 带 origin 标注的
+    Question 交互，断言事件 origin 与应答回灌；(c)
+    `concurrent_delegate_interactions_route_each_response_to_its_own_waiter`——两个 delegate
+    （depth 1/2）并发暂停，乱序应答（先 b 后 a），断言各自 waiter 收到各自 decision 且
+    step_id/call_id 归位、id 互不相同；(d) `interaction_origin_maps_to_wire`——映射函数单测
+    （None→default、Some→delegate/depth）；(e) root 场景断言增强——既有
+    `pause_then_approve_runs_the_tool` 补 `origin == InteractionOrigin::default()` / `is_root()`
+    断言（验证条件 c）；`drive_until_interaction` 帮助函数返回 `(RequestId, InteractionOrigin)`，
+    三个既有调用点同步解构。聚焦测试连跑 3 次无 flake，单测试 < 1s。
+  - 门禁结果：1) `cargo fmt --all -- --check` ✅ 2) `cargo test -p mag-core approval` ✅（17 passed，
+    连跑 3 次无 flake）3) `cargo clippy --all-targets -- -D warnings` ✅ 4) `cargo test --workspace`
+    ✅（全绿，无失败）5) `cargo doc --no-deps --workspace` ✅（0 warning）。
 
 ### M2-R [TODO] M2 review
 
