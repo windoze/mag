@@ -1,0 +1,32 @@
+[
+  {
+    "type": "user_message",
+    "text": "Inspect README",
+    "attachments": []
+  },
+  {
+    "type": "assistant_message",
+    "text": "The README is short."
+  },
+  {
+    "type": "tool_call",
+    "trace": {
+      "run_id": "run-history",
+      "call_id": "tool-history",
+      "name": "read_file",
+      "input": { "path": "README.md" },
+      "output": { "bytes": 10 },
+      "status": "finished"
+    }
+  },
+  {
+    "type": "delegation",
+    "trace": {
+      "run_id": "run-history",
+      "delegate": "planner",
+      "status": "finished",
+      "task": "outline",
+      "output": "done"
+    }
+  }
+]

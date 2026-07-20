@@ -1,34 +1,37 @@
-# 执行计划
+# Claude Execution Plan
 
-说明：本文件记录可审计的执行计划与进度，不包含私有推理链。
+## Scope
 
-## 当前目标
+- Follow `TODO.md` as the authoritative task list.
+- Identify and complete exactly the first incomplete task whose heading is not prefixed with `[DONE]`.
+- Stop after committing that task, or after committing any required prerequisite/blocker update.
 
-根据 `TODO.md` 的顺序完成首个未完成任务：`W3-1 [TODO] ui/ monorepo 脚手架`，验证后更新任务记录并提交一次 Git commit，然后停止。
+## Execution Plan
 
-## 初始步骤
+1. Read `TODO.md` to find the first incomplete task and its validation requirements.
+2. Check the latest commit message only for unfinished work directly relevant to that task.
+3. Inspect the files and tests relevant to the selected task.
+4. Implement the task with minimal, targeted changes.
+5. Run formatting first, then linting, then the task-required tests/full suite as applicable.
+6. If any unscheduled test failure appears, fix it or add the minimum prerequisite task before marking the current task complete.
+7. Update `TODO.md` by prefixing the completed task heading with `[DONE]` and filling its completion record.
+8. Update `PLAN.md` only if phase-level sequencing or completion criteria change.
+9. Inspect git status and diff, then commit all intended changes with a task-specific message.
+10. Stop without starting the next task.
 
-1. 读取 `TODO.md`，仅识别第一个未完成任务，不做开放式历史问题扫描。
-2. 查看最近提交信息；只有当其明确提到与当前任务直接相关的未完成问题时，才纳入当前任务或作为前置任务记录到 `TODO.md`。
-3. 读取当前任务涉及的相关代码、测试和文档，确认任务要求、依赖和验证命令。
+## Progress Log
 
-## 执行步骤
-
-1. 按任务要求做最小且完整的实现，不通过缩小范围或绕过规格来完成。
-2. 若发现阻塞当前任务的规格缺口、实现边界或失败测试，优先修复；若无法在当前任务内正确完成，则在 `TODO.md` 中插入最小前置任务并停止。
-3. 使用小而聚焦的补丁修改代码、测试和文档；必要时更新本计划文件记录关键进展。
-4. 先运行格式化，再运行 lint，再运行任务要求的相关测试；如果代码发生变化且需要全量验证，则运行完整测试套件。
-5. 若所有验证通过，将当前任务标题加上 `[DONE]`，填写完成记录。
-6. 检查 Git 状态、diff 和最近提交，提交本次任务相关所有未提交变更。
-7. 完成一个任务后停止，不继续处理下一个任务。
-
-## 进度记录
-
-- 已写入初始执行计划，下一步读取 `TODO.md` 识别第一个未完成任务。
-- 已读取 `TODO.md`，确认当前任务为 `W3-1`；后续只处理该任务，不进入 `W3-2`。
-- 最近提交为 `W2-R` review，通过，不包含直接阻塞 `W3-1` 的未完成事项。
-- 本机无全局 `pnpm`/`corepack`，但有 `npm`；验证阶段将使用 `npx --yes pnpm@10.14.0 ...` 执行 pnpm 命令，避免修改全局环境。
-- 已补齐 `ui/` pnpm workspace 根配置、`@mag/client`/`@mag/ui`/`@mag/app-web` 骨架、Storybook/Tailwind/shadcn 配置和 README。
-- 前端验证已通过：`npx --yes pnpm@10.14.0 install`、`format`、`lint`、`-r build`、`-r test`。当前进入 Rust 默认验证序列。
-- Rust 默认验证已通过：`cargo fmt --all`、`cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`、`cargo doc --no-deps --workspace`。
-- 已将 `TODO.md` 中 `W3-1` 标记为 `[DONE]` 并填写完成记录；下一步检查 diff/status 后提交。
+- Initial execution plan recorded before running repository commands.
+- Identified first incomplete task: `W3-2 [TODO] @mag/client: ITransport + HttpSseTransport + SessionStore`.
+- Next step: inspect only W3-2-relevant docs, generated protocol types, current `@mag/client` skeleton, and latest commit message for directly relevant unfinished work.
+- Context check complete: latest commit is W3-1 scaffolding and no directly relevant unfinished issue was found.
+- Implementation approach: add focused `transport` and `store` modules under `ui/packages/client/src`, keep HTTP mapping inside `HttpSseTransport`, and drive `SessionStore` with protocol fixtures in Vitest.
+- Implementation files added: `transport.ts`, `store.ts`, client package exports, and W3-2 Vitest JSON fixtures/tests.
+- Next step: run focused `@mag/client` typecheck/tests, then fix any compile or behavioral failures before broader formatting/lint/test validation.
+- Focused validation passed after correcting `run_finished` handling to match generated protocol (`run_finished` carries output but no `run_id`).
+- Next step: run formatting, linting, workspace frontend validation, and Rust default validation commands required by the task discipline.
+- Formatting completed (`cargo fmt --all`, `pnpm format:write`), and checks passed for `cargo fmt --all -- --check`, `pnpm format`, `pnpm lint`, and `cargo clippy --all-targets -- -D warnings`.
+- Next step: run full workspace tests/builds (`cargo test --workspace`, `pnpm -r test`, `pnpm -r build`) followed by `cargo doc --no-deps --workspace`.
+- Full validation passed: `cargo test --workspace`, `pnpm -r test`, `pnpm -r build`, and `cargo doc --no-deps --workspace`.
+- `TODO.md` updated to mark `W3-2 [DONE]` with completion record. `PLAN.md` was not changed because no phase-level sequencing or criteria changed.
+- Next step: inspect git status/diff/log, then commit the W3-2 changes only.

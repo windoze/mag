@@ -1,2 +1,5 @@
-/** Package marker used by early workspace smoke tests. */
+export * from "./store";
+export * from "./transport";
+
+/** Package marker used by workspace smoke tests. */
 export const clientPackageName = "@mag/client";

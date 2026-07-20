@@ -347,7 +347,7 @@ CI 承载（引入 CI 时列为第一批）；⑥tool 输出为 agent-lib Conten
 - 文档更新：新增 `ui/README.md`，并在根 `README.md` 补充 frontend install/build/test 与 protocol regeneration 命令；`.gitignore` 忽略 node_modules、dist 产物、coverage、Storybook 输出和 tsbuildinfo 缓存。
 - 验证通过：`npx --yes pnpm@10.14.0 install`、`npx --yes pnpm@10.14.0 format`、`npx --yes pnpm@10.14.0 lint`、`npx --yes pnpm@10.14.0 -r build`、`npx --yes pnpm@10.14.0 -r test`、`npx --yes pnpm@10.14.0 --filter @mag/ui build-storybook`、`cargo fmt --all`、`cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`、`cargo doc --no-deps --workspace`。
 
-### W3-2 [TODO] `@mag/client`：ITransport + HttpSseTransport + SessionStore
+### W3-2 [DONE] `@mag/client`：ITransport + HttpSseTransport + SessionStore
 
 - **上下文**：`docs/WEB.md` §6.2（决策 D8：send(Command) 把 REST 映射收敛在 transport 内）。
 - **实现要求**：
@@ -359,6 +359,15 @@ CI 承载（引入 CI 时列为第一批）；⑥tool 输出为 agent-lib Conten
     去重）；断线自动重连 + 全量对齐（list_sessions + 打开会话的 history）。
 - **验证条件**：vitest：JSON fixture（scripted Event 流 + history）驱动——流式合并、工具卡状态
   迁移、pending 队列、历史+增量去重、重连对齐、409 typed error。`pnpm -r test` 绿。
+
+完成记录（2026-07-21）：
+
+- `@mag/client` 新增 `ITransport`、`HttpSseTransport`、`TransportError` 与 `commandToRequest`；`Command` 到 `docs/WEB.md` §2.1 全 REST 路由映射收敛在 transport 内，fetch 请求注入 `Authorization: Bearer <token>`，REST `{kind,message}` 错误投影保留为 typed error（覆盖 409 `not_pivotable`）。
+- `HttpSseTransport.subscribe` 使用 fetch + `ReadableStream` 解析 `/api/events`，不使用 `EventSource`；支持 heartbeat comment 忽略、`event:`/`data:` 帧解析、payload type 校验、abort/unsubscribe 与 stream error 回调。
+- 新增 transport-neutral `SessionStore`：维护 session list/order、消息、工具卡、delegation、pending 交互队列、run 状态、pivot 提示、sources/config revision；提供 selectors、state subscription、create/open/history/message/pivot/cancel/respond/align 辅助方法。
+- 历史合并实现为 `get_session_history` 全量替换 thread 基底并保留仍 pending 的交互，增量事件按 tool `call_id`、delegation run/delegate key 和 run/text 状态合并，避免 terminal tool trace 重复；断线后自动重连并执行 `list_sessions` + open sessions history 对齐。
+- Vitest 新增 JSON fixture（scripted history + Event 流），覆盖全 Command 路由映射、Bearer 注入、fetch-SSE 解析、409 typed error、流式 text 合并、工具状态迁移、delegation message/status、pending 队列/提交、pivot notice、历史+增量去重、重连全量对齐。
+- 验证通过：`cargo fmt --all`、`npx --yes pnpm@10.14.0 format:write`、`npx --yes pnpm@10.14.0 --filter @mag/client build`、`npx --yes pnpm@10.14.0 --filter @mag/client test`、`cargo fmt --all -- --check`、`npx --yes pnpm@10.14.0 format`、`npx --yes pnpm@10.14.0 lint`、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`、`npx --yes pnpm@10.14.0 -r test`、`npx --yes pnpm@10.14.0 -r build`、`cargo doc --no-deps --workspace`。
 
 ### W3-3 [TODO] `@mag/ui` 核心组件 + Storybook
 

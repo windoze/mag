@@ -1,0 +1,91 @@
+[
+  {
+    "type": "run_started",
+    "id": "session-a",
+    "run_id": "run-live"
+  },
+  {
+    "type": "text_delta",
+    "id": "session-a",
+    "text": "New "
+  },
+  {
+    "type": "text_delta",
+    "id": "session-a",
+    "text": "answer"
+  },
+  {
+    "type": "tool_started",
+    "id": "session-a",
+    "trace": {
+      "run_id": "run-live",
+      "call_id": "tool-live",
+      "name": "shell",
+      "input": { "cmd": "pwd" },
+      "status": "started"
+    }
+  },
+  {
+    "type": "tool_finished",
+    "id": "session-a",
+    "trace": {
+      "run_id": "run-live",
+      "call_id": "tool-live",
+      "name": "shell",
+      "input": { "cmd": "pwd" },
+      "output": { "stdout": "/tmp" },
+      "status": "finished"
+    }
+  },
+  {
+    "type": "delegation_started",
+    "id": "session-a",
+    "trace": {
+      "run_id": "run-live",
+      "delegate": "researcher",
+      "status": "started",
+      "task": "look up context"
+    }
+  },
+  {
+    "type": "delegation_message",
+    "id": "session-a",
+    "message": {
+      "run_id": "run-live",
+      "delegate": "researcher",
+      "text": "context found"
+    }
+  },
+  {
+    "type": "delegation_finished",
+    "id": "session-a",
+    "trace": {
+      "run_id": "run-live",
+      "delegate": "researcher",
+      "status": "finished",
+      "task": "look up context",
+      "output": "context found"
+    }
+  },
+  {
+    "type": "interaction_requested",
+    "id": "session-a",
+    "request_id": "request-live",
+    "kind": {
+      "kind": "question",
+      "prompt": "Proceed?"
+    },
+    "origin": {
+      "delegate": "researcher",
+      "depth": 1
+    }
+  },
+  {
+    "type": "pivot_queued",
+    "id": "session-a"
+  },
+  {
+    "type": "pivot_applied",
+    "id": "session-a"
+  }
+]
