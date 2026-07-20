@@ -3500,3 +3500,396 @@ enabled = false
         assert_eq!(tool_names, vec!["read_file"]);
     }
 }
+
+#[cfg(test)]
+mod delegation {
+    //! M4-1 integration tests: local LLM subagent delegation assembled from
+    //! the configuration's `agents.<name>` entries and the `Delegation*` wire
+    //! event mapping, end-to-end over the scripted [`FakeLlmClient`]
+    //! (`docs/CLI.md` §5 P7, decision D3/D5).
+
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use agent_lib::{
+        client::LlmClient,
+        facade::{ToolContext, ToolResult},
+        model::{tool::Tool, usage::Usage},
+    };
+    use async_trait::async_trait;
+    use futures::stream::BoxStream;
+    use mag_service::{
+        ApprovalDecisionWire, InteractionKindWire, InteractionResponseWire, MagService,
+        RoutingMode, ServiceEvent, SessionConfig, StepIdWire, ToolCallIdWire, UserInput,
+    };
+    use mag_tools::{PermissionSpec, ToolCategory, ToolPlugin, ToolRegistry, ToolRisk};
+    use serde_json::{Value, json};
+    use tokio::time::{Duration, timeout};
+    use uuid::Uuid;
+
+    use crate::test_support::{FakeLlmClient, text_stream_with_usage, tool_use_stream};
+    use crate::{ConfigService, Engine};
+
+    /// Unique temp directory per test, removed on drop (same pattern as the
+    /// `TempConfigDir` helper in `config.rs` tests).
+    struct TempConfigDir(PathBuf);
+
+    impl TempConfigDir {
+        fn new() -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos();
+            let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let mut path = std::env::temp_dir();
+            path.push(format!("mag-deleg-{}-{nanos}-{unique}", std::process::id()));
+            fs::create_dir_all(&path).expect("create temp dir");
+            Self(path)
+        }
+
+        fn config_path(&self) -> PathBuf {
+            self.0.join("config.toml")
+        }
+    }
+
+    impl Drop for TempConfigDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A canned tool plugin (same pattern as `session_binding::StubTool`).
+    #[derive(Debug)]
+    struct StubTool {
+        name: &'static str,
+        output: &'static str,
+        permission: Option<PermissionSpec>,
+    }
+
+    #[async_trait]
+    impl ToolPlugin for StubTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn declaration(&self) -> Tool {
+            Tool {
+                name: self.name.to_owned(),
+                description: format!("stub {} tool", self.name),
+                input_schema: json!({ "type": "object", "properties": {} }),
+            }
+        }
+
+        async fn invoke(&self, _ctx: ToolContext, _args: Value) -> ToolResult {
+            ToolResult::text(self.output)
+        }
+
+        fn permission(&self) -> Option<PermissionSpec> {
+            self.permission
+        }
+    }
+
+    /// A registry with a gated `shell` and an auto-allowed `read_file`.
+    fn registry() -> ToolRegistry {
+        ToolRegistry::new()
+            .register(Arc::new(StubTool {
+                name: "shell",
+                output: "shell output",
+                permission: Some(PermissionSpec::new(ToolCategory::Shell, ToolRisk::Medium)),
+            }))
+            .register(Arc::new(StubTool {
+                name: "read_file",
+                output: "file contents",
+                permission: None,
+            }))
+    }
+
+    /// Builds an engine backed by a [`ConfigService`] serving `toml`, with the
+    /// stub tool registry and the scripted fake client.
+    fn engine_with_config(
+        toml: &str,
+        scripts: Vec<Vec<agent_lib::stream::StreamEvent>>,
+    ) -> (TempConfigDir, Engine, Arc<FakeLlmClient>) {
+        let dir = TempConfigDir::new();
+        fs::write(dir.config_path(), toml).expect("write config");
+        let service =
+            Arc::new(ConfigService::load_or_default(dir.config_path()).expect("load config"));
+        let fake = FakeLlmClient::scripted(scripts);
+        let client: Arc<dyn LlmClient> = fake.clone();
+        let engine = Engine::with_config_service(client, registry(), service);
+        (dir, engine, fake)
+    }
+
+    fn session_config(provider: &str, model: &str) -> SessionConfig {
+        SessionConfig {
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+            tool_profile: None,
+            cwd: None,
+            routing: RoutingMode::ModelRouted,
+            budget: None,
+        }
+    }
+
+    fn usage() -> Usage {
+        Usage {
+            input: 2,
+            output: 1,
+            total: Some(3),
+            ..Usage::default()
+        }
+    }
+
+    /// The interface only supplies the decision; `step_id`/`call_id` are
+    /// reconstructed from the stored interaction, so nil placeholders are fine.
+    fn approval(decision: ApprovalDecisionWire) -> InteractionResponseWire {
+        InteractionResponseWire::Approval {
+            step_id: StepIdWire::new(Uuid::nil()),
+            call_id: ToolCallIdWire::new(Uuid::nil()),
+            decision,
+            message: None,
+        }
+    }
+
+    async fn next_event(events: &mut BoxStream<'static, ServiceEvent>) -> ServiceEvent {
+        timeout(Duration::from_secs(5), futures::StreamExt::next(events))
+            .await
+            .expect("event timed out")
+            .expect("event stream closed")
+    }
+
+    /// Reads events until (and including) the run's terminal event.
+    async fn collect_until_terminal(
+        events: &mut BoxStream<'static, ServiceEvent>,
+    ) -> Vec<ServiceEvent> {
+        let mut collected = Vec::new();
+        loop {
+            let event = next_event(events).await;
+            let terminal = matches!(
+                event,
+                ServiceEvent::RunFinished { .. } | ServiceEvent::RunError { .. }
+            );
+            collected.push(event);
+            if terminal {
+                return collected;
+            }
+        }
+    }
+
+    /// Config with a bound `default` entry and one `researcher` delegate
+    /// carrying a pinned model, a system prompt, and a narrowed tool list.
+    const CONFIG_WITH_RESEARCHER: &str = r#"
+[agents.default]
+model = "model-d"
+
+[agents.researcher]
+model = "model-r"
+system_prompt = "Research thoroughly."
+role = "Researches topics and reports findings."
+tools = ["read_file"]
+"#;
+
+    /// M4-1 main path: the supervisor calls `ask_researcher` and the run emits
+    /// `DelegationStarted` → `DelegationFinished` in order with a complete
+    /// trace; the delegate runs on the shared client with its own model and
+    /// system prompt.
+    #[tokio::test]
+    async fn ask_researcher_emits_the_delegation_lifecycle_in_order() {
+        let (_dir, engine, fake) = engine_with_config(
+            CONFIG_WITH_RESEARCHER,
+            vec![
+                tool_use_stream("ask_researcher", "del-1", json!({ "task": "find facts" })),
+                text_stream_with_usage(&["research summary"], usage()),
+                text_stream_with_usage(&["final answer"], usage()),
+            ],
+        );
+        let session = engine
+            .create_session(session_config("default", "fake-chat"))
+            .await
+            .expect("create session");
+        let mut events = engine.subscribe(Some(session));
+        engine
+            .send_message(session, UserInput::text("research this"))
+            .await
+            .expect("send message");
+
+        let collected = collect_until_terminal(&mut events).await;
+
+        // Lifecycle order: DelegationStarted precedes DelegationFinished
+        // precedes the terminal RunFinished; no ToolStarted/ToolFinished pair
+        // brackets the `ask_researcher` call.
+        let started = collected
+            .iter()
+            .position(|event| matches!(event, ServiceEvent::DelegationStarted { .. }))
+            .expect("a DelegationStarted event");
+        let finished = collected
+            .iter()
+            .position(|event| matches!(event, ServiceEvent::DelegationFinished { .. }))
+            .expect("a DelegationFinished event");
+        assert!(
+            started < finished,
+            "started precedes finished: {collected:?}"
+        );
+        assert!(
+            !collected.iter().any(|event| matches!(
+                event,
+                ServiceEvent::ToolStarted { trace, .. } if trace.name == "ask_researcher"
+            )),
+            "a delegation call emits no tool lifecycle events: {collected:?}"
+        );
+        assert!(
+            matches!(collected.last(), Some(ServiceEvent::RunFinished { .. })),
+            "the run finishes: {collected:?}"
+        );
+
+        // Trace contents: the delegate name is populated on both events.
+        for event in &collected[started..=finished] {
+            match event {
+                ServiceEvent::DelegationStarted { id, trace }
+                | ServiceEvent::DelegationFinished { id, trace } => {
+                    assert_eq!(*id, session);
+                    assert_eq!(trace.delegate, "researcher");
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            !collected
+                .iter()
+                .any(|event| matches!(event, ServiceEvent::DelegationFailed { .. })),
+            "a successful delegation never fails: {collected:?}"
+        );
+
+        // The supervisor's tool surface advertises the delegation tool.
+        let requests = fake.stream_requests();
+        assert_eq!(requests.len(), 2, "supervisor turn + continuation");
+        let tool_names: Vec<&str> = requests[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert!(
+            tool_names.contains(&"ask_researcher"),
+            "ask_researcher on the tool surface: {tool_names:?}"
+        );
+
+        // The delegate runs on the shared client (non-streaming endpoint) with
+        // its pinned model and configured system prompt.
+        let child_requests = fake.chat_requests();
+        assert_eq!(child_requests.len(), 1, "one delegate drive");
+        assert_eq!(child_requests[0].model, "model-r");
+        assert_eq!(
+            child_requests[0].system.as_deref(),
+            Some("Research thoroughly.")
+        );
+    }
+
+    /// M4-1 origin attribution (M2 wiring, verified end-to-end): a tool the
+    /// delegate gates pauses through the root session's `IpcApproval`, so the
+    /// root receives an `InteractionRequested` carrying the delegate's origin;
+    /// approving it lets the delegation finish.
+    #[tokio::test]
+    async fn delegate_tool_approval_pops_to_root_with_origin() {
+        let (_dir, engine, _fake) = engine_with_config(
+            r#"
+[agents.default]
+model = "model-d"
+
+[agents.researcher]
+model = "model-r"
+tools = ["shell"]
+"#,
+            vec![
+                tool_use_stream("ask_researcher", "del-1", json!({ "task": "inspect" })),
+                tool_use_stream("shell", "child-1", json!({ "cmd": "ls" })),
+                text_stream_with_usage(&["shell unavailable; reporting from memory"], usage()),
+                text_stream_with_usage(&["final answer"], usage()),
+            ],
+        );
+        let session = engine
+            .create_session(session_config("default", "fake-chat"))
+            .await
+            .expect("create session");
+        let mut events = engine.subscribe(Some(session));
+        engine
+            .send_message(session, UserInput::text("inspect"))
+            .await
+            .expect("send message");
+
+        // agent-lib drives the child synchronously inside the delegation
+        // tool's fulfill and emits both live delegation events only once the
+        // child settles, so the child's pause reaches the root *before* any
+        // `DelegationStarted` (recorded in the M4-1 completion notes). Consume
+        // events until the interaction surfaces.
+        let request_id = loop {
+            match next_event(&mut events).await {
+                ServiceEvent::InteractionRequested {
+                    request_id,
+                    kind,
+                    origin,
+                    ..
+                } => {
+                    assert!(
+                        matches!(kind, InteractionKindWire::Approval { .. }),
+                        "the child's pause is an approval: {kind:?}"
+                    );
+                    assert_eq!(
+                        origin.delegate.as_deref(),
+                        Some("researcher"),
+                        "origin names the delegate"
+                    );
+                    assert_eq!(origin.depth, 1, "origin carries the delegation depth");
+                    assert!(!origin.is_root());
+                    break request_id;
+                }
+                ServiceEvent::RunStarted { .. } | ServiceEvent::DelegationStarted { .. } => {}
+                other => panic!("unexpected event before the interaction: {other:?}"),
+            }
+        };
+
+        engine
+            .respond_interaction(session, request_id, approval(ApprovalDecisionWire::Approve))
+            .await
+            .expect("approve the child's tool");
+
+        // The approved child finishes its turn (the declaration-only child
+        // surface answers the approved `shell` call with the facade's
+        // declaration-only `UnknownTool` result, which the child model absorbs
+        // and summarises), so the delegation completes and the run finishes.
+        let rest = collect_until_terminal(&mut events).await;
+        let started = rest
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    ServiceEvent::DelegationStarted { trace, .. } if trace.delegate == "researcher"
+                )
+            })
+            .expect("a DelegationStarted event");
+        let finished = rest
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    ServiceEvent::DelegationFinished { trace, .. } if trace.delegate == "researcher"
+                )
+            })
+            .expect("a DelegationFinished event");
+        assert!(started < finished, "started precedes finished: {rest:?}");
+        assert!(
+            matches!(
+                rest.last(),
+                Some(ServiceEvent::RunFinished { output, .. }) if output.text == "final answer"
+            ),
+            "the run finishes: {rest:?}"
+        );
+    }
+}

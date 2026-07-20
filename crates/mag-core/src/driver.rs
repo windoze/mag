@@ -32,15 +32,17 @@ use agent_lib::{
     agent::{ApprovalDecision, BudgetLimits, InteractionHandler, WorktreeRef},
     client::LlmClient,
     facade::{
-        Agent, AgentRunStream, AgentSnapshot, Approval, ApprovalPolicy, CancelHandle, FacadeError,
-        ModelRef, ReconfigRequest, Tool, ToolContext, ToolResult, ToolSetId, ToolSetRef,
-        ToolTrace as FacadeToolTrace, UsageSummary, WireRunEvent, WireRunOutput,
+        Agent, AgentRunStream, AgentSnapshot, Approval, ApprovalPolicy, CancelHandle,
+        DelegationMessage as FacadeDelegationMessage, DelegationTrace as FacadeDelegationTrace,
+        FacadeError, LocalSubagent, ModelRef, ReconfigRequest, Tool, ToolContext, ToolResult,
+        ToolSetId, ToolSetRef, ToolTrace as FacadeToolTrace, UsageSummary, WireRunEvent,
+        WireRunOutput,
     },
 };
 use mag_config::{ApprovalPolicyKind, ConfigSnapshot};
 use mag_service::{
-    Event, RunErrorKind, RunId as WireRunId, RunOutput, SessionBudget, SessionConfig, SessionId,
-    ToolCallIdWire, ToolStatusWire, ToolTrace, UsageInfo,
+    DelegationMessageWire, DelegationTrace, Event, RunErrorKind, RunId as WireRunId, RunOutput,
+    SessionBudget, SessionConfig, SessionId, ToolCallIdWire, ToolStatusWire, ToolTrace, UsageInfo,
 };
 use mag_tools::{ToolPlugin, ToolRegistry};
 use serde_json::Value;
@@ -48,7 +50,7 @@ use uuid::Uuid;
 
 use crate::{
     EventBus,
-    assembly::{ApprovalOverrides, SessionBinding},
+    assembly::{ApprovalOverrides, DelegateBinding, SessionBinding},
     engine::approval::IpcApproval,
     persistence::Persistence,
     turn_complete::{TurnCompleteHub, TurnCompletion, TurnSummary},
@@ -149,6 +151,12 @@ impl SessionDriver {
     /// interface-supplied session root (for ACP, the client's `cwd`,
     /// `docs/ACP.md` §3.2/§6); a `None` cwd keeps the facade default `"."`.
     ///
+    /// Every [`DelegateBinding`](crate::assembly::DelegateBinding) on the
+    /// binding (each configured `agents.<name>` entry except the bound one) is
+    /// registered as a local worker delegate, so the facade advertises one
+    /// model-routed `ask_<name>` tool per delegate (`docs/CLI.md` §5 P7; see
+    /// [`delegate_worker`]).
+    ///
     /// # Errors
     ///
     /// Returns any [`FacadeError`] raised while assembling the agent (for
@@ -186,6 +194,10 @@ impl SessionDriver {
         for tool in facade_tools {
             builder = builder.tool(tool);
         }
+        for delegate in binding.delegates() {
+            let worker = delegate_worker(&tools, delegate, overrides)?;
+            builder = builder.subagent(delegate.name().to_owned(), worker);
+        }
         let agent = builder.approval(policy).build()?;
 
         Ok(Self {
@@ -216,6 +228,15 @@ impl SessionDriver {
     /// omits the budget limits, so a restored session enforces the same
     /// [`SessionBudget`] it was created with.
     ///
+    /// The binding's delegates are re-registered through
+    /// [`AgentRestoreBuilder::subagent`](agent_lib::facade::AgentRestoreBuilder::subagent)
+    /// exactly as [`new`](Self::new) registers them: a snapshot persists each
+    /// delegate's data-only recipe but never its approval policy (a runtime
+    /// handle), so re-registering re-supplies the configured tiers and keeps a
+    /// restored session's tool surface and approval behaviour identical to a
+    /// freshly built one instead of silently falling back to agent-lib's
+    /// default allow tier.
+    ///
     /// # Errors
     ///
     /// Returns any [`FacadeError`] raised while rebuilding the agent (for example
@@ -241,6 +262,10 @@ impl SessionDriver {
         }
         for tool in facade_tools {
             builder = builder.tool(tool);
+        }
+        for delegate in binding.delegates() {
+            let worker = delegate_worker(&tools, delegate, overrides)?;
+            builder = builder.subagent(delegate.name().to_owned(), worker);
         }
         let agent = builder.approval(policy).build()?;
 
@@ -720,12 +745,22 @@ fn budget_limits(budget: &SessionBudget) -> BudgetLimits {
 /// the stream drains). Tool lifecycle events project into mag's
 /// [`ToolStarted`](Event::ToolStarted) / [`ToolFinished`](Event::ToolFinished).
 ///
+/// Delegation lifecycle events (`docs/CLI.md` §5 P7) project into the matching
+/// [`DelegationStarted`](Event::DelegationStarted) /
+/// [`DelegationFinished`](Event::DelegationFinished) /
+/// [`DelegationFailed`](Event::DelegationFailed) wire events through
+/// [`delegation_trace_from_wire`], and a delegate's intermediate message into
+/// [`DelegationMessage`](Event::DelegationMessage). A delegation call is
+/// bracketed by these events only — the facade deliberately emits no
+/// `ToolStarted`/`ToolFinished` pair for an `ask_<name>` call.
+///
 /// The facade's [`ApprovalRequested`](WireRunEvent::ApprovalRequested) is
 /// intentionally dropped: it is a fire-and-forget notification, and mag's
 /// canonical pause event is the [`InteractionRequested`](Event::InteractionRequested)
 /// that [`IpcApproval`] emits independently on the pause point (`docs/DESIGN.md`
-/// §3.4). Delegation, escalation, and raw variants are not produced by the
-/// current milestone, so they are ignored here.
+/// §3.4). `DelegationProgress` has no wire counterpart, and escalation,
+/// artifact, and raw variants are not produced on the local-subagent path, so
+/// they are ignored here.
 fn map_wire_event(
     session_id: SessionId,
     event: WireRunEvent,
@@ -743,6 +778,22 @@ fn map_wire_event(
         WireRunEvent::ToolFinished(trace) => Some(Event::ToolFinished {
             id: session_id,
             trace: tool_trace_from_wire(&trace, ToolStatusWire::Finished),
+        }),
+        WireRunEvent::DelegationStarted(trace) => Some(Event::DelegationStarted {
+            id: session_id,
+            trace: delegation_trace_from_wire(&trace),
+        }),
+        WireRunEvent::DelegationFinished(trace) => Some(Event::DelegationFinished {
+            id: session_id,
+            trace: delegation_trace_from_wire(&trace),
+        }),
+        WireRunEvent::DelegationFailed(trace) => Some(Event::DelegationFailed {
+            id: session_id,
+            trace: delegation_trace_from_wire(&trace),
+        }),
+        WireRunEvent::DelegationMessage(message) => Some(Event::DelegationMessage {
+            id: session_id,
+            message: delegation_message_from_wire(&message),
         }),
         WireRunEvent::Done(output) => {
             *final_output = Some(run_output_from_wire(&output));
@@ -806,6 +857,90 @@ fn tool_surface(
             }
         }
     }
+    policy = apply_per_tool_tiers(policy, overrides);
+    (facade_tools, policy)
+}
+
+/// Builds one local worker delegate (`LocalSubagent`) from its resolved
+/// binding (`docs/CLI.md` §5 P7).
+///
+/// The worker stays data-first per agent-lib's
+/// [`Agent::worker`](agent_lib::facade::Agent::worker) semantics: it carries
+/// only tool *declarations* (no executable closures — a fulfilled delegation
+/// gates a declared child tool on the worker's approval policy and answers an
+/// approved call with the facade's declaration-only `UnknownTool` result,
+/// which the child model sees as an ordinary tool error), never an LLM client
+/// — the child runtime assembled per delegation shares the **supervisor's**
+/// client, so a delegate entry's own `provider` is not consumable on the
+/// current agent-lib surface (recorded for M4-R).
+///
+/// Surface derivation mirrors [`tool_surface`]:
+///
+/// - `tools` constrains the declaration list to the named registry plugins
+///   (an absent list exposes every registered plugin's declaration); a bound
+///   name with no registered plugin is warned about and skipped.
+/// - The approval policy starts from the configured default tier, gates each
+///   projected plugin declaring a [`permission`](ToolPlugin::permission)
+///   behind `ask`, and applies the `[tools.<name>].approval` overrides — so a
+///   paused child tool pops to the root session's [`IpcApproval`] with the
+///   delegate's origin attribution (`docs/CLI.md` §3.3, decision D5).
+/// - `model` pins an explicit worker model; without one the worker inherits
+///   the supervisor's model (agent-lib R4).
+///
+/// # Errors
+///
+/// Returns any [`FacadeError`] raised by the worker builder (currently
+/// infallible, kept for signature stability).
+fn delegate_worker(
+    tools: &ToolRegistry,
+    delegate: &DelegateBinding,
+    overrides: &ApprovalOverrides,
+) -> Result<LocalSubagent, FacadeError> {
+    let mut policy = base_policy(overrides.default_tier());
+    let mut declarations = Vec::new();
+    for plugin in tools.plugins() {
+        if let Some(allowed) = delegate.tools()
+            && !allowed.iter().any(|name| name == plugin.name())
+        {
+            continue;
+        }
+        if plugin.permission().is_some() {
+            policy = policy.ask_tool(plugin.name());
+        }
+        declarations.push(plugin.declaration());
+    }
+    if let Some(allowed) = delegate.tools() {
+        for name in allowed {
+            if !tools.plugins().iter().any(|p| p.name() == name) {
+                tracing::warn!(
+                    delegate = delegate.name(),
+                    tool = name.as_str(),
+                    "delegate entry names a tool not present in the tool registry; skipped"
+                );
+            }
+        }
+    }
+    policy = apply_per_tool_tiers(policy, overrides);
+
+    let mut worker = Agent::worker()
+        .description(delegate.description())
+        .tool_declarations(declarations)
+        .approval(policy);
+    if let Some(system) = delegate.system_prompt() {
+        worker = worker.system(system.to_owned());
+    }
+    if let Some(model) = delegate.model() {
+        worker = worker.model(model.to_owned());
+    }
+    worker.build()
+}
+
+/// Applies the configured `[tools.<name>].approval` tiers on top of `policy`
+/// (shared by the main agent's [`tool_surface`] and each delegate worker).
+fn apply_per_tool_tiers(
+    mut policy: ApprovalPolicy,
+    overrides: &ApprovalOverrides,
+) -> ApprovalPolicy {
     for (name, tier) in overrides.per_tool() {
         policy = match tier {
             ApprovalPolicyKind::Ask => policy.ask_tool(name.clone()),
@@ -813,7 +948,7 @@ fn tool_surface(
             ApprovalPolicyKind::Deny => policy.deny_tool(name.clone()),
         };
     }
-    (facade_tools, policy)
+    policy
 }
 
 /// Builds the whole-agent default [`ApprovalPolicy`] for a configured tier.
@@ -869,6 +1004,38 @@ fn tool_trace_from_wire(trace: &FacadeToolTrace, status: ToolStatusWire) -> Tool
     }
 }
 
+/// Projects a facade delegation trace into the wire [`DelegationTrace`]
+/// (`docs/CLI.md` §5 P7).
+///
+/// agent-lib's facade trace currently carries only the delegate name, the
+/// terminal status, and the child's token usage — the delegated task input and
+/// the output/failure reason are not exposed on the facade event surface, so
+/// the wire's optional `task`/`output`/`message` fields stay `None` here
+/// (they remain part of the frozen contract for producers that can populate
+/// them, e.g. the M4-2 external path if agent-lib grows the surface; recorded
+/// in the M4-1 completion notes). `run_id` is `None` for the same reason as
+/// in [`tool_trace_from_wire`]: the facade does not surface a run id on its
+/// event stream.
+fn delegation_trace_from_wire(trace: &FacadeDelegationTrace) -> DelegationTrace {
+    DelegationTrace {
+        run_id: None,
+        delegate: trace.delegate.clone(),
+        task: None,
+        output: None,
+        message: None,
+    }
+}
+
+/// Projects a facade delegation message into the wire
+/// [`DelegationMessageWire`].
+fn delegation_message_from_wire(message: &FacadeDelegationMessage) -> DelegationMessageWire {
+    DelegationMessageWire {
+        run_id: None,
+        delegate: message.delegate.clone(),
+        text: message.message.clone(),
+    }
+}
+
 /// Projects the facade's terminal [`WireRunOutput`] into a mag [`RunOutput`].
 fn run_output_from_wire(output: &WireRunOutput) -> RunOutput {
     RunOutput {
@@ -889,7 +1056,10 @@ fn usage_from_summary(summary: &UsageSummary) -> UsageInfo {
 
 #[cfg(test)]
 mod tests {
-    use agent_lib::facade::{ApprovalRequest, ToolTrace as FacadeToolTrace};
+    use agent_lib::facade::{
+        ApprovalRequest, DelegationMessage as FacadeDelegationMessage,
+        DelegationTrace as FacadeDelegationTrace, ToolTrace as FacadeToolTrace,
+    };
     use agent_lib::{
         client::Response,
         facade::{RunEvent, RunOutput as FacadeRunOutput, WireRunEvent},
@@ -900,7 +1070,10 @@ mod tests {
             usage::Usage,
         },
     };
-    use mag_service::{Event, SessionId, ToolCallIdWire, ToolStatusWire, ToolTrace, UsageInfo};
+    use mag_service::{
+        DelegationMessageWire, DelegationTrace, Event, SessionId, ToolCallIdWire, ToolStatusWire,
+        ToolTrace, UsageInfo,
+    };
     use serde_json::Map;
     use uuid::Uuid;
 
@@ -1040,6 +1213,108 @@ mod tests {
         let mut final_output = None;
         assert!(map_wire_event(session_id(), wire, &mut final_output).is_none());
         assert!(final_output.is_none());
+    }
+
+    /// Builds a facade delegation trace via serde, since the type is
+    /// `#[non_exhaustive]` and has no public struct constructor.
+    fn facade_delegation_trace(status: &str) -> FacadeDelegationTrace {
+        serde_json::from_value(serde_json::json!({
+            "delegate": "researcher",
+            "status": status,
+            "usage": { "input": 3, "output": 2, "total": 5 },
+        }))
+        .expect("deserialize facade delegation trace")
+    }
+
+    /// The expected wire projection of a facade delegation trace: only the
+    /// delegate name is populated (agent-lib exposes no task/output/message on
+    /// its trace; see `delegation_trace_from_wire`).
+    fn wire_delegation_trace() -> DelegationTrace {
+        DelegationTrace {
+            run_id: None,
+            delegate: "researcher".to_owned(),
+            task: None,
+            output: None,
+            message: None,
+        }
+    }
+
+    #[test]
+    fn delegation_started_maps_and_round_trips() {
+        let wire = RunEvent::DelegationStarted(facade_delegation_trace("completed")).to_wire();
+        round_trip(&wire);
+
+        let mut final_output = None;
+        let mapped = map_wire_event(session_id(), wire, &mut final_output);
+
+        assert_eq!(
+            mapped,
+            Some(Event::DelegationStarted {
+                id: session_id(),
+                trace: wire_delegation_trace(),
+            })
+        );
+        assert!(final_output.is_none());
+    }
+
+    #[test]
+    fn delegation_finished_maps_and_round_trips() {
+        let wire = RunEvent::DelegationFinished(facade_delegation_trace("completed")).to_wire();
+        round_trip(&wire);
+
+        let mut final_output = None;
+        let mapped = map_wire_event(session_id(), wire, &mut final_output);
+
+        assert_eq!(
+            mapped,
+            Some(Event::DelegationFinished {
+                id: session_id(),
+                trace: wire_delegation_trace(),
+            })
+        );
+    }
+
+    #[test]
+    fn delegation_failed_maps_and_round_trips() {
+        let wire = RunEvent::DelegationFailed(facade_delegation_trace("failed")).to_wire();
+        round_trip(&wire);
+
+        let mut final_output = None;
+        let mapped = map_wire_event(session_id(), wire, &mut final_output);
+
+        assert_eq!(
+            mapped,
+            Some(Event::DelegationFailed {
+                id: session_id(),
+                trace: wire_delegation_trace(),
+            })
+        );
+    }
+
+    #[test]
+    fn delegation_message_maps_and_round_trips() {
+        let message: FacadeDelegationMessage = serde_json::from_value(serde_json::json!({
+            "delegate": "researcher",
+            "message": "still searching",
+        }))
+        .expect("deserialize facade delegation message");
+        let wire = RunEvent::DelegationMessage(message).to_wire();
+        round_trip(&wire);
+
+        let mut final_output = None;
+        let mapped = map_wire_event(session_id(), wire, &mut final_output);
+
+        assert_eq!(
+            mapped,
+            Some(Event::DelegationMessage {
+                id: session_id(),
+                message: DelegationMessageWire {
+                    run_id: None,
+                    delegate: "researcher".to_owned(),
+                    text: "still searching".to_owned(),
+                },
+            })
+        );
     }
 
     /// Builds a driver for `cwd` and returns the worktree path recorded in its

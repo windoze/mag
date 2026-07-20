@@ -351,6 +351,64 @@ pub(crate) struct SessionBinding {
     /// Effective per-run budget: explicit wire budget, else the bound entry's,
     /// else the `[session]` default; `None` when all are unset.
     budget: Option<SessionBudget>,
+    /// Local subagent delegates for the session's main agent: every configured
+    /// `agents.<name>` entry except the bound one (`docs/CLI.md` §5 P7).
+    delegates: Vec<DelegateBinding>,
+}
+
+/// A local subagent delegate resolved from one `agents.<name>` entry
+/// (`docs/CLI.md` §5 P7: model-routed `ask_<name>` delegation).
+///
+/// Every configured agent entry except the session's own bound entry becomes a
+/// worker delegate of the session's main agent, registered through agent-lib's
+/// [`Agent::worker`](agent_lib::facade::Agent::worker) semantics: the facade
+/// synthesizes one `ask_<name>` tool per delegate and drives the child on the
+/// supervisor's shared LLM client. The delegate's model, system prompt, and
+/// tool declaration surface come from its resolved entry; its approval tiers
+/// are re-derived from the same `[approval]` / `[tools.<name>]` configuration
+/// as the main agent's by the driver.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DelegateBinding {
+    name: String,
+    /// Human-readable description advertised to the supervising model on the
+    /// `ask_<name>` tool; falls back to a generic label derived from the name
+    /// when the entry sets no `role`.
+    description: String,
+    /// Explicitly pinned delegate model; `None` inherits the supervisor's
+    /// model (agent-lib R4 semantics).
+    model: Option<String>,
+    system_prompt: Option<String>,
+    /// Enabled tool names constraining the delegate's declaration surface;
+    /// `None` is unconstrained (every registered tool's declaration).
+    tools: Option<Vec<String>>,
+}
+
+impl DelegateBinding {
+    /// The delegate (and `ask_<name>` tool suffix) name.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The description advertised to the supervising model.
+    pub(crate) fn description(&self) -> &str {
+        &self.description
+    }
+
+    /// The pinned delegate model, when the entry sets one (`None` inherits).
+    pub(crate) fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    /// The delegate's system prompt, when the entry sets one.
+    pub(crate) fn system_prompt(&self) -> Option<&str> {
+        self.system_prompt.as_deref()
+    }
+
+    /// The delegate's enabled tool list: `Some(&[])` exposes no tools, `None`
+    /// leaves the declaration surface unconstrained.
+    pub(crate) fn tools(&self) -> Option<&[String]> {
+        self.tools.as_deref()
+    }
 }
 
 impl SessionBinding {
@@ -365,6 +423,7 @@ impl SessionBinding {
                 tools: None,
                 system_prompt: None,
                 budget: config.budget,
+                delegates: Vec::new(),
             };
         };
 
@@ -394,12 +453,38 @@ impl SessionBinding {
             .or_else(|| entry.and_then(|agent| agent.budget()).map(session_budget))
             .or_else(|| snapshot.session_defaults().budget().map(session_budget));
 
+        // Every other configured agent entry becomes a local subagent delegate
+        // of the session's main agent (`docs/CLI.md` §5 P7); iteration over the
+        // `BTreeMap` keeps the registration order deterministic.
+        let delegates = snapshot
+            .agents()
+            .values()
+            .filter(|agent| agent.name() != agent_name)
+            .map(|agent| DelegateBinding {
+                name: agent.name().to_owned(),
+                description: agent
+                    .role()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("Local subagent `{}`", agent.name())),
+                model: agent.model().map(str::to_owned),
+                system_prompt: agent.system_prompt().map(str::to_owned),
+                tools: agent.tools_list().map(|tools| {
+                    tools
+                        .iter()
+                        .filter(|tool| tool.is_enabled())
+                        .map(|tool| tool.name().to_owned())
+                        .collect()
+                }),
+            })
+            .collect();
+
         Self {
             agent_name,
             model: entry.and_then(|agent| agent.model().map(str::to_owned)),
             tools,
             system_prompt: entry.and_then(|agent| agent.system_prompt().map(str::to_owned)),
             budget,
+            delegates,
         }
     }
 
@@ -431,6 +516,13 @@ impl SessionBinding {
     /// bound entry's, then the `[session]` default).
     pub(crate) fn budget(&self) -> Option<SessionBudget> {
         self.budget
+    }
+
+    /// The local subagent delegates resolved for the session's main agent
+    /// (`docs/CLI.md` §5 P7); empty for an engine without a configuration
+    /// backend.
+    pub(crate) fn delegates(&self) -> &[DelegateBinding] {
+        &self.delegates
     }
 }
 
@@ -842,5 +934,62 @@ tools = []
             Some(&[][..]),
             "explicit empty list: no tools"
         );
+    }
+
+    /// Every configured `agents.<name>` entry except the session's bound one
+    /// resolves into a local subagent delegate (`docs/CLI.md` §5 P7): the
+    /// delegate carries the entry's model/system/tools/role, a missing `role`
+    /// falls back to a name-derived description, and disabled tools are
+    /// filtered out exactly as on the bound entry.
+    #[test]
+    fn session_binding_resolves_delegates_from_the_other_agent_entries() {
+        let snapshot = snapshot(
+            r#"
+[agents.default]
+model = "model-d"
+
+[agents.researcher]
+model = "model-r"
+system_prompt = "Research thoroughly."
+role = "Researches topics and reports findings."
+tools = ["read_file", "shell"]
+
+[agents.helper]
+
+[tools.shell]
+enabled = false
+"#,
+        );
+
+        // Bound to `default`: `researcher` and `helper` are delegates.
+        let binding = SessionBinding::resolve(&session_config("default", "m"), Some(&snapshot));
+        let delegates = binding.delegates();
+        assert_eq!(delegates.len(), 2);
+        assert_eq!(delegates[0].name(), "helper");
+        assert_eq!(delegates[0].model(), None, "no model pins: inherit");
+        assert_eq!(delegates[0].tools(), None, "no tools key: unconstrained");
+        assert_eq!(delegates[0].description(), "Local subagent `helper`");
+        assert_eq!(delegates[1].name(), "researcher");
+        assert_eq!(delegates[1].model(), Some("model-r"));
+        assert_eq!(delegates[1].system_prompt(), Some("Research thoroughly."));
+        assert_eq!(
+            delegates[1].description(),
+            "Researches topics and reports findings.",
+            "the entry's role becomes the advertised description"
+        );
+        assert_eq!(
+            delegates[1].tools(),
+            Some(&["read_file".to_owned()][..]),
+            "disabled tools are filtered from the delegate surface"
+        );
+
+        // Bound to `researcher`: `default` itself becomes a delegate.
+        let binding = SessionBinding::resolve(&session_config("researcher", "m"), Some(&snapshot));
+        let names: Vec<&str> = binding.delegates().iter().map(|d| d.name()).collect();
+        assert_eq!(names, vec!["default", "helper"]);
+
+        // No configuration backend: no delegates.
+        let binding = SessionBinding::resolve(&session_config("default", "m"), None);
+        assert!(binding.delegates().is_empty());
     }
 }

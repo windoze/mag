@@ -873,7 +873,7 @@ GUI/web/CLI 无需感知多个会话通道。
 全部落地：local LLM subagent（agent-lib `Agent::worker()`）与 external ACP agent
 （`ManagedExternalAgent::acp`）。
 
-### M4-1 [TODO] mag-core：local LLM subagent 委派 + `Delegation*` 事件映射
+### M4-1 [DONE] mag-core：local LLM subagent 委派 + `Delegation*` 事件映射
 
 - **上下文**：`docs/CLI.md` §5 P7；agent-lib `Agent::worker()`、`ask_<name>` model-routed 委派机制；
   `ServiceEvent::DelegationStarted/Finished/Failed/DelegationMessage` wire 变体已在契约中（本任务把它们
@@ -886,6 +886,64 @@ GUI/web/CLI 无需感知多个会话通道。
   - 子 agent 交互经 M2 origin 归因 pop 到 root。
 - **验证条件**：聚焦测试：fake LLM 下主 agent 调 `ask_researcher` → `DelegationStarted/Finished` 顺序正确、
   trace 内容完整；delegate 内触发审批 → root 收到带 origin 的 `InteractionRequested`。默认验证序列全过。
+
+  **完成记录**（2026-07-20）：
+
+  - **delegate 装配点**：`SessionBinding::resolve`（assembly.rs）新增 `delegates: Vec<DelegateBinding>`——
+    快照中除会话绑定条目外的每个 `agents.<name>` 条目解析为一个 `DelegateBinding{name, description,
+    model, system_prompt, tools}`；`description` 取条目 `role`，缺省回落 ``Local subagent `<name>` ``；
+    `tools` 复用绑定条目的同一过滤语义（`tools_list()` 保留「无键=不约束 / 显式空=零工具」区分，
+    disabled 条目滤除）。`SessionDriver::new`/`restore`（driver.rs）对每个 delegate 经 `delegate_worker`
+    构建 agent-lib `Agent::worker()` 的 `LocalSubagent` 并 `.subagent(name, worker)` 注册（facade 默认
+    `Delegation::model_routed` → tool surface 出现 `ask_<name>`，e2e 断言其在 supervisor 的
+    `ChatRequest.tools` 中）。worker 的 LLM 参数/系统提示/工具声明来自 `ResolvedAgent`：`model` 有值则
+    pin、无值则 inherit（agent-lib R4）；工具面为 **declaration-only**（agent-lib worker 数据优先语义，
+    见下「已知限制 1」）；审批策略按 `[approval]` 默认 tier + 插件 `permission()` → `ask_tool` +
+    `[tools.<name>].approval` 覆盖逐 delegate 派生（与主 agent `tool_surface` 同源，提取共享辅助
+    `apply_per_tool_tiers`）。
+  - **LlmClient 共享决策**：按 agent-lib 语义**共享**——`LocalSubagent` 数据优先不含 client，委派兑现时
+    `FacadeSubagentSpawner` 克隆 supervisor 的 `Arc<dyn LlmClient>` 驱动 child；agent-lib 无 per-delegate
+    client 表面，故 delegate 条目自己的 `provider` 在装配层不可消费（与 M3-6 记录的 provider params
+    未消费同源，记给 M4-R）。共享 client 也让测试脚本顺序确定（supervisor `chat_stream` / child `chat`
+    走同一 `FakeLlmClient` 脚本队列）。
+  - **事件映射点**：driver `map_wire_event` 新增四个 arm——facade `DelegationStarted/Finished/Failed`
+    → 同名 wire 事件（`delegation_trace_from_wire`），`DelegationMessage` → wire `DelegationMessage`
+    （`delegation_message_from_wire`）；`DelegationProgress` 无 wire 对应变体、忽略；
+    `ApprovalRequested` 仍按既有决策丢弃（canonical pause 是 `IpcApproval` 的 `InteractionRequested`）。
+    契约零改动（`Delegation*` 变体早已在冻结契约中）。
+  - **restore 路径**：`SessionDriver::restore` 经 `AgentRestoreBuilder::subagent` 用同一 `delegate_worker`
+    重注册全部 delegate——快照只持久化 data-only recipe 且审批策略恒回落 default，重注册使恢复后审批
+    策略与 tool surface 与新会话一致（M4-3 的「静默回落 auto_allow」陷阱在本任务已结构性消除；M4-3
+    仍负责其回归测试与 `ask_<name>` 调用本身的审批接入）。
+  - **验证**：新增测试 7 个（mag-core 96→103）：assembly
+    `session_binding_resolves_delegates_from_the_other_agent_entries`（排除绑定条目/role→description/
+    model pin/工具过滤/无配置后端无 delegate）；driver 映射单测 ×4（Started/Finished/Failed/Message
+    映射 + facade wire roundtrip）；engine e2e ×2——
+    `ask_researcher_emits_the_delegation_lifecycle_in_order`（Started<Finished<RunFinished、trace.delegate
+    正确、无 `ToolStarted/Finished` 包裹 `ask_researcher`、supervisor tool surface 含 `ask_researcher`、
+    child 用 pin 模型 + 配置 system prompt 经共享 client 驱动）与
+    `delegate_tool_approval_pops_to_root_with_origin`（delegate 内 `shell` 门控暂停 → root 收到
+    `origin{delegate:"researcher", depth:1}` 的 Approval 交互 → approve 后 DelegationFinished +
+    RunFinished，端到端验证 M2 origin 归因）。
+  - **已知限制**（逐条记录，供 M4-R 核对）：
+    1. **delegate 工具 declaration-only**：agent-lib worker 语义下 child 工具只有声明；获批的 child
+       工具调用以 facade 的 declaration-only `UnknownTool` 结果回填给 child 模型（e2e 已按此断言）。
+       child 真正执行 mag 工具需 agent-lib 提供可执行 child registry 表面。
+    2. **wire trace 的 `task`/`output`/`message` 恒为 `None`**：agent-lib facade `DelegationTrace` 仅
+       携带 `{delegate, status, usage}`，委派输入摘要与输出/失败原因不在 facade 事件表面上；
+       `delegation_trace_from_wire` rustdoc 已注明。契约字段为 optional，语义不受损。
+    3. **streaming 路径发射时序**：agent-lib 在 delegation tool 的 fulfill 内同步驱动 child，
+       `DelegationStarted/Finished` 在 child settle 后成对发射——故 delegate 内暂停的审批交互
+       **先于** `DelegationStarted` 到达 root（e2e 注释与断言已按实际时序写）；`Started<Finished`
+       顺序本身不受影响。若 UI 需要「先见 Started 再见子交互」，需 agent-lib 调整 tap 发射点（记给
+       M4-R 评估是否提 agent-lib 需求）。
+    4. `DelegationMessage`/`DelegationProgress` 目前 agent-lib 生产路径从不发射（placeholder 类型）；
+       映射已接通并有单测，未来 agent-lib 开始发射即自动生效。
+  - **门禁结果**：1) `cargo fmt --all -- --check` ✅（初检 2 处 diff，`cargo fmt --all` 修复后复检通过）
+    2) 聚焦测试 `cargo test -p mag-core delegation`（6 过）与 `cargo test -p mag-core session_binding`
+    （9 过）✅ 3) `cargo clippy --all-targets -- -D warnings` ✅ 4) `cargo test --workspace` ✅
+    （全部目标 ok，0 失败；mag-core 103 过含新增 7；1 ignored 为既有 zed 联调测试）
+    5) `cargo doc --no-deps --workspace` ✅（0 warning）。
 
 ### M4-2 [TODO] mag-core：external ACP agent 委派（决策 D3，核心）
 
