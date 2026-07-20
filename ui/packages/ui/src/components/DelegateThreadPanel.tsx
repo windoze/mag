@@ -49,7 +49,10 @@ export interface DelegateThreadPanelProps {
 /**
  * Renders one delegate's sub-thread: the activity the wire attributes to the
  * delegate (decision D5) — delegation messages and origin-tagged interaction
- * cards carrying their `[from <delegate>@depth<n>]` badges.
+ * cards carrying their `[from <delegate>@depth<n>]` badges. Plain messages
+ * carry no badge: the wire gives them no depth of their own, and the header
+ * already shows the group badge, so repeating it per message would both add
+ * clutter and mis-attribute depth when a delegate ran at multiple depths.
  */
 export function DelegateThreadPanel({
   className,
@@ -104,11 +107,11 @@ export function DelegateThreadPanel({
           items.map((item) => {
             if (item.type === "message") {
               return (
-                <div className="space-y-1" key={item.message.id}>
-                  <OriginBadge origin={origin} />
-                  <div className="rounded-lg border border-border bg-card px-3 py-2 text-sm">
-                    <Markdown text={item.message.text} />
-                  </div>
+                <div
+                  className="rounded-lg border border-border bg-card px-3 py-2 text-sm"
+                  key={item.message.id}
+                >
+                  <Markdown text={item.message.text} />
                 </div>
               );
             }

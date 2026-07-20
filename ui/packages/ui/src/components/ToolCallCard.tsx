@@ -67,7 +67,7 @@ function StatusBadge({ status }: { readonly status: ToolStatusView }): React.JSX
   return (
     <span
       className={cn(
-        "inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold capitalize",
+        "inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] font-semibold capitalize",
         status === "started" && "bg-primary/10 text-primary",
         status === "finished" && "bg-success/10 text-success",
         status === "denied" && "bg-warning/15 text-warning",
@@ -75,6 +75,12 @@ function StatusBadge({ status }: { readonly status: ToolStatusView }): React.JSX
         status === "failed" && "bg-destructive/10 text-destructive"
       )}
     >
+      {status === "started" ? (
+        <span
+          aria-hidden
+          className="inline-block h-2.5 w-2.5 animate-spin rounded-full border border-current border-t-transparent"
+        />
+      ) : null}
       {status.replace("_", " ")}
     </span>
   );

@@ -301,7 +301,115 @@ describe("App", () => {
     await click(getButton(rendered.container, "Probe"));
     await waitFor(() => transport.sent.some((command) => command.type === "probe_local_agents"));
     await waitFor(() => rendered.container.textContent?.includes("Gemini CLI") === true);
+    // Probing only covers local agents: provider rows must survive.
+    expect(rendered.container.textContent).toContain("anthropic");
     expect(rendered.container.textContent).not.toContain("Claude Code");
+
+    await act(async () => rendered.root.unmount());
+  });
+
+  it("surfaces pivot failures other than not_pivotable instead of falling back", async () => {
+    const transport = new ScriptedTransport();
+    const rendered = await renderApp(<App transport={transport} storage={new MemoryStorage()} />);
+
+    await waitFor(() => rendered.container.textContent?.includes("Inspect README") === true);
+    await click(getButton(rendered.container, "Inspect README"));
+    await waitFor(() => rendered.container.textContent?.includes("The README is short.") === true);
+
+    await act(async () => {
+      transport.emit({ type: "run_started", id: sessionId, run_id: "run-live" });
+    });
+    transport.sent.length = 0;
+    transport.pivotError = new TransportError("engine exploded", { kind: "backend", status: 500 });
+
+    await change(getComposer(rendered.container), "try a pivot");
+    await click(getButton(rendered.container, "Insert pivot..."));
+
+    await waitFor(() => rendered.container.textContent?.includes("engine exploded") === true);
+    // A non-409/not_pivotable failure must not silently fall back to a new run.
+    expect(transport.sent.map((command) => command.type)).toEqual(["pivot_message"]);
+
+    await act(async () => rendered.root.unmount());
+  });
+
+  it("closes the delegate sub-thread when switching sessions", async () => {
+    const transport = new ScriptedTransport();
+    const rendered = await renderApp(<App transport={transport} storage={new MemoryStorage()} />);
+
+    await waitFor(() => rendered.container.textContent?.includes("Inspect README") === true);
+    await click(getButton(rendered.container, "Inspect README"));
+    await waitFor(() => rendered.container.textContent?.includes("The README is short.") === true);
+
+    await act(async () => {
+      transport.emit({
+        type: "delegation_started",
+        id: sessionId,
+        trace: { run_id: "run-live", delegate: "researcher", status: "started", task: "research" }
+      });
+    });
+    await click(getButton(rendered.container, "researcher"));
+    await waitFor(
+      () =>
+        rendered.container.querySelector('[aria-label="Delegate researcher sub-thread"]') !== null
+    );
+
+    // Switching to another session clears the drill-down selection.
+    await click(getButton(rendered.container, "New shell session"));
+    await waitFor(
+      () =>
+        rendered.container.querySelector('[aria-label="Delegate researcher sub-thread"]') === null
+    );
+
+    await act(async () => rendered.root.unmount());
+  });
+
+  it("keeps composer drafts per session across navigation", async () => {
+    const transport = new ScriptedTransport();
+    const rendered = await renderApp(<App transport={transport} storage={new MemoryStorage()} />);
+
+    await waitFor(() => rendered.container.textContent?.includes("Inspect README") === true);
+    await click(getButton(rendered.container, "Inspect README"));
+    await waitFor(() => rendered.container.textContent?.includes("The README is short.") === true);
+
+    await change(getComposer(rendered.container), "draft for A");
+
+    // A draft typed for session A must not leak into session B's composer.
+    await click(getButton(rendered.container, "New shell session"));
+    await waitFor(() => getComposer(rendered.container).value === "");
+    await change(getComposer(rendered.container), "draft for B");
+
+    await click(getButton(rendered.container, "Inspect README"));
+    await waitFor(() => getComposer(rendered.container).value === "draft for A");
+
+    await act(async () => rendered.root.unmount());
+  });
+
+  it("confirms before reloading the config with unsaved edits", async () => {
+    const transport = new ScriptedTransport();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const rendered = await renderApp(<App transport={transport} storage={new MemoryStorage()} />);
+
+    await waitFor(() => rendered.container.textContent?.includes("Inspect README") === true);
+    await click(getButton(rendered.container, "Config"));
+    await waitFor(
+      () =>
+        rendered.container.querySelector("textarea")?.value.includes("[providers.anthropic]") ===
+        true
+    );
+
+    // Dirty editor + declined confirmation: no reload command is sent.
+    const textarea = rendered.container.querySelector("textarea") as HTMLTextAreaElement;
+    await change(textarea, '[session]\nrouting = "dispatcher"\n');
+    transport.sent.length = 0;
+    await click(getButton(rendered.container, "Reload"));
+    expect(confirm).toHaveBeenCalled();
+    expect(transport.sent.map((command) => command.type)).toEqual([]);
+
+    // Accepted confirmation: reload proceeds and refetches the text.
+    confirm.mockReturnValue(true);
+    await click(getButton(rendered.container, "Reload"));
+    await waitFor(() => transport.sent.some((command) => command.type === "get_config"));
+    expect(transport.sent.map((command) => command.type)).toEqual(["reload_config", "get_config"]);
 
     await act(async () => rendered.root.unmount());
   });
@@ -311,6 +419,7 @@ class ScriptedTransport implements ITransport {
   readonly kind = "web" as const;
   readonly sent: TransportCommand[] = [];
   failPivot = false;
+  pivotError: TransportError | undefined;
   subscribeCalls = 0;
   private handler: ((event: TransportEvent) => void) | undefined;
 
@@ -353,6 +462,13 @@ class ScriptedTransport implements ITransport {
       case "list_sources":
         return [
           {
+            id: "anthropic",
+            name: "anthropic",
+            kind: "llm_provider",
+            available: true,
+            capabilities: ["anthropic"]
+          },
+          {
             id: "claude-code",
             name: "Claude Code",
             kind: "local_agent",
@@ -382,6 +498,9 @@ class ScriptedTransport implements ITransport {
       case "send_message":
         return { run_id: "run-fallback" };
       case "pivot_message":
+        if (this.pivotError !== undefined) {
+          throw this.pivotError;
+        }
         if (this.failPivot) {
           throw new TransportError("no active run", { kind: "not_pivotable", status: 409 });
         }

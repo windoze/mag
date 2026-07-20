@@ -581,11 +581,90 @@ CI 承载（引入 CI 时列为第一批）；⑥tool 输出为 agent-lib Conten
   零改动（git status 实证），`cargo test --workspace` 与 `cargo doc` 复用 W3-4（`0fe4985`）
   全绿结果，按规则跳过重跑。
 
-### W4-R [TODO] W4 review
+### W4-R [DONE] W4 review
 
 - **实现要求**：对照 `docs/WEB.md` §5 全节逐项核对 CLI 能力在 web 的呈现覆盖（§0 目标清单）；
   检查 origin 归因、pivot 回落、D2 语义文案。发现问题直接修复。
 - **验证条件**：`pnpm -r test`/`pnpm -r build` 绿 + 默认验证序列；完成记录逐项列出 §0 清单结论。
+
+**完成记录（2026-07-21）**：通读 W4-1..W4-3 全部 diff（`b2b00ba`/`6e52ab5`/`6603ffc`）并派四个
+review 子代理分块核查（delegation+origin / pivot+run 状态 / ConfigEditor+Sources / §0 交叉覆盖），
+**发现 6 项 bug 级 + 10 项小问题全部当场修复并补测试**，修复后结论 **W4 放行进入 W5**。
+
+**§0 目标清单逐项结论**（端到端接线核实，含 file:line 证据于 review 过程）：
+
+1. **会话 CRUD + 恢复** ✅：create/list/resume/delete 全接线；resume → GET history 全量渲染
+   （user/assistant/tool call/delegation 记录，§3 P3）；删除为 hover 按钮 + 确认对话框两步
+   （满足「二次确认」意图，字面「hover 菜单」见偏差④）。
+2. **流式对话** ✅：`text_delta` 增量 + streaming 徽标 + Markdown 增量渲染；`run_finished` 收尾去重。
+3. **工具调用可视化** ✅：`tool_started/finished` 按 `call_id` 关联、rank 防降级、五态徽标 +
+   折叠全量 JSON；历史 ToolCall 同卡渲染；本轮换补 started 态 spinner（§5.2 字面要求）。
+4. **用户交互卡 + origin 归因** ✅：四形态交互卡、`[from <delegate>@depth<n>]` 徽标（root 不显示）、
+   多 pending 按 seq 排队、提交后只读已决态；无 `always` 按钮属 W3-R 已记录偏差。
+5. **多 agent 编排可视化** ✅：内联 DelegationCard + 右栏分组列表 + drill-down 子线程
+   （消息 + origin 交互卡按 seq 交错）；delegate 内部工具卡无归因属已记录 wire 限制。
+6. **pivot 两层语义 + cancel** ✅：run 中先 pivot、仅 409+`not_pivotable` 回落 send_message
+   （本轮把回落条件收紧为显式 409+kind 双判并补负分支测试）；composer 文案切换、Cancel 按钮、
+   pivot 三态轻量系统消息。
+7. **Config 查看/编辑/重载/应用** ✅：TOML 文本形态、Save=PUT、Reload 后重拉、Apply 旁 D2 生效
+   时机文案、`config_changed` toast、secret 引用不物化；graph 占位插槽。
+8. **Sources 列表** ✅：name/kind/available/version/capabilities 表格 + Probe 刷新（本轮修复
+   probe 丢 provider 行的 bug，见修复清单 4）。
+
+**origin 归因 / pivot 回落 / D2 文案专项检查**：徽标格式逐字符合 §5.2；D2 文案（Apply 按钮旁注 +
+toast）与 §5.2  sanctioned 措辞一致（对 CLI.md §4.4 的更细语义——idle 会话立即生效、apply 不覆盖
+approval/providers/session 默认值——属 spec 文本自身的简化，记录在案随 F-R 复核）。
+
+**修复清单**（全部补了回归测试）：
+
+1. **delegation 消息被 history 刷新抹掉**（bug）：`replaceHistory` 重建 delegations 时丢弃了
+   event 流来的 `delegation_message`（wire history 无此条目），resume/重连后子线程变空。修复为
+   与 pendingInteractions 同策略保留并按 key 重挂；trace 未入 history 的（in-flight）保留合成卡。
+   跨页面加载的丢失属 wire 限制，记录为偏差②。
+2. **pivot 成功无本地用户回声**（bug，D6 与 CLI 不一致）：`pivotMessage` 成功后像 `sendMessage`
+   一样追加本地 user 气泡；服务端会把 applied pivot 作为 user message 提交进 history，后续
+   replace 收敛。补成功回声 + 拒绝不回声两则测试。
+3. **run 状态卡死**（bug）：`syncSessionInfos` 的 idle 校正只覆盖 `running`，本地
+   `awaiting_interaction` + 服务端 idle（交互在别处应答）会卡死在 running 态。修复为两种活跃态
+   都以服务端投影为准复位（history 无 run 状态，重连对齐无法兜底）。
+4. **Probe 丢 provider 行**（bug）：`probe_local_agents` 只返回 local_agent，store 却整体替换
+   sources，`llm_provider` 行静默消失。修复为 merge（仅替换 local_agent 行），
+   `local_agents_probed` 事件同路；client + 壳级测试改为含 provider 行的断言。
+5. **空数组/空表被 strip 掉**（bug）：`configDtoToToml` 丢弃 `tools = []`（语义为「不暴露工具」，
+   与缺省「不约束」不同）与空 `[tools.x]` 条目，保存即静默改语义。修复为仅剥 null/undefined，
+   保留空数组/空表；补 round-trip 测试。
+6. **未知 TOML key 静默丢弃**（bug）：`tomlToConfigDto` 不校验 key，serde 无
+   `deny_unknown_fields`，PUT 全量替换 + write-through 使打字段落从磁盘消失。修复为 client 侧
+   白名单校验（映射 ConfigDto 生成类型，`params`/`env` 自由表不校验），报错列出完整路径；
+   ConfigEditor stories 里两处虚构 key（`max_turns`/`require_for_writes`）同步改为真实 key。
+7. **子线程逐消息 origin 徽标**：wire 消息无 depth，同名 delegate 多 depth 运行时逐消息徽标会
+   错标；spec 只要求交互/工具卡带徽标。移除逐消息徽标（头部组徽标保留），同时消除窄栏噪音。
+8. **渲染期直读 mutable store**：delegationGroups 改由 `SessionView.delegationGroups` 经 snapshot
+   派生（store 内建一次），选中清理 effect 补依赖数组；补「切换会话清除 drill-down」壳级测试。
+9. **「latest status」按创建序**：delegation trace 原地 upsert，`.at(-1)` 拿到的是最新创建而非
+   最新更新；`DelegationView` 新增 `updatedSeq`，右栏列表/面板头/usage 改按更新序取。
+10. **pivot 回落条件收紧**：`TransportError` 路径要求 409+`not_pivotable` 双判；补「500 backend
+    不回落、错误上浮 banner」负分支壳级测试。
+11. **ConfigPage Reload 丢未保存编辑**：dirty 时先 confirm；补拒绝/接受两分支壳级测试。
+12. **杂项**：SourcesPage 错误行补 `role="alert"`；Composer running 态无 `onCancel` 不渲染
+    Cancel（补测试）；composer 草稿改按会话隔离（跨会话跳转不再串草稿，补壳级测试）；sidebar
+    徽标文案 `awaiting` → `awaiting-interaction`（§5.1 字面）；`config.ts` 补 `params` 自由表
+    round-trip 类型漂移（datetime→string、整值 float→int）的文档注释。
+
+**记录在案的偏差（不阻塞）**：①wire 工具事件无 origin、无 `always` approval 变体（W3-R 已录，
+复核仍准确）；②delegation 消息不入 history——页面内 resume/重连已由修复 1 兜住，跨页面加载
+（新开标签）子线程消息仍丢，需 wire 扩展，随 F-R 评估；③§5.4「最小文件附加（路径文本）」未做
+——引擎尚不消费附件（W1-R 记录①），做 UI 只能是死功能；已加入 W5-1 范围显式裁决；④删除确认为
+hover 按钮 + 原生 confirm 两步，非字面「hover 菜单」，满足不可逆操作二次确认意图；⑤pending 交互
+在 run 终态后残留为已决卡（wire 无 interaction-resolved 事件），与 W3-R 记录③同源；
+⑥xl 断点以下右栏不可达——§0 非目标明确不做移动端/窄屏适配；⑦pivot notices 在 history replace
+后清空（轻量系统消息可接受的短暂性；修复 2 后 pivot 文本本体经 history 存续）。
+
+**验证通过**：`pnpm format:write`+`pnpm format`、`pnpm lint`、`pnpm -r test`（protocol 门禁 +
+client 36 + ui 29 + app-web 11 全绿）、`pnpm -r build`、`build-storybook`、
+`cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`。Rust 源码本轮零改动
+（`git diff HEAD -- crates/` 实证为空），`cargo test --workspace` 与 `cargo doc` 复用 W3-4
+（`0fe4985`）全绿结果，按规则跳过重跑。
 
 ---
 
@@ -601,6 +680,10 @@ CI 承载（引入 CI 时列为第一批）；⑥tool 输出为 agent-lib Conten
     完成记录注明取舍）：建会话→对话→审批→委派→pivot→cancel→config→sources 全路径。
   - Storybook 视觉态补全（错误态/空态/长会话性能基线——大列表虚拟化视需要，不性能过度设计）。
   - 真实浏览器联调 `#[ignore]` 脚本与说明。
+  - 裁决 §5.4「最小文件附加（路径文本）」：W4-R 发现 Composer 无附件入口，而引擎尚不消费附件
+    （W1-R 记录①、history attachments 恒空）。本任务须二选一并闭环——要么实现最小路径文本附件
+    UI（store/`MessageBubble` 已支持附件载体），要么正式修订 `docs/WEB.md` §5.4 移除该承诺；
+    不允许继续悬空。
 - **验证条件**：上述测试全绿；默认验证序列 + `pnpm -r test`/`pnpm -r build` 全绿。
 
 ### F-R [TODO] 全计划 review

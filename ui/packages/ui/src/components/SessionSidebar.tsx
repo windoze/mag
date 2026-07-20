@@ -147,7 +147,7 @@ function SessionStatusBadge({ status }: { readonly status: SessionStatusView }):
         status === "awaiting_interaction" && "bg-warning/15 text-warning"
       )}
     >
-      {status === "awaiting_interaction" ? "awaiting" : status}
+      {status === "awaiting_interaction" ? "awaiting-interaction" : status}
     </span>
   );
 }

@@ -52,6 +52,20 @@ describe("Composer", () => {
     expect(onSend).toHaveBeenCalledWith("steer the run");
   });
 
+  it("omits the cancel button while running when no cancel callback is provided", () => {
+    const host = render(
+      <Composer
+        mode="running"
+        value="steer"
+        onSend={() => undefined}
+        onValueChange={() => undefined}
+      />
+    );
+
+    expect(buttonByText(host, "Insert pivot...")).toBeDefined();
+    expect(hasButton(host, "Cancel")).toBe(false);
+  });
+
   it("surfaces the pending-interaction count without blocking input", () => {
     const host = render(
       <Composer

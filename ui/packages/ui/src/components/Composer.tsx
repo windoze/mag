@@ -88,7 +88,7 @@ export function Composer({
           ) : null}
         </div>
         <div className="flex items-center gap-2">
-          {mode === "running" ? (
+          {mode === "running" && onCancel !== undefined ? (
             <Button disabled={disabled} type="button" variant="outline" onClick={onCancel}>
               Cancel
             </Button>

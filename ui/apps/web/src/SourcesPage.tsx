@@ -14,8 +14,8 @@ export interface SourcesPageProps {
 
 /**
  * Container for the sources table (docs/WEB.md §5.5): refreshes the source
- * list on entry and probes local agents on demand. The probed list replaces
- * the store's sources, so the table updates through the snapshot.
+ * list on entry and probes local agents on demand. Probed local agents are
+ * merged into the store's sources, so the table updates through the snapshot.
  */
 export function SourcesPage({ onBack, sources, store }: SourcesPageProps): React.JSX.Element {
   const [busy, setBusy] = React.useState(false);
@@ -42,7 +42,10 @@ export function SourcesPage({ onBack, sources, store }: SourcesPageProps): React
   return (
     <div className="flex flex-col gap-2">
       {error !== undefined ? (
-        <p className="mx-4 mt-4 rounded-lg border border-destructive/20 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+        <p
+          className="mx-4 mt-4 rounded-lg border border-destructive/20 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+          role="alert"
+        >
           {error}
         </p>
       ) : null}

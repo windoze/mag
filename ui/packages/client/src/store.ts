@@ -72,6 +72,8 @@ export interface DelegationView {
   readonly id: string;
   /** Latest delegation lifecycle snapshot. */
   trace: DelegationTrace;
+  /** Monotonic marker of the last trace update, for "latest status" derivation. */
+  updatedSeq: number;
   /** Messages emitted by the delegated agent, in arrival order. */
   readonly messages: StoredDelegationMessage[];
   /** Source that first produced this card. */
@@ -177,6 +179,8 @@ export interface SessionView {
   readonly toolCalls: readonly ToolCallView[];
   /** Delegation cards keyed by delegate/run identity. */
   readonly delegations: readonly DelegationView[];
+  /** Delegation drill-down groups derived for the right rail. */
+  readonly delegationGroups: readonly DelegationGroupView[];
   /** Pending interaction queue in arrival order. */
   readonly pendingInteractions: readonly InteractionView[];
   /** Full ordered thread projection. */
@@ -363,10 +367,10 @@ export class SessionStore {
    */
   selectDelegationGroups(id: SessionId): readonly DelegationGroupView[] {
     const session = this.sessions.get(id);
-    if (session === undefined) {
-      return [];
-    }
+    return session === undefined ? [] : this.buildDelegationGroups(session);
+  }
 
+  private buildDelegationGroups(session: MutableSession): DelegationGroupView[] {
     interface GroupDraft {
       readonly delegate: string;
       readonly delegations: DelegationView[];
@@ -457,15 +461,22 @@ export class SessionStore {
   }
 
   /**
-   * Sends `probe_local_agents` and replaces the store's source list with the
-   * fresh result. The server also broadcasts `local_agents_probed`; replacing
-   * here is idempotent with that event.
+   * Sends `probe_local_agents` and merges the fresh result into the store's
+   * source list. Probing only covers local agents — provider rows reported by
+   * `list_sources` are kept. The server also broadcasts `local_agents_probed`;
+   * merging here is idempotent with that event.
    */
   async probeSources(): Promise<readonly SourceInfo[]> {
-    const sources = (await this.transport.send({ type: "probe_local_agents" })) as SourceInfo[];
-    this.sources = [...sources];
+    const probed = (await this.transport.send({ type: "probe_local_agents" })) as SourceInfo[];
+    this.mergeProbedSources(probed);
     this.notify();
-    return sources;
+    return probed;
+  }
+
+  /** Replaces local-agent rows with the probed list, keeping all other source kinds. */
+  private mergeProbedSources(probed: readonly SourceInfo[]): void {
+    const others = this.sources.filter((source) => source.kind !== "local_agent");
+    this.sources = [...others, ...probed];
   }
 
   /** Marks a session as open and replaces its thread with authoritative history. */
@@ -526,12 +537,26 @@ export class SessionStore {
     buffered.forEach((event) => this.applyEvent(event));
   }
 
-  /** Replaces one session's committed history while preserving still-pending interactions. */
+  /**
+   * Replaces one session's committed history while preserving still-pending
+   * interactions and streamed delegation messages. History entries carry
+   * delegation lifecycle traces but no `delegation_message` payloads (the wire
+   * history format has no such entry), so messages received via the live event
+   * stream are re-attached to the rebuilt cards; without this, every resume or
+   * reconnect alignment would empty the delegate sub-threads.
+   */
   replaceHistory(id: SessionId, history: readonly HistoryEntry[]): void {
     const session = this.ensureSession(id);
     const pendingInteractions = session.interactions.filter(
       (interaction) => interaction.status === "pending"
     );
+    const streamedMessages = new Map<string, DelegationView>();
+
+    session.delegations.forEach((delegation) => {
+      if (delegation.messages.length > 0) {
+        streamedMessages.set(delegation.id, delegation);
+      }
+    });
 
     session.messages = [];
     session.toolCalls = [];
@@ -546,6 +571,26 @@ export class SessionStore {
     session.activeAssistant = undefined;
 
     history.forEach((entry, index) => this.applyHistoryEntry(session, entry, index));
+    streamedMessages.forEach((previous, key) => {
+      const rebuilt = session.delegationsById.get(key);
+      if (rebuilt !== undefined) {
+        rebuilt.messages.push(...previous.messages);
+        return;
+      }
+      // The trace never reached history (e.g. the delegation was still
+      // in-flight when the snapshot was taken): keep a synthetic card so the
+      // streamed messages stay reachable.
+      const delegation = {
+        id: key,
+        trace: previous.trace,
+        updatedSeq: previous.updatedSeq,
+        messages: [...previous.messages],
+        source: previous.source
+      } satisfies DelegationView;
+      session.delegations.push(delegation);
+      session.delegationsById.set(key, delegation);
+      session.thread.push({ type: "delegation", delegation });
+    });
     pendingInteractions.forEach((interaction) => this.installInteraction(session, interaction));
   }
 
@@ -596,9 +641,24 @@ export class SessionStore {
     return result;
   }
 
-  /** Sends a pivot message, preserving typed `not_pivotable` failures for callers. */
+  /**
+   * Sends a pivot message, preserving typed `not_pivotable` failures for
+   * callers. On success the pivot text is appended as a local user bubble so
+   * the typed line stays visible like in the CLI (decision D6); the server
+   * commits applied pivots into history as user messages, so a later history
+   * replace converges onto the authoritative entry.
+   */
   async pivotMessage(id: SessionId, text: string): Promise<void> {
     await this.transport.send({ type: "pivot_message", session_id: id, text });
+    const session = this.ensureSession(id);
+    this.addMessage(session, {
+      id: this.nextId("local-pivot"),
+      role: "user",
+      text,
+      streaming: false,
+      source: "local"
+    });
+    this.notify();
   }
 
   /** Sends a run cancellation command. */
@@ -689,7 +749,7 @@ export class SessionStore {
         this.applyDelegationMessage(event.id, event.message);
         break;
       case "local_agents_probed":
-        this.sources = [...event.available];
+        this.mergeProbedSources(event.available);
         break;
       case "pivot_queued":
         this.addPivotNotice(event.id, "queued");
@@ -778,7 +838,16 @@ export class SessionStore {
           session.run.state === "running"
             ? { state: "awaiting_interaction", runId: session.run.runId }
             : { state: "awaiting_interaction" };
-      } else if (info.status === "idle" && session.run.state === "running") {
+      } else if (
+        info.status === "idle" &&
+        (session.run.state === "running" || session.run.state === "awaiting_interaction")
+      ) {
+        // The server is authoritative: a locally active run whose session the
+        // server reports as idle has ended (e.g. the interaction was answered
+        // from another tab, or a terminal event was missed during a
+        // disconnect). Reset so the composer does not stay stuck in running
+        // mode; reconnect alignment cannot fix this because history entries
+        // carry no run state.
         session.run = { state: "idle" };
       }
     });
@@ -931,11 +1000,18 @@ export class SessionStore {
     if (existing !== undefined) {
       if (delegationStatusRank(trace.status) >= delegationStatusRank(existing.trace.status)) {
         existing.trace = trace;
+        existing.updatedSeq = this.nextSeq();
       }
       return;
     }
 
-    const delegation = { id: key, trace, messages: [], source } satisfies DelegationView;
+    const delegation = {
+      id: key,
+      trace,
+      updatedSeq: this.nextSeq(),
+      messages: [],
+      source
+    } satisfies DelegationView;
     session.delegations.push(delegation);
     session.delegationsById.set(key, delegation);
     session.thread.push({ type: "delegation", delegation });
@@ -954,6 +1030,7 @@ export class SessionStore {
     const delegation = {
       id: key,
       trace: { run_id: message.run_id, delegate: message.delegate, status: "started" },
+      updatedSeq: stored.seq,
       messages: [stored],
       source: "event"
     } satisfies DelegationView;
@@ -1024,6 +1101,7 @@ export class SessionStore {
       messages: [...session.messages],
       toolCalls: [...session.toolCalls],
       delegations: [...session.delegations],
+      delegationGroups: this.buildDelegationGroups(session),
       pendingInteractions: [...session.pendingInteractions],
       thread: [...session.thread],
       run: session.run,

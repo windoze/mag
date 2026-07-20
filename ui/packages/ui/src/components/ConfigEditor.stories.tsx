@@ -13,7 +13,7 @@ model = "claude-sonnet-4-5"
 tools = ["read_file", "grep"]
 
 [session]
-max_turns = 20
+routing = "model_routed"
 `;
 
 const meta = {
@@ -40,7 +40,7 @@ export const TextMode: Story = {};
 
 export const Editing: Story = {
   args: {
-    text: `${sampleToml}\n[approval]\nrequire_for_writes = true\n`
+    text: `${sampleToml}\n[approval]\ndefault_policy = "ask"\ntimeout_secs = 120\n`
   }
 };
 

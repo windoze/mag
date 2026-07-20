@@ -636,6 +636,122 @@ describe("@mag/client", () => {
     expect(ids.filter((id) => id === "session-new")).toHaveLength(1);
     expect(new Set(ids).size).toBe(ids.length);
   });
+
+  it("preserves streamed delegation messages across a history replace", () => {
+    const store = new SessionStore(new ScriptedTransport());
+    store.applyEvent({ type: "run_started", id: sessionId, run_id: "run-live" });
+    store.applyEvent({
+      type: "delegation_started",
+      id: sessionId,
+      trace: { run_id: "run-live", delegate: "researcher", status: "started", task: "research" }
+    });
+    store.applyEvent({
+      type: "delegation_message",
+      id: sessionId,
+      message: { run_id: "run-live", delegate: "researcher", text: "scanning repo" }
+    });
+    // A delegation whose trace never reached history (still in flight when the
+    // snapshot was taken) keeps a synthetic card for its messages.
+    store.applyEvent({
+      type: "delegation_message",
+      id: sessionId,
+      message: { run_id: "run-other", delegate: "planner", text: "drafting plan" }
+    });
+
+    store.replaceHistory(sessionId, [
+      {
+        type: "delegation",
+        trace: {
+          run_id: "run-live",
+          delegate: "researcher",
+          status: "finished",
+          task: "research",
+          output: "done"
+        }
+      }
+    ]);
+
+    const session = store.selectSession(sessionId)!;
+    const researcher = session.delegations.find(
+      (delegation) => delegation.trace.delegate === "researcher"
+    )!;
+    expect(researcher.trace.status).toBe("finished");
+    expect(researcher.messages.map((stored) => stored.message.text)).toEqual(["scanning repo"]);
+    const planner = session.delegations.find(
+      (delegation) => delegation.trace.delegate === "planner"
+    )!;
+    expect(planner.messages.map((stored) => stored.message.text)).toEqual(["drafting plan"]);
+
+    // Drill-down groups still expose the preserved sub-thread items.
+    const groups = store.selectDelegationGroups(sessionId);
+    expect(
+      groups
+        .find((group) => group.delegate === "researcher")
+        ?.items.map((item) => (item.type === "message" ? item.text : item.interaction.requestId))
+    ).toEqual(["scanning repo"]);
+    expect(
+      groups
+        .find((group) => group.delegate === "planner")
+        ?.items.map((item) => (item.type === "message" ? item.text : item.interaction.requestId))
+    ).toEqual(["drafting plan"]);
+  });
+
+  it("appends a local user echo for a successful pivot, like the CLI", async () => {
+    const transport = new ScriptedTransport();
+    const store = new SessionStore(transport);
+    await store.openSession(sessionId);
+
+    await store.pivotMessage(sessionId, "focus on the tests");
+
+    expect(transport.sent.at(-1)).toEqual({
+      type: "pivot_message",
+      session_id: sessionId,
+      text: "focus on the tests"
+    });
+    const session = store.selectSession(sessionId)!;
+    expect(session.messages.at(-1)).toMatchObject({
+      role: "user",
+      text: "focus on the tests",
+      source: "local"
+    });
+    expect(session.thread.at(-1)).toMatchObject({ type: "message" });
+  });
+
+  it("does not append a local echo when the pivot is rejected", async () => {
+    const transport = new ScriptedTransport();
+    const store = new SessionStore(transport);
+    await store.openSession(sessionId);
+    transport.pivotError = new TransportError("no active run", {
+      kind: "not_pivotable",
+      status: 409
+    });
+
+    await expect(store.pivotMessage(sessionId, "too late")).rejects.toBeInstanceOf(TransportError);
+
+    expect(store.selectSession(sessionId)!.messages.map((message) => message.text)).not.toContain(
+      "too late"
+    );
+  });
+
+  it("resets a locally active run when the server reports the session idle", async () => {
+    const transport = new ScriptedTransport();
+    const store = new SessionStore(transport);
+    store.applyEvent({ type: "run_started", id: sessionId, run_id: "run-live" });
+    store.applyEvent({
+      type: "interaction_requested",
+      id: sessionId,
+      request_id: "req-stuck",
+      kind: { kind: "question", prompt: "Answered elsewhere?" },
+      origin: { depth: 0 }
+    });
+    expect(store.selectSession(sessionId)!.run.state).toBe("awaiting_interaction");
+
+    // The interaction was answered from another tab: list_sessions now reports
+    // the session as idle, and the server projection is authoritative.
+    await store.refreshSessions();
+
+    expect(store.selectSession(sessionId)!.run).toEqual({ state: "idle" });
+  });
 });
 
 class ScriptedTransport implements ITransport {
@@ -644,6 +760,7 @@ class ScriptedTransport implements ITransport {
   readonly histories = new Map<SessionId, HistoryEntry[]>([[sessionId, historyFixture]]);
   sessions: SessionInfo[] = [sessionInfo];
   subscribeCalls = 0;
+  pivotError: TransportError | undefined;
   private handler: ((event: Event) => void) | undefined;
   private subscribeOptions: SubscribeOptions | undefined;
 
@@ -658,6 +775,11 @@ class ScriptedTransport implements ITransport {
         return { id: sessionId, config: command.config };
       case "send_message":
         return { run_id: "run-local" };
+      case "pivot_message":
+        if (this.pivotError !== undefined) {
+          throw this.pivotError;
+        }
+        return undefined;
       default:
         return undefined;
     }

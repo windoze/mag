@@ -44,6 +44,9 @@ const DEFAULT_SESSION_CONFIG = {
 
 let browserStore: SessionStore | undefined;
 
+/** Draft-map key for the composer before any session is selected. */
+const NEW_SESSION_DRAFT_KEY = "(new-session)";
+
 type Route =
   | { readonly page: "session"; readonly sessionId?: string }
   | { readonly page: "sources" }
@@ -68,7 +71,7 @@ export function App(props: AppProps = {}): React.JSX.Element {
   const [store] = React.useState(() => createStore(props));
   const snapshot = useSessionStoreSnapshot(store);
   const [route, setRoute] = React.useState<Route>({ page: "session" });
-  const [composerValue, setComposerValue] = React.useState("");
+  const [composerDrafts, setComposerDrafts] = React.useState<Readonly<Record<string, string>>>({});
   const [pendingAction, setPendingAction] = React.useState<string>();
   const [error, setError] = React.useState<string>();
   const [notice, setNotice] = React.useState<string>();
@@ -79,8 +82,21 @@ export function App(props: AppProps = {}): React.JSX.Element {
   const activeRun = isActiveRun(activeSession?.run);
   const composerMode = composerModeFor(activeSession?.run);
   const pendingInteractionCount = activeSession?.pendingInteractions.length ?? 0;
-  const delegationGroups =
-    activeSessionId === undefined ? [] : store.selectDelegationGroups(activeSessionId);
+  const delegationGroups = activeSession?.delegationGroups ?? [];
+  // Composer drafts are kept per session so a cross-session jump cannot send
+  // text typed for one session to another.
+  const draftKey = activeSessionId ?? NEW_SESSION_DRAFT_KEY;
+  const composerValue = composerDrafts[draftKey] ?? "";
+  const setComposerValue = (value: string): void => {
+    setComposerDrafts((drafts) => ({ ...drafts, [draftKey]: value }));
+  };
+  const clearComposerDrafts = (...keys: readonly string[]): void => {
+    setComposerDrafts((drafts) => {
+      const next = { ...drafts };
+      keys.forEach((key) => delete next[key]);
+      return next;
+    });
+  };
 
   React.useEffect(() => {
     captureFragmentToken(props.storage, props.location, props.history);
@@ -117,7 +133,7 @@ export function App(props: AppProps = {}): React.JSX.Element {
     ) {
       setSelectedDelegate(undefined);
     }
-  });
+  }, [delegationGroups, selectedDelegate]);
 
   const openDelegateGroup = (delegate: string): void => {
     setSelectedDelegate(delegate);
@@ -169,7 +185,7 @@ export function App(props: AppProps = {}): React.JSX.Element {
       try {
         await store.pivotMessage(sessionId, text);
       } catch (pivotError: unknown) {
-        if (!isTransportErrorKind(pivotError, "not_pivotable")) {
+        if (!isNotPivotableConflict(pivotError)) {
           throw pivotError;
         }
         await store.sendMessage(sessionId, text);
@@ -177,7 +193,7 @@ export function App(props: AppProps = {}): React.JSX.Element {
     } else {
       await store.sendMessage(sessionId, text);
     }
-    setComposerValue("");
+    clearComposerDrafts(draftKey, sessionId);
     await store.refreshSessions();
   };
 
@@ -399,11 +415,18 @@ function composerModeFor(run: RunView | undefined): ComposerMode {
   return isActiveRun(run) ? "running" : "idle";
 }
 
-function isTransportErrorKind(error: unknown, kind: string): boolean {
+/**
+ * True only for the pivot fallback condition of docs/WEB.md §5.4: HTTP 409
+ * with kind `not_pivotable`. Every other failure must surface to the user
+ * instead of silently falling back to `send_message`.
+ */
+function isNotPivotableConflict(error: unknown): boolean {
   if (error instanceof TransportError) {
-    return error.kind === kind;
+    return error.status === 409 && error.kind === "not_pivotable";
   }
-  return typeof error === "object" && error !== null && "kind" in error && error.kind === kind;
+  return (
+    typeof error === "object" && error !== null && "kind" in error && error.kind === "not_pivotable"
+  );
 }
 
 function errorMessage(error: unknown): string {
@@ -550,7 +573,7 @@ function RightRail({
             </p>
           ) : (
             groups.map((group) => {
-              const latest = group.delegations.at(-1)?.trace;
+              const latest = latestDelegationTrace(group);
               const pendingCount = group.items.filter(
                 (item) => item.type === "interaction" && item.interaction.status === "pending"
               ).length;
@@ -585,7 +608,7 @@ function RightRail({
           delegate={selectedGroup.delegate}
           depth={selectedGroup.depth}
           items={selectedGroup.items.map(toDelegateThreadItem)}
-          status={selectedGroup.delegations.at(-1)?.trace.status}
+          status={latestDelegationTrace(selectedGroup)?.status}
           usage={latestUsage(selectedGroup)}
           onClose={onCloseDelegate}
           onRespondInteraction={onRespondInteraction}
@@ -641,9 +664,28 @@ function toDelegateThreadItem(item: DelegationGroupView["items"][number]): Deleg
   };
 }
 
+/**
+ * Most recently updated lifecycle trace in the group. Traces are upserted in
+ * place, so creation order (`.at(-1)`) would miss an older run that finished
+ * later; `updatedSeq` tracks the last update instead.
+ */
+function latestDelegationTrace(
+  group: DelegationGroupView
+): DelegationGroupView["delegations"][number]["trace"] | undefined {
+  return group.delegations.reduce<DelegationGroupView["delegations"][number] | undefined>(
+    (latest, delegation) =>
+      latest === undefined || delegation.updatedSeq >= latest.updatedSeq ? delegation : latest,
+    undefined
+  )?.trace;
+}
+
 function latestUsage(group: DelegationGroupView): DelegationItemView["usage"] {
   const withUsage = group.delegations.filter((delegation) => delegation.trace.usage !== undefined);
-  return withUsage.at(-1)?.trace.usage;
+  return withUsage.reduce<DelegationGroupView["delegations"][number] | undefined>(
+    (latest, delegation) =>
+      latest === undefined || delegation.updatedSeq >= latest.updatedSeq ? delegation : latest,
+    undefined
+  )?.trace.usage;
 }
 
 function groupSummary(group: DelegationGroupView, pendingCount: number): string {

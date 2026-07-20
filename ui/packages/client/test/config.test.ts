@@ -22,7 +22,16 @@ const sampleDto = {
   approval: { default_policy: "ask", timeout_secs: 60 }
 } satisfies ConfigDto;
 
+const providerSource = {
+  id: "anthropic",
+  name: "anthropic",
+  kind: "llm_provider",
+  available: true,
+  capabilities: ["anthropic"]
+} satisfies SourceInfo;
+
 const sampleSources = [
+  providerSource,
   {
     id: "claude-code",
     name: "Claude Code",
@@ -63,6 +72,32 @@ describe("config TOML mapping", () => {
   it("maps empty and whitespace-only text to an empty DTO", () => {
     expect(tomlToConfigDto("")).toEqual({});
     expect(tomlToConfigDto("  \n\t\n")).toEqual({});
+  });
+
+  it("preserves explicit empty arrays and tables, which carry their own semantics", () => {
+    // `tools = []` means "expose no tools" while a missing `tools` key leaves
+    // the agent unconstrained; an empty `[tools.shell]` table keeps the entry.
+    const dto = {
+      agents: { default: { tools: [] } },
+      tools: { shell: {} }
+    } satisfies ConfigDto;
+
+    const text = configDtoToToml(dto);
+    expect(text).toContain("tools = []");
+    expect(text).toContain("[tools.shell]");
+    expect(tomlToConfigDto(text)).toEqual(dto);
+  });
+
+  it("rejects unknown config keys instead of silently dropping them on save", () => {
+    expect(() => tomlToConfigDto("[session]\nmax_turns = 20\n")).toThrowError(
+      /^Invalid TOML: unknown config key `session\.max_turns`$/
+    );
+    expect(() => tomlToConfigDto("[providerz]\n")).toThrowError(
+      /^Invalid TOML: unknown config key `providerz`$/
+    );
+    expect(() => tomlToConfigDto("[agents.default]\nbuget = { max_steps = 3 }\n")).toThrowError(
+      /^Invalid TOML: unknown config key `agents\.default\.buget`$/
+    );
   });
 
   it("throws a clear error on invalid TOML", () => {
@@ -131,9 +166,9 @@ describe("SessionStore config and sources helpers", () => {
     expect(listener).toHaveBeenCalled();
   });
 
-  it("probeSources replaces snapshot sources with the probed list", async () => {
+  it("probeSources merges probed local agents, keeping provider rows", async () => {
     const probed = [
-      { ...sampleSources[0], available: false, version: undefined }
+      { ...sampleSources[1], available: false, version: undefined }
     ] satisfies SourceInfo[];
     const transport = new StubTransport((command) =>
       command.type === "probe_local_agents" ? probed : sampleSources
@@ -147,8 +182,24 @@ describe("SessionStore config and sources helpers", () => {
       "list_sources",
       "probe_local_agents"
     ]);
+    // The command returns only the probed local agents...
     expect(sources).toEqual(probed);
-    expect(store.getSnapshot().sources).toEqual(probed);
+    // ...but the store keeps provider rows: probing never covers them, so a
+    // wholesale replace would silently drop them from the Sources table.
+    expect(store.getSnapshot().sources).toEqual([providerSource, ...probed]);
+  });
+
+  it("merges the local_agents_probed event the same way as the probe response", async () => {
+    const probed = [
+      { ...sampleSources[1], available: false, version: undefined }
+    ] satisfies SourceInfo[];
+    const transport = new StubTransport(() => sampleSources);
+    const store = new SessionStore(transport);
+
+    await store.refreshSources();
+    store.applyEvent({ type: "local_agents_probed", available: probed });
+
+    expect(store.getSnapshot().sources).toEqual([providerSource, ...probed]);
   });
 });
 
