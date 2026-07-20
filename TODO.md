@@ -383,7 +383,7 @@ GUI/web/CLI 无需感知多个会话通道。
 转换；运行时可更新（`update_config` / 文件 watch `reload`），在合适时机生效（会话创建钉住 +
 `apply_config` 到 turn 边界）；同一套系统后续直接服务 GUI/web。
 
-### M3-1 [TODO] 新 crate `mag-config`：DTO + TOML 读写 + 校验
+### M3-1 [DONE] 新 crate `mag-config`：DTO + TOML 读写 + 校验
 
 - **上下文**：`docs/CLI.md` §4.1/§4.2（TOML 示例在 §4.2 代码块）。DTO 对应配置文件或任何可能的配置
   来源（决策 D4：不与「配置文件」绑死）。
@@ -400,6 +400,54 @@ GUI/web/CLI 无需感知多个会话通道。
     保证 watch 端不读到半截文件）；行级校验错误（带 line/col 与字段路径，`ConfigError` 枚举）。
   - 轮次 trip 单测：§4.2 示例 TOML → DTO → TOML 语义等价。
 - **验证条件**：聚焦测试 `cargo test -p mag-config`；默认验证序列全过。
+
+  **完成记录**（2026-07-22）：
+  - 实现要点：新建 `crates/mag-config`（已加入 workspace members，`#![warn(missing_docs)]`），
+    四个模块：`dto.rs`（DTO serde 类型）、`secret.rs`（`SecretRef`）、`error.rs`（`ConfigError`）、
+    `io.rs`（TOML 读写 + `validate`）。根类型 `ConfigDto{providers, agents, external_agents, tools,
+    session, approval}`——全部 name-keyed map 用 `BTreeMap`（序列化确定性），全部字段
+    `Option` + `skip_serializing_if`（部分配置合法、round-trip 不长幽灵节）。`ProviderDto{wire,
+    base_url, api_key: SecretRef, params}`、`AgentDto{provider, model, tools, system_prompt, role,
+    budget}`、`ExternalAgentDto{kind, command, env, capabilities}`、`ToolDto{approval, enabled}`、
+    `SessionDefaultsDto{routing, persist_path, budget}`、`ApprovalSectionDto{default_policy,
+    timeout_secs}`、`BudgetDto{max_steps, max_tokens, max_cost_micros, max_wall_time_secs}`。
+    TOML IO：`parse_str`/`to_string_pretty`/`load`（读+解析+validate）/`save_atomic`（同目录
+    `.<name>.tmp-<pid>` 临时文件 + write_all + sync_all + rename，失败清理临时文件，父目录按需
+    创建）。`ConfigError`（thiserror，`#[non_exhaustive]`）：`Io{path,source}` /
+    `Parse{path,line,col,message}`（byte span → 1-based line/col）/ `Serialize{message}` /
+    `Validation{path,message}`（字段路径如 `agents.default.tools[2]`）。
+  - 关键决策：① **字段命名以 §4.2 实际示例为准**——TODO 任务书列举的 `[llm.<name>]`/
+    `[[agent]]`/`[[external_agent]]`/`[approval]` 与 docs/CLI.md §4.2 示例（`[providers.<name>]`/
+    `[agents.<name>]`/`[external_agents.<name>]`/`[tools.<name>]`/`[session]`）不一致，按任务书
+    自身「字段命名与示例一致、§4.2 示例为最小完备集」的要求取后者（§4.2 的 DTO↔DO 结构图同）；
+    任务书提到但示例没有的字段（agent role/system_prompt/budget、external env/capabilities、
+    session persist_path、provider 参数表 params、`[approval]` 段）作为 Option 字段补齐，即
+    「示例最小完备集 ∪ 任务书列举面」。② 根类型命名 `ConfigDto`（对齐 M3-4 契约方法签名
+    `get_config() -> ConfigDto`），rustdoc 注明对应 §4.2 图中的 `ConfigFileDto`。③ **enum 类字符串
+    保持 String**（`wire`/`kind`/`approval`/`routing`/`default_policy`）——§4.2 明确把「approval
+    枚举合法」归入 DTO→DO resolve 校验，DTO 层保持宽松以支持部分配置；M3-2 resolve 时校验并报
+    带路径的错。④ `SecretRef` 双形态：反序列化接受 §4.2 内联表 `{env=...}`/`{keyring=...}`
+    （canonical）与字符串 mini-DSL `"env:VAR"`/`"keyring:NAME"`（服务决策 D4 的非 TOML 来源）；
+    序列化恒为 canonical 表形态；裸 secret 值（无前缀字符串、双 key、未知 key、空名）一律拒绝，
+    杜绝 secret 内联落盘；`Display` 输出 §4.3 `ConfigView` 脱敏字样 `{env = "VAR"}`。⑤
+    `BudgetDto` 四字段逐一对齐 mag-service `SessionBudget`（max_steps/max_tokens/max_cost_micros/
+    max_wall_time_secs），M3-2 转换为纯字段投影。⑥ `validate()` 只做结构校验（空节名/空字符串/
+    重复 tool 名/空 argv/零 budget/零 timeout），交叉引用与枚举校验留给 resolve；`load` 自动跑
+    validate，`parse_str` 保持纯 serde（GUI patch 等来源可构造中间态）。⑦ struct 字段顺序
+    标量在前、表在后（`api_key`/`params`/`budget` 置尾），规避 TOML ValueAfterTable 序列化限制。
+  - 测试（全部离线，tempdir；4 个单元 + 23 个集成，共 27 个）：§4.2 示例**逐字符** TOML →
+    DTO 字段断言（含两个 secret 引用形态、external command、tools.shell.approval、session
+    budget）→ `to_string_pretty` → 重解析 `PartialEq` 语义等价；序列化输出含全部节头且 secret
+    保持引用形态；JSON roundtrip（D4 GUI 来源）；空文档 = default；部分配置合法且 roundtrip
+    无幽灵节；SecretRef 表/字符串双形态接受 + 5 类畸形拒绝 + 裸值拒绝 + 序列化恒 canonical；
+    tempdir 下 save_atomic/load roundtrip、覆盖写、无临时文件残留、缺文件 Io 错带路径、parse
+    错带 line/col（line=3/2 逐例断言）、load 自动 validate；validate 各失败路径字段路径断言
+    （`agents.default.tools[2]` 等）。
+  - 依赖边界：`cargo tree -p mag-config -e normal --depth 1` 仅 serde/thiserror/toml——无
+    agent-lib/mag-core/mag-service，硬约束满足。
+  - 门禁结果：1) `cargo fmt --all -- --check` ✅ 2) `cargo test -p mag-config` ✅（27 passed）
+    3) `cargo clippy --all-targets -- -D warnings` ✅ 4) `cargo test --workspace` ✅（全绿，
+    1 ignored 为既有 `#[ignore]` 联调测试）5) `cargo doc --no-deps --workspace` ✅（0 warning）。
 
 ### M3-2 [TODO] mag-config：DTO ↔ DO 双向转换
 

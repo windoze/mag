@@ -2,6 +2,7 @@
 members = [
     "crates/mag",
     "crates/mag-acp",
+    "crates/mag-config",
     "crates/mag-core",
     "crates/mag-service",
     "crates/mag-sources",
@@ -21,6 +22,9 @@ keyring = "3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tempfile = "3"
+thiserror = "2"
 tokio = "1"
+toml = "0.8"
 tokio-stream = "0.1"
 uuid = { version = "1", features = ["serde"] }
