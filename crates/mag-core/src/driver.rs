@@ -436,7 +436,9 @@ impl SessionDriver {
     ///   tool name with no registered plugin is skipped with a warn log — the
     ///   facade would reject the whole set for referencing a tool outside its
     ///   registry. An agent entry with no tool list imposes no constraint and
-    ///   leaves the current surface untouched.
+    ///   leaves the current surface untouched; an explicit `tools = []` clears
+    ///   the surface (an empty replacement set passes facade admission — its
+    ///   backing check is vacuous).
     ///
     /// Out of scope on the current agent-lib reconfigure surface (documented
     /// for M3-R): the approval policy is baked into the agent at build time
@@ -501,13 +503,14 @@ impl SessionDriver {
             }
         }
 
-        let wanted: Vec<&str> = agent_config
-            .tools()
-            .iter()
-            .filter(|tool| tool.is_enabled())
-            .map(|tool| tool.name())
-            .collect();
-        if !wanted.is_empty() {
+        let wanted: Option<Vec<&str>> = agent_config.tools_list().map(|tools| {
+            tools
+                .iter()
+                .filter(|tool| tool.is_enabled())
+                .map(|tool| tool.name())
+                .collect()
+        });
+        if let Some(wanted) = wanted {
             let mut declarations = Vec::new();
             for name in wanted {
                 match self
@@ -1236,6 +1239,40 @@ enabled = false
                 .map(|tool| tool.name.as_str())
                 .collect();
             assert_eq!(names, vec!["read_file", "list_dir", "grep", "shell"]);
+        });
+    }
+
+    /// An explicit `tools = []` on the bound entry clears the session's tool
+    /// surface: the replacement set is empty (facade admission is vacuous for
+    /// zero declarations), unlike an absent `tools` key which leaves the
+    /// surface untouched.
+    #[test]
+    fn apply_config_clears_the_surface_on_an_explicit_empty_tool_list() {
+        driver_test_runtime().block_on(async {
+            use mag_config::{ConfigDto, ConfigSnapshot};
+
+            let client =
+                FakeLlmClient::scripted(vec![text_stream_with_usage(&["ok"], usage(1, 1))]);
+            let mut driver = driver_for_test(client.clone());
+            let dto = ConfigDto::parse_str(
+                r#"
+[agents.default]
+tools = []
+"#,
+            )
+            .expect("config parses");
+            let snapshot = ConfigSnapshot::resolve(&dto, 1).expect("config resolves");
+
+            driver.apply_config(session_id(), &snapshot);
+            drive_one_turn(&mut driver).await;
+
+            let requests = client.stream_requests();
+            assert_eq!(requests.len(), 1);
+            assert!(
+                requests[0].tools.is_empty(),
+                "explicit empty list exposes no tools: {:?}",
+                requests[0].tools
+            );
         });
     }
 

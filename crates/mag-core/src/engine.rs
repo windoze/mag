@@ -3285,6 +3285,38 @@ tools = ["read_file"]
         assert_eq!(tool_names, vec!["read_file"]);
     }
 
+    /// An explicit `tools = []` on the bound entry builds the session with an
+    /// empty tool surface — a real constraint, distinct from an absent
+    /// `tools` key (unconstrained).
+    #[tokio::test]
+    async fn explicit_empty_tool_list_builds_a_tool_less_session() {
+        let (_dir, engine, fake) = engine_with_config(
+            r#"
+[agents.default]
+tools = []
+"#,
+            vec![text_stream_with_usage(&["ok"], usage())],
+        );
+        let session = engine
+            .create_session(session_config("fake", "fake-chat"))
+            .await
+            .expect("create session");
+        let mut events = engine.subscribe(Some(session));
+        engine
+            .send_message(session, UserInput::text("hi"))
+            .await
+            .expect("send message");
+        collect_until_terminal(&mut events).await;
+
+        let requests = fake.stream_requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].tools.is_empty(),
+            "explicit empty list exposes no tools: {:?}",
+            requests[0].tools
+        );
+    }
+
     /// A session created with `provider = "reviewer"` binds the
     /// `agents.reviewer` entry, and `apply_config` reconfigures it from that
     /// same bound entry.

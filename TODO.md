@@ -780,12 +780,90 @@ GUI/web/CLI 无需感知多个会话通道。
     已修）4) `cargo test --workspace` ✅（全部 ok，0 失败，1 ignored 为既有 zed 联调测试）
     5) `cargo doc --no-deps --workspace` ✅（0 warning）。
 
-### M3-R [TODO] M3 review
+### M3-R [DONE] M3 review
 
 - **实现要求**：对照 `docs/CLI.md` §4 全节检查：DTO↔DO 双向无损、快照隔离（update 不影响已钉住会话）、
   write-through 原子性、watch 回环防护、turn-complete 边界语义、secret 不物化不输出、GUI/web 可用性
   （四方法 + 事件足以驱动配置 UI）。发现问题直接修复并补测试。
 - **验证条件**：默认验证序列全过；完成记录列出 review 结论。
+
+  **完成记录**（2026-07-23）：
+  - **review 方法**：通读 M3 全部六个提交的 diff 与当前源码（mag-config 五模块、mag-core
+    `config.rs`/`turn_complete.rs`/`assembly.rs` 及 engine/driver/session 接线、mag-service 契约 diff、
+    bin `main.rs`），逐条对照 `docs/CLI.md` §4.1–§4.6 与决策 D2/D4。
+  - **检查点结论（逐项）**：
+    1. **DTO↔DO 双向无损** ✅——`resolve`/`project` 对称，raw `Option` 字段保留（未设置的键投影后仍
+       未设置，无幽灵节）；implicit tool 节点不回投；roundtrip 测试（`dto_do_dto_round_trip_is_lossless`
+       等）覆盖；secret 全程保持 `SecretRef` 引用形态，DO→DTO→TOML 序列化仍为 `{env=...}`/
+       `{keyring=...}` 引用字样。
+    2. **快照隔离** ✅——会话钉住 `Arc<ConfigSnapshot>`（create/resume 时 `current()` 廉价克隆），
+       节点构建后不可变，update 换根不影响旧图；`snapshot_isolation_keeps_pinned_snapshot_unchanged`、
+       `update_swaps_the_snapshot_and_persists_the_file`（pinned 句柄原值断言）覆盖。
+    3. **write-through 原子性** ✅——`save_atomic` 同目录临时文件 + write_all + sync_all + rename，
+       失败清理临时文件；`ConfigService::update` 先落盘后换根，写盘失败不换快照、不发信号
+       （`update_keeps_the_snapshot_and_emits_nothing_when_the_write_fails`）；写者全程持写锁串行化，
+       revision/文件/内存快照三者一致。
+    4. **watch 回环防护** ✅（已降级，记录完整）——notify 离线不可拉取，降级为仅显式 reload；降级原因
+       与 watcher 落地时的回环防护要求（去抖 ~300ms + 自写指纹去重）写在 `config.rs` 模块 rustdoc 与
+       M3-3 完成记录；仅显式 reload 时回环不可能发生，降级可接受。
+    5. **turn-complete 边界语义** ✅——`run_turn` 两条终态路径（stream 建立失败早退 + 主循环终态）在
+       终态事件发出、stream 借用释放后各发一次 `TurnSummary`（committed=快照落库后，cancel/失败=归位
+       后）；listener 经 `catch_unwind` 隔离（panicking listener 不饿死后续 listener 的测试）；apply 在
+       turn 边界（run_done 回收 driver 处先于 deferred 命令重放补应用）、Idle 立即（`ApplyConfig` 命令
+       即服务即应用）、在飞 run 绝不 mid-turn 变更（engine e2e
+       `apply_config_during_run_lands_at_the_turn_boundary`：首请求旧 model、次请求新 model）。
+    6. **secret 不物化不输出** ✅——取值只在装配 `ProviderConfig` 最后一刻（`resolve_provider_secret`
+       惰性解析默认 agent 的 provider）；`EngineError::Secret` 只带 provider 名 + 引用名字样；
+       `get_config` 投影引用形态；测试断言错误消息不含 secret 物质（`!message.contains("sk-")`）。
+    7. **GUI/web 可用性** ✅（一处确认偏差）——四方法 + `ConfigChanged{revision}` 足以驱动配置 UI
+       （读 `get_config`、写 `update_config`、刷新靠事件）。确认偏差：§4.3 草稿的
+       `ConfigView`（含 revision）与 `update_config/reload_config -> Result<u64>` 按 M3-4 任务书签名
+       落地为 `ConfigDto` + `Result<(), ServiceError>`，revision 经 `ConfigChanged` 事件获得（M3-4
+       决策②③已记录）；`ConfigPatch` 节级替换简化为整文档替换（GUI 读-改-写全文档，能力上是超集）。
+       如需「启动即知当前 revision」，可在后续里程碑以向后兼容新增方法补上（本 review 不动冻结契约）。
+    8. **冻结契约只加不改** ✅——M3-4 diff 纯新增（四方法、`ConfigChanged` 双枚举变体、
+       `ServiceError::Config`），既有方法签名与事件语义未动；M3-5/M3-6 只动 mag-core 内部与 bin。
+  - **发现与修复**（1 项，已修并补测试）：**显式 `tools = []` 与缺失 `tools` 键被混为一谈**。
+    `SessionBinding::resolve` 用 `.filter(|names| !names.is_empty())` 把显式空列表折叠成「不约束」
+    （会话反而暴露全部注册工具），`driver::reconfig_requests` 用 `if !wanted.is_empty()` 跳过，导致
+    apply 无法把工具面收缩到零——两处都把 `None`（无 tools 键=不约束）与 `Some([])`（显式空=零工具）
+    混同。修复：`ResolvedAgent` 新增 `tools_list() -> Option<&[Arc<ResolvedTool>]>` 访问器保留区分
+    （`tools()` 维持折叠语义并在 rustdoc 指明）；binding 与 reconfig 改用 `tools_list()`——显式空列表
+    在建会话时投射为空工具面（`tool_surface` 本就正确处理 `Some(&[])`）、在 apply 时投射为空
+    declarations 的 `ReplaceToolSet`（agent-lib 准入对空集 vacuous 通过，已核
+    `facade::Agent::reconfigure` 与 `ReconfigRequest::validate` 只查重名与注册表背书）。新增测试 4
+    个：mag-config `explicit_empty_tool_list_is_distinct_from_no_tool_list`（含 roundtrip 保留
+    `Some(vec![])`）；mag-core `session_binding_distinguishes_an_explicit_empty_tool_list`、
+    `apply_config_clears_the_surface_on_an_explicit_empty_tool_list`、engine e2e
+    `explicit_empty_tool_list_builds_a_tool_less_session`。
+  - **已知限制确认清单**（逐条核对记录位置，确认完整、可接受）：
+    1. 文件 watch 降级为仅显式 reload——M3-3 完成记录 + `config.rs` 模块 rustdoc（含回环防护落地
+       要求）✅。
+    2. keyring secret 变体报明确 Unsupported（只实现 env）——M3-6 完成记录 + `assembly.rs` 模块
+       rustdoc/`EngineError::Secret` rustdoc/`resolve_provider_secret` 实现（错误带引用名不带值，
+       有测试）✅。
+    3. 审批策略/budget 烤在 agent build 时，reconfigure 只覆盖 SetModel/ReplaceToolSet；新会话
+       spawn 时拾取新绑定——M3-5「出范围」段 + M3-6 审批策略段 + `driver.rs::apply_config` rustdoc
+       「Out of scope」段 + `ApprovalOverrides::from_snapshot` rustdoc ✅。
+    4. `approval.timeout_secs` 未接线（agent-lib 无对应表面）——`ApprovalOverrides::from_snapshot`
+       rustdoc（注明留 M3-R）+ M3-6 完成记录 ✅，本 review 确认为 agent-lib 表面缺口，非 mag 侧缺陷。
+    5. deny tier 在注入 IpcApproval 下仍暂停到界面（agent-lib 语义）——`tool_surface` rustdoc +
+       M3-6 完成记录 ✅。
+    6. provider params / 多 provider 并行未消费（agent-lib 无对应表面/单共享 client 架构）——M3-6
+       完成记录（记给 M3-R/M4）✅；`ResolvedProvider::params` 在 DTO/DO/roundtrip 层完整保留，
+       仅装配层不消费。
+    7. （本 review 补充确认）`get_config` 不返回 revision、`update_config` 为整文档替换——M3-4
+       决策记录 ✅，见检查点 7。
+  - **依赖边界抽核**：`cargo tree -p mag-config -e normal --depth 1` 仅 serde/thiserror/toml；
+    mag-service 无 agent-lib/mag-core——硬约束满足。
+  - **门禁结果**：1) `cargo fmt --all -- --check` ✅（本次修复初检 1 处 diff，`cargo fmt --all`
+    修复后复检通过）2) `cargo test -p mag-config` ✅（40 passed，含新增 1）与
+    `cargo test -p mag-core` ✅（96 passed，含新增 3）3) `cargo clippy --all-targets -- -D warnings`
+    ✅ 4) `cargo test --workspace` ✅（全部测试目标 ok，0 失败，1 ignored 为既有 zed 联调测试）
+    5) `cargo doc --no-deps --workspace` ✅（0 warning）。
+  - **review 结论**：M3 六个任务实现与 `docs/CLI.md` §4 全节一致，决策 D2（钉住 + 显式 apply）与
+    D4（DTO/DO 分层）落地正确；发现 1 处语义缺陷（显式空工具列表）已修复并补 4 个测试；全部已知
+    限制均有完整记录且属外部环境约束（agent-lib 表面/离线依赖），可接受。**M3 通过**。
 
 ---
 

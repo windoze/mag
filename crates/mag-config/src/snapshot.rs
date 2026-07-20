@@ -435,8 +435,21 @@ impl ResolvedAgent {
     /// sets no tool list). Explicit overrides share the `Arc` with
     /// [`ConfigSnapshot::tools`]; names without an override share a
     /// synthesized default node per name.
+    ///
+    /// This accessor collapses "no `tools` key" and an explicit `tools = []`
+    /// into the same empty slice; use [`tools_list`](Self::tools_list) when
+    /// the distinction matters (an absent list imposes no constraint, an
+    /// explicit empty list constrains the agent to *no* tools).
     pub fn tools(&self) -> &[Arc<ResolvedTool>] {
         self.tools.as_deref().unwrap_or(&[])
+    }
+
+    /// The tool list exactly as configured: `None` when the DTO sets no
+    /// `tools` key (the agent imposes no tool constraint), `Some` — possibly
+    /// empty — when the key is present. An explicit `tools = []` therefore
+    /// reads as "expose no tools", not "unconstrained".
+    pub fn tools_list(&self) -> Option<&[Arc<ResolvedTool>]> {
+        self.tools.as_deref()
     }
 
     /// System prompt override, when configured.

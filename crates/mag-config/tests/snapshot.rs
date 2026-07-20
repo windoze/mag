@@ -174,6 +174,38 @@ fn dto_do_dto_round_trip_is_lossless() {
 }
 
 #[test]
+fn explicit_empty_tool_list_is_distinct_from_no_tool_list() {
+    let dto = ConfigDto::parse_str(
+        r#"
+[agents.bare]
+
+[agents.empty]
+tools = []
+"#,
+    )
+    .expect("parse");
+    let snapshot = ConfigSnapshot::resolve(&dto, 1).expect("resolve");
+
+    // No `tools` key: unconstrained (`None`); the slice accessor serves empty.
+    let bare = snapshot.agent("bare").expect("agents.bare");
+    assert_eq!(bare.tools_list(), None);
+    assert!(bare.tools().is_empty());
+
+    // Explicit `tools = []`: a real constraint to *no* tools.
+    let empty = snapshot.agent("empty").expect("agents.empty");
+    assert_eq!(empty.tools_list(), Some(&[][..]));
+
+    // The distinction survives projection (lossless round-trip).
+    let projected = snapshot.project();
+    assert_eq!(projected.agent("bare").and_then(|a| a.tools.clone()), None);
+    assert_eq!(
+        projected.agent("empty").and_then(|a| a.tools.clone()),
+        Some(Vec::new())
+    );
+    assert_eq!(projected, dto);
+}
+
+#[test]
 fn dangling_provider_reference_reports_field_path() {
     let mut dto = ConfigDto::default();
     dto.agents.insert(

@@ -382,16 +382,13 @@ impl SessionBinding {
         };
         let entry = snapshot.agent(&agent_name);
 
-        let tools = entry
-            .map(|agent| {
-                agent
-                    .tools()
-                    .iter()
-                    .filter(|tool| tool.is_enabled())
-                    .map(|tool| tool.name().to_owned())
-                    .collect::<Vec<_>>()
-            })
-            .filter(|names| !names.is_empty());
+        let tools = entry.and_then(|agent| agent.tools_list()).map(|tools| {
+            tools
+                .iter()
+                .filter(|tool| tool.is_enabled())
+                .map(|tool| tool.name().to_owned())
+                .collect::<Vec<_>>()
+        });
         let budget = config
             .budget
             .or_else(|| entry.and_then(|agent| agent.budget()).map(session_budget))
@@ -418,6 +415,9 @@ impl SessionBinding {
     }
 
     /// The bound entry's enabled tool list, when it constrains the surface.
+    /// `Some(&[])` is a real constraint (an explicit `tools = []` exposes no
+    /// tools); `None` means the entry sets no `tools` key and the surface is
+    /// unconstrained.
     pub(crate) fn tools(&self) -> Option<&[String]> {
         self.tools.as_deref()
     }
@@ -817,5 +817,30 @@ budget = { max_steps = 5 }
         assert_eq!(binding.agent_name(), "default");
         assert_eq!(binding.model(), None);
         assert_eq!(binding.budget().and_then(|b| b.max_tokens), Some(7));
+    }
+
+    /// An explicit `tools = []` constrains the session to *no* tools
+    /// (`Some(&[])`), while an absent `tools` key leaves the surface
+    /// unconstrained (`None`) — the two are not the same configuration.
+    #[test]
+    fn session_binding_distinguishes_an_explicit_empty_tool_list() {
+        let snapshot = snapshot(
+            r#"
+[agents.default]
+
+[agents.empty]
+tools = []
+"#,
+        );
+
+        let binding = SessionBinding::resolve(&session_config("default", "m"), Some(&snapshot));
+        assert_eq!(binding.tools(), None, "no tools key: unconstrained");
+
+        let binding = SessionBinding::resolve(&session_config("empty", "m"), Some(&snapshot));
+        assert_eq!(
+            binding.tools(),
+            Some(&[][..]),
+            "explicit empty list: no tools"
+        );
     }
 }
