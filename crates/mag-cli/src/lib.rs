@@ -16,11 +16,11 @@ use std::sync::Arc;
 
 use futures::{Stream, StreamExt};
 use mag_service::{
-    ApprovalDecisionWire, ApprovalRequirementWire, InteractionKindWire, InteractionOrigin,
-    InteractionResponseWire, MagService, PermissionCategoryWire, PermissionDecisionWire,
-    PermissionRiskWire, RequestId, RoutingMode, RunErrorKind, ServiceError, ServiceEvent,
-    SessionConfig, SessionId, SessionInfo, SourceInfo, SourceKindWire, StepIdWire, ToolCallIdWire,
-    UserInput,
+    ApprovalDecisionWire, ApprovalRequirementWire, ConfigDto, InteractionKindWire,
+    InteractionOrigin, InteractionResponseWire, MagService, PermissionCategoryWire,
+    PermissionDecisionWire, PermissionRiskWire, RequestId, RoutingMode, RunErrorKind, ServiceError,
+    ServiceEvent, SessionConfig, SessionId, SessionInfo, SourceInfo, SourceKindWire, StepIdWire,
+    ToolCallIdWire, UserInput,
 };
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, Stdout};
 use tokio::sync::{Mutex, mpsc};
@@ -590,6 +590,7 @@ where
             }
             Ok(LineOutcome::Continue)
         }
+        "/config" => handle_config_command(service, output, parts).await,
         "/help" => {
             if parts.next().is_some() {
                 write_line(output, "[error] usage: /help\n").await?;
@@ -597,7 +598,7 @@ where
             }
             write_line(
                 output,
-                "commands: /new, /sessions, /resume <id>, /delete <id>, /cancel, /sources, /help, /quit\n",
+                "commands: /new, /sessions, /resume <id>, /delete <id>, /cancel, /sources, /config <show|reload|apply>, /help, /quit\n",
             )
             .await?;
             Ok(LineOutcome::Continue)
@@ -606,6 +607,67 @@ where
             write_line(output, &format!("[error] unknown command `{command}`\n")).await?;
             Ok(LineOutcome::Continue)
         }
+    }
+}
+
+async fn handle_config_command<W>(
+    service: &Arc<dyn MagService>,
+    output: &SharedOutput<W>,
+    mut parts: std::str::SplitWhitespace<'_>,
+) -> Result<LineOutcome, CliError>
+where
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    let Some(subcommand) = parts.next() else {
+        write_line(output, "[error] usage: /config <show|reload|apply>\n").await?;
+        return Ok(LineOutcome::Continue);
+    };
+    if parts.next().is_some() {
+        write_line(output, "[error] usage: /config <show|reload|apply>\n").await?;
+        return Ok(LineOutcome::Continue);
+    }
+
+    match subcommand {
+        "show" => match service.get_config().await {
+            Ok(config) => render_config(output, &config).await?,
+            Err(error) => write_line(output, &format!("[error] {error}\n")).await?,
+        },
+        "reload" => match service.reload_config().await {
+            Ok(()) => write_line(output, "[config reloaded]\n").await?,
+            Err(error) => write_line(output, &format!("[error] {error}\n")).await?,
+        },
+        "apply" => match service.apply_config().await {
+            Ok(()) => {
+                write_line(
+                    output,
+                    "[config apply requested; changes will apply at each session's next turn boundary]\n",
+                )
+                .await?
+            }
+            Err(error) => write_line(output, &format!("[error] {error}\n")).await?,
+        },
+        _ => write_line(output, "[error] usage: /config <show|reload|apply>\n").await?,
+    }
+    Ok(LineOutcome::Continue)
+}
+
+async fn render_config<W>(
+    output: &SharedOutput<W>,
+    config: &ConfigDto,
+) -> Result<(), std::io::Error>
+where
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    match config.to_string_pretty() {
+        Ok(mut toml) => {
+            if toml.is_empty() {
+                toml.push_str("# empty config\n");
+            } else if !toml.ends_with('\n') {
+                toml.push('\n');
+            }
+            write_line(output, &toml).await
+        }
+        Err(error) => write_line(output, &format!("[error] config serialization: {error}\n")).await,
     }
 }
 
@@ -967,6 +1029,9 @@ where
         }
         ServiceEvent::PivotDropped { id, reason } => {
             write_line(output, &format!("\n[pivot dropped {id}] {reason}\n")).await?;
+        }
+        ServiceEvent::ConfigChanged { revision } => {
+            write_line(output, &format!("\n[config changed revision={revision}]\n")).await?;
         }
         _ => {}
     }

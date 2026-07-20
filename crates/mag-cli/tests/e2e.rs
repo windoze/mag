@@ -1,7 +1,7 @@
 //! Pipe-driven end-to-end tests for the minimal `mag-cli` REPL.
 //!
 //! The tests inject a scripted [`MagService`] and drive [`Cli::run_with_io`] with
-//! in-memory stdin/stdout pipes. They cover the M6-1/M6-2 contracts without a
+//! in-memory stdin/stdout pipes. They cover the M6 CLI contracts without a
 //! real terminal, network, credentials, or LLM.
 
 use std::sync::{Arc, Mutex};
@@ -53,6 +53,9 @@ struct ScriptedService {
     list_sessions_calls: Arc<Mutex<usize>>,
     list_sources_calls: Arc<Mutex<usize>>,
     probe_calls: Arc<Mutex<usize>>,
+    get_config_calls: Arc<Mutex<usize>>,
+    reload_config_calls: Arc<Mutex<usize>>,
+    apply_config_calls: Arc<Mutex<usize>>,
     create_count: Arc<Mutex<usize>>,
 }
 
@@ -70,6 +73,9 @@ impl ScriptedService {
             list_sessions_calls: Arc::new(Mutex::new(0)),
             list_sources_calls: Arc::new(Mutex::new(0)),
             probe_calls: Arc::new(Mutex::new(0)),
+            get_config_calls: Arc::new(Mutex::new(0)),
+            reload_config_calls: Arc::new(Mutex::new(0)),
+            apply_config_calls: Arc::new(Mutex::new(0)),
             create_count: Arc::new(Mutex::new(0)),
         }
     }
@@ -110,6 +116,18 @@ impl ScriptedService {
         Arc::clone(&self.probe_calls)
     }
 
+    fn get_config_calls(&self) -> Arc<Mutex<usize>> {
+        Arc::clone(&self.get_config_calls)
+    }
+
+    fn reload_config_calls(&self) -> Arc<Mutex<usize>> {
+        Arc::clone(&self.reload_config_calls)
+    }
+
+    fn apply_config_calls(&self) -> Arc<Mutex<usize>> {
+        Arc::clone(&self.apply_config_calls)
+    }
+
     fn emit_interaction_script(&self, id: SessionId) {
         let call_id = ToolCallIdWire::parse_str(CALL_APPROVAL).expect("valid call id");
         let _ = self.events.send(ServiceEvent::InteractionRequested {
@@ -144,6 +162,23 @@ impl ScriptedService {
             origin: InteractionOrigin::default(),
         });
     }
+}
+
+fn scripted_config() -> ConfigDto {
+    ConfigDto::parse_str(
+        r#"
+[providers.openai]
+wire = "openai"
+
+[agents.default]
+provider = "openai"
+model = "gpt-5-codex"
+
+[tools.shell]
+approval = "ask"
+"#,
+    )
+    .expect("scripted config parses")
 }
 
 fn scripted_session_config(provider: &str, model: &str) -> SessionConfig {
@@ -341,9 +376,8 @@ impl MagService for ScriptedService {
     }
 
     async fn get_config(&self) -> Result<ConfigDto, ServiceError> {
-        Err(ServiceError::Unsupported {
-            operation: "get_config".to_owned(),
-        })
+        *self.get_config_calls.lock().expect("lock") += 1;
+        Ok(scripted_config())
     }
 
     async fn update_config(&self, _config: ConfigDto) -> Result<(), ServiceError> {
@@ -353,15 +387,16 @@ impl MagService for ScriptedService {
     }
 
     async fn reload_config(&self) -> Result<(), ServiceError> {
-        Err(ServiceError::Unsupported {
-            operation: "reload_config".to_owned(),
-        })
+        *self.reload_config_calls.lock().expect("lock") += 1;
+        let _ = self
+            .events
+            .send(ServiceEvent::ConfigChanged { revision: 42 });
+        Ok(())
     }
 
     async fn apply_config(&self) -> Result<(), ServiceError> {
-        Err(ServiceError::Unsupported {
-            operation: "apply_config".to_owned(),
-        })
+        *self.apply_config_calls.lock().expect("lock") += 1;
+        Ok(())
     }
 }
 
@@ -699,4 +734,56 @@ async fn slash_commands_call_the_matching_service_methods() {
         cancels.lock().expect("lock").clone(),
         vec![SessionId::parse_str(SESSION_B).unwrap()]
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_commands_call_service_methods_and_render_changes() {
+    let service = Arc::new(ScriptedService::new());
+    let get_config_calls = service.get_config_calls();
+    let reload_config_calls = service.reload_config_calls();
+    let apply_config_calls = service.apply_config_calls();
+    let (mut stdin_writer, mut stdout_reader, run) = spawn_cli(service);
+    let mut output = String::new();
+
+    read_until(&mut stdout_reader, &mut output, "[session").await;
+    stdin_writer
+        .write_all(b"/config show\n")
+        .await
+        .expect("request config show");
+    read_until(&mut stdout_reader, &mut output, "model = \"gpt-5-codex\"").await;
+    assert!(output.contains("[providers.openai]"), "{output}");
+    assert!(output.contains("wire = \"openai\""), "{output}");
+    assert!(output.contains("[tools.shell]"), "{output}");
+    assert!(output.contains("approval = \"ask\""), "{output}");
+
+    stdin_writer
+        .write_all(b"/config reload\n")
+        .await
+        .expect("request config reload");
+    read_until(&mut stdout_reader, &mut output, "[config reloaded]").await;
+    read_until(
+        &mut stdout_reader,
+        &mut output,
+        "[config changed revision=42]",
+    )
+    .await;
+
+    stdin_writer
+        .write_all(b"/config apply\n")
+        .await
+        .expect("request config apply");
+    read_until(&mut stdout_reader, &mut output, "next turn boundary").await;
+
+    stdin_writer.write_all(b"/quit\n").await.expect("quit CLI");
+    stdin_writer.shutdown().await.expect("close scripted stdin");
+
+    let result = tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("CLI run must not hang")
+        .expect("CLI task must join");
+    result.expect("CLI run must succeed");
+
+    assert_eq!(*get_config_calls.lock().expect("lock"), 1);
+    assert_eq!(*reload_config_calls.lock().expect("lock"), 1);
+    assert_eq!(*apply_config_calls.lock().expect("lock"), 1);
 }

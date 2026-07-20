@@ -1282,7 +1282,7 @@ GUI/web/CLI 无需感知多个会话通道。
     `cargo clippy --all-targets -- -D warnings` ✅ 4) `cargo test --workspace` ✅（全绿，1 ignored 为既有 zed 联调测试）
     5) `cargo doc --no-deps --workspace` ✅（0 warning）。
 
-### M6-4 [TODO] `/config` 命令
+### M6-4 [DONE] `/config` 命令
 
 - **上下文**：`docs/CLI.md` §2 + §4（决策 D2 生效时机）。
 - **实现要求**：
@@ -1292,6 +1292,27 @@ GUI/web/CLI 无需感知多个会话通道。
     `ConfigChanged{revision}` 事件渲染一行提示。
 - **验证条件**：e2e：三个子命令调用正确 service 方法并渲染预期输出；`ConfigChanged` 事件到达时打印。
   默认验证序列全过。
+
+  **完成记录**（2026-07-20）：
+  - 实现要点：`mag-cli` 补齐 `/config <show|reload|apply>` 子命令并纳入 `/help`。`/config show` 调
+    `MagService::get_config()`，直接使用 `mag-service::ConfigDto` re-export 的 `to_string_pretty()` 输出 TOML
+    形态，secret 保持 DTO 引用形态、不会物化；空配置输出 TOML 注释 `# empty config`，避免无可见反馈。
+    `/config reload` 调 `reload_config()` 并打印 `[config reloaded]`；因 service 契约返回 `()` 不携带 revision，
+    新 revision 通过事件流的 `ConfigChanged{revision}` 一行提示体现。`/config apply` 调 `apply_config()` 并打印
+    “changes will apply at each session's next turn boundary” 的 D2 生效时机提示。
+  - 事件渲染：`ServiceEvent::ConfigChanged{revision}` 新增渲染为
+    `[config changed revision=<n>]`，全局订阅流到达时即可提示配置快照 revision 更新。
+  - 测试：`crates/mag-cli/tests/e2e.rs` 的 scripted `Arc<dyn MagService>` 新增配置方法成功路径、调用计数与
+    `ConfigChanged{revision:42}` 事件；新增
+    `config_commands_call_service_methods_and_render_changes`，逐步管道驱动 `/config show`、`/config reload`、
+    `/config apply`，断言 TOML 输出包含 provider/agent/tool 配置、三个 service 方法各调用一次、reload 成功提示
+    与 `ConfigChanged` revision 提示均出现、apply 提示包含下一 turn 边界语义。
+  - 依赖边界：`crates/mag-cli/Cargo.toml` 未变；`mag-cli` 仍只直接依赖 `mag-service` +
+    `futures`/`tokio`/`rustyline`，未直接依赖 `mag-core` / `agent-lib` / `mag-config`。
+  - 门禁结果：1) `cargo fmt --all -- --check` 初次发现 rustfmt diff，`cargo fmt --all` 修复后复检 ✅
+    2) `cargo test -p mag-cli` ✅（8 passed）3) `cargo clippy --all-targets -- -D warnings` ✅
+    4) `cargo test --workspace` ✅（全绿，1 ignored 为既有 zed 联调测试）5)
+    `cargo doc --no-deps --workspace` ✅（0 warning）。
 
 ### M6-5 [TODO] bin 装配 + 端到端验证
 
