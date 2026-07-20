@@ -6,10 +6,28 @@
   :root {
     --background: 220 24% 98%;
     --foreground: 224 28% 12%;
+    --card: 0 0% 100%;
+    --card-foreground: 224 28% 12%;
+    --muted: 220 18% 94%;
+    --muted-foreground: 223 10% 42%;
+    --accent: 220 18% 91%;
+    --accent-foreground: 224 28% 12%;
     --border: 220 16% 88%;
+    --input: 220 16% 84%;
     --primary: 224 76% 48%;
     --primary-foreground: 0 0% 100%;
+    --success: 156 64% 34%;
+    --success-foreground: 0 0% 100%;
+    --warning: 35 92% 48%;
+    --warning-foreground: 30 28% 10%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+    --ring: 224 76% 48%;
     --radius: 0.75rem;
+  }
+
+  * {
+    @apply border-border;
   }
 
   body {

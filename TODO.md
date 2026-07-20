@@ -369,7 +369,7 @@ CI 承载（引入 CI 时列为第一批）；⑥tool 输出为 agent-lib Conten
 - Vitest 新增 JSON fixture（scripted history + Event 流），覆盖全 Command 路由映射、Bearer 注入、fetch-SSE 解析、409 typed error、流式 text 合并、工具状态迁移、delegation message/status、pending 队列/提交、pivot notice、历史+增量去重、重连全量对齐。
 - 验证通过：`cargo fmt --all`、`npx --yes pnpm@10.14.0 format:write`、`npx --yes pnpm@10.14.0 --filter @mag/client build`、`npx --yes pnpm@10.14.0 --filter @mag/client test`、`cargo fmt --all -- --check`、`npx --yes pnpm@10.14.0 format`、`npx --yes pnpm@10.14.0 lint`、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`、`npx --yes pnpm@10.14.0 -r test`、`npx --yes pnpm@10.14.0 -r build`、`cargo doc --no-deps --workspace`。
 
-### W3-3 [TODO] `@mag/ui` 核心组件 + Storybook
+### W3-3 [DONE] `@mag/ui` 核心组件 + Storybook
 
 - **上下文**：`docs/WEB.md` §5.2/§5.4/§6.3。
 - **实现要求**：纯 props+回调组件：`ThreadView`（消息流 + Markdown 渲染 + 流式增量）、
@@ -379,6 +379,15 @@ CI 承载（引入 CI 时列为第一批）；⑥tool 输出为 agent-lib Conten
   Tailwind + shadcn 落地，设计 token 集中。
 - **验证条件**：Storybook 构建绿；组件交互测试（交互卡提交回调载荷正确）；`pnpm -r test` /
   `pnpm -r build` 绿。
+
+完成记录（2026-07-21）：
+
+- `@mag/ui` 扩展集中设计 token（card/muted/accent/input/ring/success/warning/destructive 等）与 Button primitive 变体，保持 Tailwind + shadcn 风格，不引入新的运行时主题包。
+- 新增纯 props + 回调组件：`ThreadView`（消息流、Markdown-lite 渲染、流式标记、tool/interaction/delegation/pivot/run error 投影）、`ToolCallCard`（折叠详情 + started/finished/denied/cancelled/failed 五状态徽标）、`InteractionCard`（Approval/Question/Choice/Permission，含 origin 徽标与已决只读态）、`Composer`（idle/running pivot/pending 提示/cancel 状态）、`SessionSidebar`（New/Sources/Config 固定入口、cwd 分组、状态徽标、删除回调）。
+- `@mag/ui` 未依赖 `@mag/client`/`@mag/protocol`，通过自有 view props 保持组件库 transport-free；交互提交 payload 结构与 wire 同形，审批响应沿用既有 CLI 约定用 `call_id` 作为占位 `step_id`。
+- Storybook 覆盖核心视觉态：工具五状态、交互四形态与只读态、composer idle/running/pending/disabled、sidebar 分组/空态/三状态徽标、thread 流式消息/Markdown/附件/delegate/pivot/run error。Storybook Vite 配置窄范围过滤 Storybook core 自身 `EVAL` warning，构建无项目 warning。
+- 组件交互测试覆盖 `InteractionCard` Approval/Question/Choice/Permission 提交回调 payload（含 choice 零基 index、permission deny reason、approval `step_id = call_id`）。
+- 验证通过：`npx --yes pnpm@10.14.0 --filter @mag/ui build`、`npx --yes pnpm@10.14.0 --filter @mag/ui test`、`npx --yes pnpm@10.14.0 --filter @mag/ui build-storybook`、`cargo fmt --all`、`npx --yes pnpm@10.14.0 format:write`、`cargo fmt --all -- --check`、`npx --yes pnpm@10.14.0 format`、`npx --yes pnpm@10.14.0 lint`、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`、`npx --yes pnpm@10.14.0 -r test`、`npx --yes pnpm@10.14.0 -r build`、`cargo doc --no-deps --workspace`。
 
 ### W3-4 [TODO] app-web 壳：对话闭环
 
