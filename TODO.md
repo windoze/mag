@@ -162,12 +162,38 @@
 - 新增 `update-config-command.json` fixture：Rust 侧通过 `Command` serde roundtrip 校验，TS 侧通过 `satisfies`/编译期 fixture 校验协议类型可接受同形 JSON payload。
 - 验证通过：`cargo fetch`、`cargo fmt --all`、`cargo fmt --all -- --check`、`cargo test -p mag-service --features ts-export export_ts`、`cargo test -p mag-service update_config_protocol_fixture_round_trips`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy -p mag-service --features ts-export --all-targets -- -D warnings`、`cargo test --workspace`、`cargo doc --no-deps --workspace`、`npx --yes -p typescript@5.9.2 tsc --noEmit -p ui/packages/protocol/tsconfig.json`。
 
-### W1-R [TODO] W1 review
+### W1-R [DONE] W1 review
 
 - **实现要求**：对照 `docs/WEB.md` §3 P1–P4 与 §2.4 逐项核查：契约只加不改（mag-acp/mag-cli 不受
   影响）；HistoryEntry 粒度（含 tool call）；SessionInfo 兼容；ts-rs 管线无手写漂移。发现问题直接
   修复并补测试。
 - **验证条件**：默认验证序列全过；完成记录列出 review 结论。
+
+**完成记录（2026-07-21）**：通读 W1-1..W1-4 全部 diff（`149dffb`/`6a1803d`/`137ec20`+`7677250`/
+`a168f58`）逐项核查，结论 **W1 放行进入 W2，无 bug 级发现、无需修复项**：
+
+- **P1** ✅：Command 五变体（PivotMessage/GetConfig/UpdateConfig/ReloadConfig/ApplyConfig）serde 惯例
+  一致；`ServiceError::kind()` 7 变体全 snake_case 且与 serde tag 互证；仓内无 `mag_service::Command`
+  dispatcher 消费点需同步。
+- **P3** ✅：`HistoryEntry` `#[non_exhaustive]` 四变体（含 ToolCall/Delegation，Q1 拍板）；Engine
+  实现未知 session→SessionNotFound、无快照→空；全链路测试（工具+委派→持久化→跨 Engine 重启还原）
+  覆盖顺序/终态/内容。
+- **P4** ✅：SessionInfo 三字段全 `#[serde(default)]`，旧 JSON 兼容测试在；list_sessions 填真实值，
+  running/awaiting 断言在；时间戳毫秒一致。
+- **ts-rs** ✅：feature-gated（默认构建 0 引用，cargo tree 实测）；45 个生成文件覆盖 §2.4 全部 wire
+  类型，零手写；重生成零漂移（实测）；fixture 双侧互证 + `tsc --noEmit` 通过。
+- **只加不改** ✅：mag-acp/mag-cli 的改动全部是编译适配（新字段默认值/新 trait 方法 stub），两
+  interface 测试原样全过。
+- **门禁**：fmt/clippy(`-D warnings`)/workspace 29 套件全 ok/doc 全过（唯一 ignored 为既有真二进制
+  e2e 骨架）。
+
+**记录在案的偏差（不阻塞，随 W2/W5 跟踪）**：①history `UserMessage.attachments` 恒空——引擎尚不
+消费附件，W3 thread view 不应预期附件还原；②`DelegationTrace` 既有事件新增 `status`/`usage` 字段
+（兼容方向安全，序列化形状变化知会）；③history/标题投影对受损快照硬错误（单条坏记录可拖垮
+`GET /api/sessions`）且标题派生为全量投影——建议 W2/W5 加固（投影容错 + commit 时物化 title）；
+④DelegationStatusWire 无 Cancelled/Denied 终态（折叠为 Failed，表达力取舍）；⑤ts-rs 漂移门禁尚无
+CI 承载（引入 CI 时列为第一批）；⑥tool 输出为 agent-lib ContentBlock 裸 JSON，wire 稳定输出形态
+后续固化。
 
 ---
 
