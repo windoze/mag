@@ -336,11 +336,44 @@ GUI/web/CLI 无需感知多个会话通道。
     连跑 3 次无 flake）3) `cargo clippy --all-targets -- -D warnings` ✅ 4) `cargo test --workspace`
     ✅（全绿，无失败）5) `cargo doc --no-deps --workspace` ✅（0 warning）。
 
-### M2-R [TODO] M2 review
+### M2-R [DONE] M2 review
 
 - **实现要求**：对照 `docs/CLI.md` §3.3 检查：向后兼容（旧消费者不感知 origin 仍可用）、多 delegate
   并发交互不串号、rustdoc 完整。发现问题直接修复并补测试。
 - **验证条件**：默认验证序列全过；完成记录列出 review 结论。
+- 完成记录：
+  - **review 结论：通过，无问题，无修复项。** 通读 b092573（M2-1）与 01da54f（M2-2）全部 diff 并
+    对照 `docs/CLI.md` §3.3 决策 D5 逐项核查。
+  - 检查点 ① **向后兼容**：`origin` 在 wire `Event::InteractionRequested` 与 `ServiceEvent::
+    InteractionRequested` 双枚举上均为裸 `InteractionOrigin` + `#[serde(default)]`（default =
+    root：`delegate: None, depth: 0`）；旧 JSON（无 origin 键）反序列化为 root——两个枚举各有
+    专项测试（`interaction_requested_without_origin_deserializes_as_root`）；旧消费者读新 JSON
+    时 serde 默认忽略未知字段，不感知 origin 仍可用；`delegate` 带 `skip_serializing_if`，root
+    序列化为 `{"depth":0}` 且可解回 default（round-trip 测试覆盖）。§3.3 原文写
+    `Option<InteractionOrigin>`「之类」，实现取裸类型 + Default，语义等价（`None` ≈
+    `delegate: None`），rustdoc 已记录该取舍，不算偏差。
+  - 检查点 ② **双枚举一致性**：两枚举同步加字段、`From<Event> for ServiceEvent` 透传 origin，
+    service.rs 转换测试逐项断言。
+  - 检查点 ③ **多 delegate 并发不串号（RequestId 路由）**：生产路径 `driver.rs` `new`/`restore`
+    均把会话级唯一 `Arc<IpcApproval>` 注入 agent 的 `interaction_handler`，委派链全部交互汇入同一
+    实例；id 由实例级 `RequestIdSource` 单调铸造，pending map 按 id 存 oneshot 精确唤醒。测试
+    `concurrent_delegate_interactions_route_each_response_to_its_own_waiter` 双 delegate
+    （depth 1/2）并发暂停、乱序应答，断言各自 waiter 收到各自 decision 且 step_id/call_id 归位。
+  - 检查点 ④ **origin 映射正确性**：`interaction_origin_to_wire`——`None`→default（root）、
+    `Some`→delegate+depth；两侧 depth 均为 `u32`（M2-2 已顺手修正 M2-1 rustdoc 中「agent-lib
+    uses usize」的不准确表述）；单测 + 两级 delegate 集成测试（`Agent::worker()` +
+    `AgentBuilder::subagent` 走 agent-lib 公共 API）断言 root 订阅者收到
+    `origin.delegate == Some("reviewer")`、`depth == 1`，root 场景既有测试补强
+    `origin == default` / `is_root()` 断言。
+  - 检查点 ⑤ **rustdoc 完整**：模块级 D5 说明、`IpcApproval` 类型级路由保证、`respond` 路由
+    保证、wire 类型与字段级文档齐备；`cargo doc` 0 warning。
+  - 备注（非缺陷）：`InteractionOrigin::is_root()` 仅判 `delegate.is_none()`，理论上
+    `delegate: None, depth > 0` 会误判 root，但映射函数不可能产生该组合，接受。
+  - 门禁结果：1) `cargo fmt --all -- --check` ✅ 2) `cargo test -p mag-service` ✅（17 passed）
+    + `cargo test -p mag-core approval` ✅（17 passed）3) `cargo clippy --all-targets --
+    -D warnings` ✅（touch 后强制重检，非缓存）4) `cargo test --workspace` ✅（全绿，1 ignored
+    为既有 `#[ignore]` 联调测试）5) `cargo doc --no-deps --workspace` ✅（touch 强制重建 M2 涉及
+    两 crate，0 warning）。
 
 ---
 
