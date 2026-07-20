@@ -33,3 +33,4 @@ tokio-stream = "0.1"
 tower = "0.5"
 ts-rs = "12"
 uuid = { version = "1", features = ["serde"] }
+rust-embed = "8"

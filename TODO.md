@@ -241,7 +241,7 @@ CI 承载（引入 CI 时列为第一批）；⑥tool 输出为 agent-lib Conten
 - 聚焦测试覆盖：回环端口 server + 自写 chunked SSE 客户端验证事件帧格式/heartbeat；双连接广播；客户端断开后的订阅清理；直接有界队列溢出断连。
 - 验证通过：`cargo fmt --all`、`cargo test -p mag-web`、`cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`、`cargo doc --no-deps --workspace`。
 
-### W2-3 [TODO] token auth + 静态资源
+### W2-3 [DONE] token auth + 静态资源
 
 - **上下文**：`docs/WEB.md` §4（Q6 拍板）与 §10 D4（Q4：debug 目录/release 嵌入）。
 - **实现要求**：
@@ -254,6 +254,15 @@ CI 承载（引入 CI 时列为第一批）；⑥tool 输出为 agent-lib Conten
     index.html）。
 - **验证条件**：聚焦测试：正确/错误/缺失 token 三态；`--no-auth` 直通；非 loopback + `--no-auth`
   被忽略；占位页/静态文件 200；默认验证序列全过。
+
+完成记录（2026-07-21）：
+
+- `mag-web` 新增 `prepare_router`/`resolve_serve_options`，解析 `ServeOptions` 后暴露生成 token，供后续 bin 打印访问 URL；`serve()` 使用解析后的 router 与地址启动。
+- `/api/**` 改为独立 nested API router，并在 token 启用时套 Bearer auth middleware；缺失/错误 token 返回 401 `{kind:"unauthorized", message:"missing or invalid bearer token"}`，拒绝请求不会调用 `MagService`；静态资源与 `/` 不需要 auth。
+- token 三态完成：默认从 OS random 生成 UUID v4 形态 token；`TokenPolicy::Provided` 使用外部 token；loopback `TokenPolicy::Disabled` 直通；非 loopback + disabled 打印警告并强制生成 token。
+- 静态资源完成：debug 默认读 `ui/apps/web/dist/`（可由 `static_assets_dir` 覆盖），release 通过 `rust-embed` 嵌入同目录；`/`、静态文件和非 `/api` SPA 路径返回文件或 `index.html` fallback；缺少 `index.html` 时返回提示先 `pnpm build` 的友好占位页。
+- 聚焦测试覆盖：正确/错误/缺失 token、默认生成 token、`--no-auth` loopback 直通、非 loopback 忽略 `--no-auth`、静态资源无 auth、SPA fallback、缺失 dist 占位页。
+- 验证通过：`cargo fmt --all`、`cargo test -p mag-web`、`cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo check -p mag-web --release`、`cargo test --workspace`、`cargo doc --no-deps --workspace`。
 
 ### W2-4 [TODO] bin `mag --web` + 协议级 e2e
 

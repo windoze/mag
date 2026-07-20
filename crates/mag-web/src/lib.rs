@@ -9,8 +9,10 @@
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode, Uri, header},
+    middleware::{self, Next},
     response::{
         IntoResponse, Response,
         sse::{Event as SseEvent, Sse},
@@ -26,8 +28,10 @@ use serde::Serialize;
 use serde_json::Value;
 use std::{
     convert::Infallible,
+    fs,
+    io::{self, Read},
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    path::PathBuf,
+    path::{Path as FsPath, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -71,43 +75,167 @@ pub enum TokenPolicy {
     Disabled,
 }
 
+/// Router plus resolved options produced from [`ServeOptions`].
+pub struct PreparedRouter {
+    router: Router,
+    options: ResolvedServeOptions,
+}
+
+impl PreparedRouter {
+    /// Returns the resolved options, including any generated auth token.
+    pub const fn options(&self) -> &ResolvedServeOptions {
+        &self.options
+    }
+
+    /// Consumes the prepared value and returns the axum router.
+    pub fn into_router(self) -> Router {
+        self.router
+    }
+}
+
+/// Fully resolved serving options after applying auth and asset defaults.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedServeOptions {
+    address: SocketAddr,
+    auth_token: Option<String>,
+    static_assets: StaticAssets,
+}
+
+impl ResolvedServeOptions {
+    /// Returns the TCP address that should be bound.
+    pub const fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    /// Returns the bearer token when API auth is enabled.
+    pub fn auth_token(&self) -> Option<&str> {
+        self.auth_token.as_deref()
+    }
+
+    /// Returns whether API auth is enabled.
+    pub const fn auth_enabled(&self) -> bool {
+        self.auth_token.is_some()
+    }
+
+    /// Returns the filesystem asset directory when this build serves one.
+    pub fn static_assets_dir(&self) -> Option<&FsPath> {
+        match &self.static_assets {
+            StaticAssets::Directory(path) => Some(path.as_path()),
+            #[cfg(not(debug_assertions))]
+            StaticAssets::Embedded => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum StaticAssets {
+    Directory(PathBuf),
+    #[cfg(not(debug_assertions))]
+    Embedded,
+}
+
+#[derive(Clone)]
+struct AuthState {
+    token: Arc<str>,
+}
+
+/// Resolves serving options and builds the axum router.
+///
+/// # Errors
+///
+/// Returns an I/O error if the default random token cannot be generated.
+pub fn prepare_router(
+    service: Arc<dyn MagService>,
+    opts: ServeOptions,
+) -> io::Result<PreparedRouter> {
+    let options = resolve_serve_options(opts)?;
+    let router = router_with_resolved_options(service, options.clone(), SseConfig::default());
+
+    Ok(PreparedRouter { router, options })
+}
+
+/// Resolves auth policy, bind address, and static asset source from raw options.
+///
+/// # Errors
+///
+/// Returns an I/O error if token generation is required but the OS random source fails.
+pub fn resolve_serve_options(opts: ServeOptions) -> io::Result<ResolvedServeOptions> {
+    let address = SocketAddr::new(opts.host, opts.port);
+    let auth_token = resolve_auth_token(opts.host, opts.token_policy)?;
+    let static_assets = resolve_static_assets(opts.static_assets_dir);
+
+    Ok(ResolvedServeOptions {
+        address,
+        auth_token,
+        static_assets,
+    })
+}
+
 /// Runs the web adapter until the HTTP server exits.
 ///
 /// # Errors
 ///
 /// Returns the bind or server I/O error reported by Tokio/axum.
-pub async fn serve(service: Arc<dyn MagService>, opts: ServeOptions) -> std::io::Result<()> {
-    let address = SocketAddr::new(opts.host, opts.port);
+pub async fn serve(service: Arc<dyn MagService>, opts: ServeOptions) -> io::Result<()> {
+    let prepared = prepare_router(service, opts)?;
+    let address = prepared.options().address();
     let listener = tokio::net::TcpListener::bind(address).await?;
-    axum::serve(listener, router(service)).await
+    axum::serve(listener, prepared.into_router()).await
 }
 
-/// Builds the REST router for an injected [`MagService`].
+/// Builds an unauthenticated router for tests and trusted in-process callers.
 pub fn router(service: Arc<dyn MagService>) -> Router {
     router_with_sse_config(service, SseConfig::default())
 }
 
 fn router_with_sse_config(service: Arc<dyn MagService>, sse: SseConfig) -> Router {
-    let state = AppState { service, sse };
+    router_with_resolved_options(service, unauthenticated_options(), sse)
+}
 
-    Router::new()
-        .route("/api/sessions", get(list_sessions).post(create_session))
-        .route("/api/events", get(events))
-        .route("/api/sessions/{id}/resume", post(resume_session))
-        .route("/api/sessions/{id}", delete(delete_session))
-        .route("/api/sessions/{id}/history", get(get_session_history))
-        .route("/api/sessions/{id}/messages", post(send_message))
-        .route("/api/sessions/{id}/pivot", post(pivot_message))
-        .route("/api/sessions/{id}/cancel", post(cancel))
+fn router_with_resolved_options(
+    service: Arc<dyn MagService>,
+    options: ResolvedServeOptions,
+    sse: SseConfig,
+) -> Router {
+    let state = AppState {
+        service,
+        sse,
+        static_assets: options.static_assets.clone(),
+    };
+
+    let api = Router::new()
+        .route("/sessions", get(list_sessions).post(create_session))
+        .route("/events", get(events))
+        .route("/sessions/{id}/resume", post(resume_session))
+        .route("/sessions/{id}", delete(delete_session))
+        .route("/sessions/{id}/history", get(get_session_history))
+        .route("/sessions/{id}/messages", post(send_message))
+        .route("/sessions/{id}/pivot", post(pivot_message))
+        .route("/sessions/{id}/cancel", post(cancel))
         .route(
-            "/api/sessions/{id}/interactions/{request_id}",
+            "/sessions/{id}/interactions/{request_id}",
             post(respond_interaction),
         )
-        .route("/api/sources", get(list_sources))
-        .route("/api/sources/probe", post(probe_local_agents))
-        .route("/api/config", get(get_config).put(update_config))
-        .route("/api/config/reload", post(reload_config))
-        .route("/api/config/apply", post(apply_config))
+        .route("/sources", get(list_sources))
+        .route("/sources/probe", post(probe_local_agents))
+        .route("/config", get(get_config).put(update_config))
+        .route("/config/reload", post(reload_config))
+        .route("/config/apply", post(apply_config))
+        .fallback(api_not_found);
+
+    let api = match options.auth_token {
+        Some(token) => api.layer(middleware::from_fn_with_state(
+            AuthState {
+                token: Arc::from(token),
+            },
+            require_bearer_auth,
+        )),
+        None => api,
+    };
+
+    Router::new()
+        .nest("/api", api)
+        .fallback(static_asset)
         .with_state(state)
 }
 
@@ -115,6 +243,7 @@ fn router_with_sse_config(service: Arc<dyn MagService>, sse: SseConfig) -> Route
 struct AppState {
     service: Arc<dyn MagService>,
     sse: SseConfig,
+    static_assets: StaticAssets,
 }
 
 #[derive(Clone, Copy)]
@@ -130,6 +259,137 @@ impl Default for SseConfig {
             queue_capacity: 64,
         }
     }
+}
+
+fn unauthenticated_options() -> ResolvedServeOptions {
+    ResolvedServeOptions {
+        address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        auth_token: None,
+        static_assets: resolve_static_assets(None),
+    }
+}
+
+fn resolve_auth_token(host: IpAddr, policy: TokenPolicy) -> io::Result<Option<String>> {
+    let non_loopback = !host.is_loopback();
+    if non_loopback {
+        eprintln!(
+            "mag-web warning: binding non-loopback host {host}; bearer token auth is required"
+        );
+    }
+
+    match policy {
+        TokenPolicy::Generate => generate_token().map(Some),
+        TokenPolicy::Provided(token) => Ok(Some(token)),
+        TokenPolicy::Disabled if non_loopback => {
+            eprintln!("mag-web warning: ignoring --no-auth for non-loopback host {host}");
+            generate_token().map(Some)
+        }
+        TokenPolicy::Disabled => Ok(None),
+    }
+}
+
+fn generate_token() -> io::Result<String> {
+    let mut bytes = [0_u8; 16];
+    fill_random(&mut bytes)?;
+
+    // Encode an RFC 4122 version 4 UUID without depending on another runtime crate.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+    Ok(format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    ))
+}
+
+#[cfg(unix)]
+fn fill_random(bytes: &mut [u8]) -> io::Result<()> {
+    fs::File::open("/dev/urandom")?.read_exact(bytes)
+}
+
+#[cfg(not(unix))]
+fn fill_random(_bytes: &mut [u8]) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "default token generation requires an OS random source",
+    ))
+}
+
+fn resolve_static_assets(override_dir: Option<PathBuf>) -> StaticAssets {
+    match override_dir {
+        Some(path) => StaticAssets::Directory(path),
+        None => default_static_assets(),
+    }
+}
+
+#[cfg(debug_assertions)]
+fn default_static_assets() -> StaticAssets {
+    StaticAssets::Directory(default_static_assets_dir())
+}
+
+#[cfg(not(debug_assertions))]
+fn default_static_assets() -> StaticAssets {
+    StaticAssets::Embedded
+}
+
+#[cfg(debug_assertions)]
+fn default_static_assets_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../ui/apps/web/dist")
+}
+
+async fn require_bearer_auth(
+    State(auth): State<AuthState>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Result<Response, AuthError> {
+    if bearer_token(request.headers()) == Some(auth.token.as_ref()) {
+        Ok(next.run(request).await)
+    } else {
+        Err(AuthError)
+    }
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+}
+
+#[derive(Clone, Debug)]
+struct AuthError;
+
+impl IntoResponse for AuthError {
+    fn into_response(self) -> Response {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorBody {
+                kind: "unauthorized".to_owned(),
+                message: "missing or invalid bearer token".to_owned(),
+            }),
+        )
+            .into_response()
+    }
+}
+
+async fn api_not_found() -> StatusCode {
+    StatusCode::NOT_FOUND
 }
 
 /// Error type returned by web API handlers.
@@ -187,6 +447,139 @@ fn service_error_status(error: &ServiceError) -> StatusCode {
 struct ErrorBody {
     kind: String,
     message: String,
+}
+
+async fn static_asset(State(state): State<AppState>, uri: Uri) -> Response {
+    if is_api_path(uri.path()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    match static_asset_response(&state.static_assets, uri.path()) {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("mag-web failed to read static asset: {error}");
+            ApiError::Internal.into_response()
+        }
+    }
+}
+
+fn static_asset_response(assets: &StaticAssets, request_path: &str) -> io::Result<Response> {
+    let Some(asset_path) = normalize_asset_path(request_path) else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+
+    if let Some(bytes) = load_static_asset(assets, &asset_path)? {
+        return Ok(bytes_response(&asset_path, bytes));
+    }
+
+    if let Some(bytes) = load_static_asset(assets, "index.html")? {
+        return Ok(bytes_response("index.html", bytes));
+    }
+
+    Ok(placeholder_response(assets))
+}
+
+fn is_api_path(path: &str) -> bool {
+    path == "/api" || path.starts_with("/api/")
+}
+
+fn normalize_asset_path(request_path: &str) -> Option<String> {
+    let trimmed = request_path.trim_start_matches('/');
+    if trimmed.is_empty() {
+        return Some("index.html".to_owned());
+    }
+
+    let mut segments = Vec::new();
+    for segment in trimmed.split('/') {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segment == ".." || segment.contains('\\') {
+            return None;
+        }
+        segments.push(segment);
+    }
+
+    if segments.is_empty() {
+        Some("index.html".to_owned())
+    } else {
+        Some(segments.join("/"))
+    }
+}
+
+fn load_static_asset(assets: &StaticAssets, path: &str) -> io::Result<Option<Vec<u8>>> {
+    match assets {
+        StaticAssets::Directory(root) => load_directory_asset(root, path),
+        #[cfg(not(debug_assertions))]
+        StaticAssets::Embedded => {
+            Ok(EmbeddedAssets::get(path).map(|asset| asset.data.into_owned()))
+        }
+    }
+}
+
+fn load_directory_asset(root: &FsPath, path: &str) -> io::Result<Option<Vec<u8>>> {
+    match fs::read(root.join(path)) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) => match error.kind() {
+            io::ErrorKind::NotFound | io::ErrorKind::IsADirectory => Ok(None),
+            _ => Err(error),
+        },
+    }
+}
+
+fn bytes_response(path: &str, bytes: Vec<u8>) -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, content_type(path))],
+        Body::from(bytes),
+    )
+        .into_response()
+}
+
+fn placeholder_response(assets: &StaticAssets) -> Response {
+    let source = match assets {
+        StaticAssets::Directory(path) => path.display().to_string(),
+        #[cfg(not(debug_assertions))]
+        StaticAssets::Embedded => "embedded release assets".to_owned(),
+    };
+    let body = format!(
+        r#"<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>mag web assets missing</title></head>
+<body>
+<main style="font-family: system-ui, sans-serif; max-width: 48rem; margin: 4rem auto; line-height: 1.5;">
+<h1>mag web UI is not built yet</h1>
+<p>No <code>index.html</code> was found in <code>{source}</code>.</p>
+<p>Run <code>pnpm build</code> in <code>ui/</code>, then restart <code>mag --web</code>.</p>
+</main>
+</body>
+</html>"#
+    );
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        body,
+    )
+        .into_response()
+}
+
+fn content_type(path: &str) -> &'static str {
+    match path.rsplit_once('.').map(|(_, extension)| extension) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") | Some("mjs") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("json") => "application/json; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("ico") => "image/x-icon",
+        Some("wasm") => "application/wasm",
+        Some("txt") => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
 }
 
 #[derive(Serialize)]
@@ -394,13 +787,18 @@ fn event_type(value: &Value) -> Result<&str, String> {
         .ok_or_else(|| "serialized ServiceEvent missing type tag".to_owned())
 }
 
+#[cfg(not(debug_assertions))]
+#[derive(rust_embed::RustEmbed)]
+#[folder = "../../ui/apps/web/dist/"]
+struct EmbeddedAssets;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use async_trait::async_trait;
     use axum::{
         body::{Body, to_bytes},
-        http::{Method, Request},
+        http::{HeaderValue, Method, Request},
     };
     use futures::{StreamExt, stream};
     use mag_service::{RoutingMode, ServiceEvent, SourceKindWire};
@@ -681,6 +1079,47 @@ mod tests {
         builder.body(body).expect("request builds")
     }
 
+    fn request_with_token(
+        method: Method,
+        uri: impl AsRef<str>,
+        body: Option<Value>,
+        token: &str,
+    ) -> Request<Body> {
+        let mut request = request(method, uri, body);
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).expect("token header is valid"),
+        );
+        request
+    }
+
+    fn prepared_app(
+        service: Arc<ScriptedService>,
+        token_policy: TokenPolicy,
+        static_assets_dir: Option<PathBuf>,
+    ) -> (Router, ResolvedServeOptions) {
+        let prepared = prepare_router(
+            service,
+            ServeOptions {
+                host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port: 0,
+                token_policy,
+                static_assets_dir,
+            },
+        )
+        .expect("router prepares");
+        let options = prepared.options().clone();
+        (prepared.into_router(), options)
+    }
+
+    fn token_shape_is_uuid(value: &str) -> bool {
+        value.len() == 36
+            && value.chars().enumerate().all(|(index, ch)| match index {
+                8 | 13 | 18 | 23 => ch == '-',
+                _ => ch.is_ascii_hexdigit(),
+            })
+    }
+
     fn json_value<T: Serialize>(value: T) -> Value {
         serde_json::to_value(value).expect("value serializes")
     }
@@ -690,6 +1129,13 @@ mod tests {
             .await
             .expect("response body readable");
         serde_json::from_slice(&bytes).expect("response body is JSON")
+    }
+
+    async fn body_text(response: Response) -> String {
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body readable");
+        String::from_utf8(bytes.to_vec()).expect("response body is utf-8")
     }
 
     async fn assert_empty_body(response: Response) {
@@ -1173,6 +1619,218 @@ mod tests {
             body_json::<Value>(response).await,
             json!({ "kind": "internal", "message": "internal server error" })
         );
+    }
+
+    #[tokio::test]
+    async fn api_auth_requires_matching_bearer_token() {
+        let service = Arc::new(ScriptedService::default());
+        let (app, options) = prepared_app(
+            service.clone(),
+            TokenPolicy::Provided("secret-token".to_owned()),
+            None,
+        );
+
+        assert!(options.auth_enabled());
+        assert_eq!(options.auth_token(), Some("secret-token"));
+
+        let response = app
+            .clone()
+            .oneshot(request(Method::GET, "/api/sessions", None))
+            .await
+            .expect("missing auth response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            body_json::<Value>(response).await,
+            json!({ "kind": "unauthorized", "message": "missing or invalid bearer token" })
+        );
+
+        let response = app
+            .clone()
+            .oneshot(request_with_token(
+                Method::GET,
+                "/api/sessions",
+                None,
+                "wrong-token",
+            ))
+            .await
+            .expect("wrong auth response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        assert!(
+            service.calls().is_empty(),
+            "rejected auth must not call service methods"
+        );
+
+        let response = app
+            .oneshot(request_with_token(
+                Method::GET,
+                "/api/sessions",
+                None,
+                "secret-token",
+            ))
+            .await
+            .expect("authorized response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json::<Value>(response).await,
+            json_value(vec![SessionInfo::new(session_id(), config())])
+        );
+        assert_eq!(service.calls(), vec![Call::ListSessions]);
+    }
+
+    #[tokio::test]
+    async fn token_policy_generate_creates_uuid_shaped_token() {
+        let options = resolve_serve_options(ServeOptions {
+            host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 0,
+            token_policy: TokenPolicy::Generate,
+            static_assets_dir: None,
+        })
+        .expect("options resolve");
+
+        let token = options.auth_token().expect("generated token exists");
+        assert!(token_shape_is_uuid(token), "token: {token}");
+    }
+
+    #[tokio::test]
+    async fn no_auth_policy_allows_loopback_api_without_token() {
+        let service = Arc::new(ScriptedService::default());
+        let (app, options) = prepared_app(service.clone(), TokenPolicy::Disabled, None);
+
+        assert!(!options.auth_enabled());
+
+        let response = app
+            .oneshot(request(Method::GET, "/api/sessions", None))
+            .await
+            .expect("no-auth response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(service.calls(), vec![Call::ListSessions]);
+    }
+
+    #[tokio::test]
+    async fn non_loopback_no_auth_is_ignored_and_requires_generated_token() {
+        let service = Arc::new(ScriptedService::default());
+        let prepared = prepare_router(
+            service.clone(),
+            ServeOptions {
+                host: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                port: 0,
+                token_policy: TokenPolicy::Disabled,
+                static_assets_dir: None,
+            },
+        )
+        .expect("router prepares");
+        let options = prepared.options().clone();
+        let token = options
+            .auth_token()
+            .expect("non-loopback no-auth resolves to a generated token")
+            .to_owned();
+        let app = prepared.into_router();
+
+        assert!(options.auth_enabled());
+        assert!(token_shape_is_uuid(&token), "token: {token}");
+
+        let response = app
+            .clone()
+            .oneshot(request(Method::GET, "/api/sessions", None))
+            .await
+            .expect("missing auth response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(service.calls().is_empty());
+
+        let response = app
+            .oneshot(request_with_token(
+                Method::GET,
+                "/api/sessions",
+                None,
+                &token,
+            ))
+            .await
+            .expect("authorized response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(service.calls(), vec![Call::ListSessions]);
+    }
+
+    #[tokio::test]
+    async fn static_assets_are_served_without_auth_and_spa_fallbacks_to_index() {
+        let service = Arc::new(ScriptedService::default());
+        let temp = tempfile::tempdir().expect("temp dir creates");
+        let assets = temp.path();
+        std::fs::create_dir(assets.join("assets")).expect("assets dir creates");
+        std::fs::write(
+            assets.join("index.html"),
+            "<!doctype html><main>mag web shell</main>",
+        )
+        .expect("index writes");
+        std::fs::write(assets.join("assets/app.js"), "console.log('mag');").expect("asset writes");
+
+        let (app, options) = prepared_app(
+            service.clone(),
+            TokenPolicy::Provided("secret-token".to_owned()),
+            Some(assets.to_path_buf()),
+        );
+
+        assert_eq!(options.static_assets_dir(), Some(assets));
+
+        let response = app
+            .clone()
+            .oneshot(request(Method::GET, "/", None))
+            .await
+            .expect("index response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("text/html; charset=utf-8"))
+        );
+        assert!(body_text(response).await.contains("mag web shell"));
+
+        let response = app
+            .clone()
+            .oneshot(request(Method::GET, "/assets/app.js", None))
+            .await
+            .expect("asset response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("text/javascript; charset=utf-8"))
+        );
+        assert_eq!(body_text(response).await, "console.log('mag');");
+
+        let response = app
+            .clone()
+            .oneshot(request(Method::GET, "/sessions/local-route", None))
+            .await
+            .expect("spa fallback response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(body_text(response).await.contains("mag web shell"));
+
+        let response = app
+            .oneshot(request(Method::GET, "/api/sessions", None))
+            .await
+            .expect("api still requires auth");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(service.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_static_assets_return_friendly_placeholder() {
+        let service = Arc::new(ScriptedService::default());
+        let temp = tempfile::tempdir().expect("temp dir creates");
+        let missing_assets = temp.path().join("missing-dist");
+        let (app, _) = prepared_app(service, TokenPolicy::Disabled, Some(missing_assets.clone()));
+
+        let response = app
+            .oneshot(request(Method::GET, "/", None))
+            .await
+            .expect("placeholder response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("text/html; charset=utf-8"))
+        );
+        let body = body_text(response).await;
+        assert!(body.contains("pnpm build"));
+        assert!(body.contains(&missing_assets.display().to_string()));
     }
 
     #[tokio::test]
