@@ -1,27 +1,32 @@
 # 执行计划
 
-本文件记录本次调用的可公开执行计划与进度。不会记录私有推理过程。
+## 本次调用目标
 
-## 初始计划
+目标：只完成 `TODO.md` 中第一个未完成任务，完成记录、验证和提交后停止。
 
-1. 读取 `TODO.md`，按文档顺序识别第一个标题未以 `[DONE]` 开头的任务。
-2. 检查该任务的要求、依赖、验证方式和完成记录；必要时查看最新提交是否明确提到与该任务直接相关的未完成问题。
-3. 在不做开放式历史问题清扫的前提下，收集完成当前任务所需的最小代码上下文。
-4. 实现当前任务；若遇到阻塞当前任务的规格不匹配或缺失前置条件，则将最小必要前置任务插入 `TODO.md`，提交后停止。
-5. 按要求运行格式化、lint 和相关测试；若观察到未被排期的失败测试，修复或在 `TODO.md` 中排期到当前任务完成之前。
-6. 任务完成后，在 `TODO.md` 中将任务标题加上 `[DONE]` 并更新完成记录；仅当阶段计划实际变化时才更新 `PLAN.md`。
-7. 检查 git 状态和差异，提交本次任务相关全部变更，然后停止，不继续下一个任务。
+## 步骤计划
 
-## 进度
+1. 优先读取 `TODO.md`，识别第一个标题未带 `[DONE]` 前缀的任务。
+2. 检查最近提交是否明确留下与该任务直接相关的未完成问题。
+3. 阅读任务正文、依赖、验证要求和相关代码路径。
+4. 按任务原要求实现，不缩小范围，不引入 workaround。
+5. 按要求运行格式化、lint 和测试：先 `cargo fmt`，再 `cargo clippy --all-targets -- -D warnings`，之后运行相关/完整测试。
+6. 若发现未排期的失败测试或阻塞当前任务的规格不匹配，优先修复；若无法在当前任务内修复，则在 `TODO.md` 插入最小前置任务并停止。
+7. 任务完成且验证通过后，在 `TODO.md` 中将任务标题前缀改为 `[DONE]` 并补完成记录。
+8. 仅当阶段级顺序、依赖、假设或完成条件变化时才更新 `PLAN.md`。
+9. 检查 git status/diff/log，提交本任务相关变更。
+10. 停止，不开始下一个任务。
 
-- 已创建初始执行计划，下一步读取 `TODO.md` 识别当前任务。
-- 已读取 `TODO.md`，本次执行目标确定为首个未完成任务：`W1-3 [TODO] SessionInfo 增强（P4）`。
-- 下一步只检查与 `SessionInfo`、`list_sessions`、运行/交互状态直接相关的实现与最新提交信息，避免开放式历史问题清扫。
-- 已确认最新提交 `[W1-2] Add session history retrieval` 未直接声明 W1-3 的未完成问题。
-- 实施方案：在 `mag-service` 为 `SessionInfo` 向后兼容新增 `title: Option<String>`、`last_active_at: Option<u64>`、`status: SessionStatusWire`；在 `mag-core` 的 `list_sessions` 中以持久化列表为基底，叠加会话历史标题/活跃时间与 live session actor 状态快照。
-- 测试方案：补 `mag-service` 旧 JSON 兼容与新字段 roundtrip；补 `mag-core` running、awaiting interaction、历史标题/时间的聚焦断言，再运行任务要求和默认验证序列。
-- 已完成代码实现与新增聚焦测试，并已运行 `cargo fmt --all`。
-- 下一步运行 `cargo test -p mag-service` 与 mag-core 聚焦测试；若通过，再运行 clippy、workspace test、doc。
-- 验证已通过：`cargo test -p mag-service`、三个 mag-core 聚焦测试、`cargo clippy --all-targets -- -D warnings`、`cargo fmt --all -- --check`、`cargo test --workspace`、`cargo doc --no-deps --workspace`。
-- 已将 `TODO.md` 中 `W1-3` 标记为 `[DONE]` 并补完成记录；下一步检查 git 差异并提交本次任务变更。
-- 已完成提交前检查，提交 W1-3 任务变更，并确认工作区无未提交变更。
+## 进度记录
+
+- 已在读取项目任务文件或运行命令前初始化本计划文件。
+- 已识别首个未完成任务：`W1-4 ts-rs 生成管线 + @mag/protocol`。
+- 最近提交 `7677250 [W1-3] Record completion progress` 未明确留下 W1-4 的直接前置问题。
+- 当前范围：检查现有 wire DTO 与构建结构，增加 feature-gated `ts-rs` 导出支持，创建 `@mag/protocol`，完成验证，更新 `TODO.md` 并提交。
+- 已完成初始实现：新增默认关闭的 `ts-export` Cargo feature、为 service/config DTO 添加 `TS` 派生、添加 `export_ts` 导出测试、创建 protocol 包骨架、补 fixture 检查和 README 再生成说明。
+- `cargo fetch` 已取得 `ts-rs v12.0.1`，无需启用降级方案。
+- `cargo test -p mag-service --features ts-export export_ts` 已通过并生成 protocol 绑定。
+- Rust JSON fixture 测试与 TypeScript 编译期 fixture 校验均已通过。
+- 必要验证已全部通过：格式检查、聚焦测试、默认 clippy、`ts-export` clippy、完整 workspace 测试、workspace 文档构建、TypeScript 编译检查。
+- `TODO.md` 已将 `W1-4` 标记为 `[DONE]` 并补完成记录；`PLAN.md` 未变，因为阶段级计划未变化。
+- 下一步：重新暂存更新后的计划文件，提交 W1-4 变更并停止。

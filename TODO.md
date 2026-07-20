@@ -137,7 +137,7 @@
 - 测试覆盖：`mag-service` 旧 `SessionInfo` JSON 兼容与新字段 roundtrip；`mag-core` running 状态、awaiting interaction 状态、持久化标题/活动时间断言。
 - 验证通过：`cargo fmt --all`、`cargo test -p mag-service`、`cargo test -p mag-core list_sessions_reports_running_status_and_live_title`、`cargo test -p mag-core gated_tool_pauses_then_runs_after_approve`、`cargo test -p mag-core committed_run_persists_a_snapshot_to_the_store`、`cargo clippy --all-targets -- -D warnings`、`cargo fmt --all -- --check`、`cargo test --workspace`、`cargo doc --no-deps --workspace`。
 
-### W1-4 [TODO] ts-rs 生成管线 + `@mag/protocol`
+### W1-4 [DONE] ts-rs 生成管线 + `@mag/protocol`
 
 - **上下文**：`docs/WEB.md` §2.4（Q3 拍板 ts-rs）。
 - **实现要求**：
@@ -152,6 +152,15 @@
     SessionInfo/SourceInfo/ConfigDto 等）。
 - **验证条件**：默认验证序列全过；生成物存在且与 Rust roundtrip 测试互证（任一 wire 类型的
   JSON fixture 同时被 Rust serde 与 TS 类型接受——TS 侧可做最小编译期校验）。
+
+完成记录（2026-07-21）：
+
+- `mag-config` 与 `mag-service` 新增默认关闭的 `ts-export` feature；`ts-rs` 依赖仅在该 feature 下启用，默认构建不引入。
+- `ConfigDto`/嵌套 DTO、`SecretRef`、`Command`/`Event`/`ServiceEvent`、session/history/interaction/tool/delegation/source/error 等协议类型新增 feature-gated `TS` 派生；ID 新类型导出为 TS `string`，JSON `u64` wire 字段导出为 TS `number`。
+- 新增 `cargo test -p mag-service --features ts-export export_ts` 导出测试，重建 `ui/packages/protocol/src/generated/` 与 generated `src/index.ts`；`@mag/protocol` 包骨架含 `package.json`、`tsconfig.json`、README 与漂移门禁说明。
+- 首份生成物已提交；`SecretRef` 仅导出 `{ env: string } | { keyring: string }` 引用形态，不导出 secret 值。
+- 新增 `update-config-command.json` fixture：Rust 侧通过 `Command` serde roundtrip 校验，TS 侧通过 `satisfies`/编译期 fixture 校验协议类型可接受同形 JSON payload。
+- 验证通过：`cargo fetch`、`cargo fmt --all`、`cargo fmt --all -- --check`、`cargo test -p mag-service --features ts-export export_ts`、`cargo test -p mag-service update_config_protocol_fixture_round_trips`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy -p mag-service --features ts-export --all-targets -- -D warnings`、`cargo test --workspace`、`cargo doc --no-deps --workspace`、`npx --yes -p typescript@5.9.2 tsc --noEmit -p ui/packages/protocol/tsconfig.json`。
 
 ### W1-R [TODO] W1 review
 

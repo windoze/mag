@@ -28,6 +28,11 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// at assembly time (`Engine::from_config`), never here. No test or log may
 /// print a resolved value (`docs/CLI.md` §4.1).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-export",
+    ts(type = "{ env: string } | { keyring: string }")
+)]
 pub enum SecretRef {
     /// Reference to an environment variable (e.g. `ANTHROPIC_API_KEY`).
     Env(String),

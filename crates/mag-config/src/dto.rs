@@ -26,19 +26,25 @@ use crate::SecretRef;
 /// All sections are optional; an empty document deserializes to
 /// `ConfigDto::default()`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(optional_fields))]
 #[serde(default)]
 pub struct ConfigDto {
     /// LLM provider definitions (`[providers.<name>]`).
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[cfg_attr(feature = "ts-export", ts(as = "Option<_>"))]
     pub providers: BTreeMap<String, ProviderDto>,
     /// Local agent definitions (`[agents.<name>]`).
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[cfg_attr(feature = "ts-export", ts(as = "Option<_>"))]
     pub agents: BTreeMap<String, AgentDto>,
     /// External agent sources (`[external_agents.<name>]`, decision D3).
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[cfg_attr(feature = "ts-export", ts(as = "Option<_>"))]
     pub external_agents: BTreeMap<String, ExternalAgentDto>,
     /// Per-tool overrides (`[tools.<name>]`).
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[cfg_attr(feature = "ts-export", ts(as = "Option<_>"))]
     pub tools: BTreeMap<String, ToolDto>,
     /// Session defaults (`[session]`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -86,6 +92,8 @@ impl ConfigDto {
 /// Field order matters for TOML serialization: scalar values first, table
 /// values (`api_key`, `params`) last.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(optional_fields))]
 pub struct ProviderDto {
     /// Wire protocol spoken by the provider (e.g. `"anthropic"`, `"openai"`).
     /// The set of supported protocols is validated at resolve time, not here.
@@ -103,6 +111,7 @@ pub struct ProviderDto {
     /// Free-form provider parameter table forwarded to the client at assembly
     /// time (e.g. `max_retries`, timeouts, headers).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-export", ts(type = "Record<string, unknown>", optional))]
     pub params: Option<BTreeMap<String, toml::Value>>,
 }
 
@@ -112,6 +121,8 @@ pub struct ProviderDto {
 /// checks happen at resolve time (DTO→DO), which reports dangling references
 /// with field paths.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(optional_fields))]
 pub struct AgentDto {
     /// Name of the `[providers.<name>]` entry backing this agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -138,6 +149,8 @@ pub struct AgentDto {
 /// `kind = "acp"` agents are spawned from `command`; working-directory
 /// isolation is agent-lib's responsibility.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(optional_fields))]
 pub struct ExternalAgentDto {
     /// Source kind (currently `"acp"`); validated at resolve time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -157,6 +170,8 @@ pub struct ExternalAgentDto {
 
 /// A per-tool override (`[tools.<name>]`, e.g. `[tools.shell]`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(optional_fields))]
 pub struct ToolDto {
     /// Approval policy override: `"ask"` | `"allow"` | `"deny"` (mapped to
     /// `ApprovalPolicy` at assembly time; validated at resolve time).
@@ -171,6 +186,8 @@ pub struct ToolDto {
 /// (`docs/CLI.md` §4.4): existing sessions pin the snapshot captured at
 /// creation time.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(optional_fields))]
 pub struct SessionDefaultsDto {
     /// Delegation routing mode (e.g. `"model_routed"`); validated at resolve
     /// time against the service contract's routing modes.
@@ -186,6 +203,8 @@ pub struct SessionDefaultsDto {
 
 /// Approval defaults (`[approval]`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(optional_fields))]
 pub struct ApprovalSectionDto {
     /// Default approval policy for tools without a `[tools.<name>]` override:
     /// `"ask"` | `"allow"` | `"deny"`; validated at resolve time.
@@ -202,6 +221,8 @@ pub struct ApprovalSectionDto {
 /// shape so the DTO↔DO conversion is a field-by-field projection. Every
 /// dimension is optional; an unset dimension is unbounded.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(optional_fields))]
 pub struct BudgetDto {
     /// Maximum agent steps per run.
     #[serde(default, skip_serializing_if = "Option::is_none")]

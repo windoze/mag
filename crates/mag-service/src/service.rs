@@ -266,6 +266,7 @@ pub trait MagService: Send + Sync {
 /// This is the transport-neutral counterpart of the
 /// [`Command::SendMessage`](crate::Command::SendMessage) wire payload.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 pub struct UserInput {
     /// User-visible text payload.
     pub text: String,
@@ -288,6 +289,8 @@ impl UserInput {
 /// Metadata describing one known session, returned by
 /// [`MagService::list_sessions`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(optional_fields))]
 pub struct SessionInfo {
     /// Stable session identity.
     pub id: SessionId,
@@ -320,6 +323,7 @@ impl SessionInfo {
 
 /// Wire status for a listed session.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatusWire {
     /// No run is currently active and no interaction is waiting.
@@ -340,6 +344,7 @@ pub enum SessionStatusWire {
 /// interfaces observe whichever subset they need.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServiceEvent {
     /// A session was created.
@@ -563,6 +568,7 @@ impl From<Event> for ServiceEvent {
 /// Error returned by [`MagService`] operations.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServiceError {
     /// The referenced session does not exist.

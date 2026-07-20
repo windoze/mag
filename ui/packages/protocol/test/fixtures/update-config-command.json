@@ -1,0 +1,30 @@
+{
+  "type": "update_config",
+  "config": {
+    "providers": {
+      "anthropic": {
+        "wire": "anthropic",
+        "api_key": {
+          "env": "ANTHROPIC_API_KEY"
+        }
+      }
+    },
+    "agents": {
+      "default": {
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5",
+        "tools": ["read_file", "shell"]
+      }
+    },
+    "session": {
+      "routing": "model_routed",
+      "budget": {
+        "max_steps": 8
+      }
+    },
+    "approval": {
+      "default_policy": "ask",
+      "timeout_secs": 60
+    }
+  }
+}

@@ -36,6 +36,8 @@ macro_rules! define_id {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
         #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+        #[cfg_attr(feature = "ts-export", ts(type = "string"))]
         #[serde(transparent)]
         #[repr(transparent)]
         pub struct $name(Uuid);
@@ -127,6 +129,7 @@ define_id!(
 /// Commands accepted by the transport-neutral engine.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
     /// Create a new session with the supplied configuration.
@@ -202,6 +205,7 @@ pub enum Command {
 /// Events emitted by the transport-neutral engine.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
     /// A session was created.
@@ -348,6 +352,7 @@ pub enum Event {
 /// `message`.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum RunErrorKind {
     /// Unclassified failure; the `message` carries the details.
@@ -365,6 +370,8 @@ pub enum RunErrorKind {
 
 /// Configuration used when creating or resuming a session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(optional_fields))]
 pub struct SessionConfig {
     /// AI provider or source key, such as `openai` or `local`.
     pub provider: String,
@@ -408,6 +415,8 @@ pub struct SessionConfig {
 /// whole seconds). Every dimension is optional; an unset dimension is
 /// unbounded.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(optional_fields))]
 pub struct SessionBudget {
     /// Maximum agent steps per run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -426,6 +435,7 @@ pub struct SessionBudget {
 /// Delegation routing mode reserved in the session configuration.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum RoutingMode {
     /// Supervisor model decides when and where to delegate.
@@ -437,6 +447,8 @@ pub enum RoutingMode {
 
 /// Optional user-message attachment metadata.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(optional_fields))]
 pub struct MessageAttachment {
     /// Optional display name for the attachment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -455,6 +467,7 @@ pub struct MessageAttachment {
 /// One committed history item returned by `get_session_history`.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HistoryEntry {
     /// A user-authored message.
@@ -484,6 +497,8 @@ pub enum HistoryEntry {
 
 /// Final output reported for a successful run.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(optional_fields))]
 pub struct RunOutput {
     /// Final assistant text collected for the run.
     pub text: String,
@@ -494,6 +509,7 @@ pub struct RunOutput {
 
 /// Provider-neutral token usage summary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 pub struct UsageInfo {
     /// Tokens read from the prompt or input stream.
     pub input_tokens: u64,
@@ -505,6 +521,8 @@ pub struct UsageInfo {
 
 /// Trace payload for tool start and finish events.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(optional_fields))]
 pub struct ToolTrace {
     /// Optional run identity when the trace is tied to a specific run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -529,6 +547,7 @@ pub struct ToolTrace {
 /// Wire-visible lifecycle state for a tool trace.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum ToolStatusWire {
     /// The tool call has started.
@@ -545,6 +564,8 @@ pub enum ToolStatusWire {
 
 /// Trace payload for delegated child-agent work.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(optional_fields))]
 pub struct DelegationTrace {
     /// Optional parent run identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -571,6 +592,7 @@ pub struct DelegationTrace {
 /// Wire-visible lifecycle state for a delegation trace.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum DelegationStatusWire {
     /// The delegation has started but has not reported a terminal outcome.
@@ -584,6 +606,8 @@ pub enum DelegationStatusWire {
 
 /// Message emitted by a delegated child agent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(optional_fields))]
 pub struct DelegationMessageWire {
     /// Optional parent run identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -610,6 +634,8 @@ pub struct DelegationMessageWire {
 /// serialized before attribution existed still deserialize as
 /// root-originated.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(optional_fields))]
 pub struct InteractionOrigin {
     /// Name of the delegate (sub-agent) that produced the interaction.
     ///
@@ -636,6 +662,7 @@ impl InteractionOrigin {
 /// Interaction request shown to a user or policy engine.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InteractionKindWire {
     /// Degenerate yes/no approval for one framework tool call.
@@ -680,6 +707,7 @@ pub enum InteractionKindWire {
 /// Interaction response supplied by a user or policy engine.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InteractionResponseWire {
     /// Response to an approval interaction.
@@ -716,6 +744,7 @@ pub enum InteractionResponseWire {
 /// Requirement produced by a tool approval policy.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ApprovalRequirementWire {
     /// Execute the tool without pausing for external approval.
@@ -731,6 +760,7 @@ pub enum ApprovalRequirementWire {
 /// External decision for a tool approval request.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalDecisionWire {
     /// The tool may execute normally.
@@ -746,6 +776,7 @@ pub enum ApprovalDecisionWire {
 /// Class of privileged action requested by an agent.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionCategoryWire {
     /// Executing a shell command.
@@ -767,6 +798,7 @@ pub enum PermissionCategoryWire {
 /// Estimated blast radius of granting a privileged action.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionRiskWire {
     /// Read-only or otherwise easily reversible action.
@@ -782,6 +814,7 @@ pub enum PermissionRiskWire {
 /// External decision for a permission request.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PermissionDecisionWire {
     /// The privileged action may proceed.
@@ -798,6 +831,8 @@ pub enum PermissionDecisionWire {
 
 /// Information about a configured or probed AI source.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-export", ts(optional_fields))]
 pub struct SourceInfo {
     /// Stable source key used by configuration.
     pub id: String,
@@ -821,6 +856,7 @@ pub struct SourceInfo {
 /// Wire-visible source family.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum SourceKindWire {
     /// Hosted or API-backed model provider.
@@ -831,6 +867,107 @@ pub enum SourceKindWire {
     ToolRuntime,
     /// Other source type.
     Other,
+}
+
+#[cfg(all(test, feature = "ts-export"))]
+mod ts_exports {
+    use super::*;
+    use std::{fs, path::PathBuf};
+    use ts_rs::{Config, TS};
+
+    fn protocol_src_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../ui/packages/protocol/src")
+    }
+
+    fn export_type<T>(config: &Config)
+    where
+        T: TS + 'static,
+    {
+        T::export_all(config).unwrap_or_else(|error| {
+            panic!(
+                "failed to export {} TypeScript bindings: {error}",
+                T::name(config)
+            )
+        });
+    }
+
+    fn write_index(src_dir: &std::path::Path, generated_dir: &std::path::Path) {
+        let mut modules = fs::read_dir(generated_dir)
+            .expect("read generated protocol directory")
+            .map(|entry| entry.expect("read generated protocol entry").path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "ts"))
+            .map(|path| {
+                path.file_stem()
+                    .expect("generated TypeScript file has a stem")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        modules.sort();
+
+        let mut index = String::from(
+            "/* @generated by `cargo test -p mag-service --features ts-export export_ts`. Do not edit. */\n",
+        );
+        for module in modules {
+            index.push_str(&format!("export * from \"./generated/{module}\";\n"));
+        }
+
+        fs::write(src_dir.join("index.ts"), index).expect("write protocol index");
+    }
+
+    #[test]
+    fn export_ts() {
+        let src_dir = protocol_src_dir();
+        let generated_dir = src_dir.join("generated");
+        if generated_dir.exists() {
+            fs::remove_dir_all(&generated_dir).expect("remove stale generated protocol bindings");
+        }
+        fs::create_dir_all(&generated_dir).expect("create generated protocol directory");
+
+        let config = Config::new()
+            .with_out_dir(&generated_dir)
+            .with_large_int("number");
+
+        export_type::<AgentIdWire>(&config);
+        export_type::<ApprovalDecisionWire>(&config);
+        export_type::<ApprovalRequirementWire>(&config);
+        export_type::<Command>(&config);
+        export_type::<ConfigDto>(&config);
+        export_type::<DelegationMessageWire>(&config);
+        export_type::<DelegationStatusWire>(&config);
+        export_type::<DelegationTrace>(&config);
+        export_type::<Event>(&config);
+        export_type::<HistoryEntry>(&config);
+        export_type::<InteractionKindWire>(&config);
+        export_type::<InteractionOrigin>(&config);
+        export_type::<InteractionResponseWire>(&config);
+        export_type::<MessageAttachment>(&config);
+        export_type::<PermissionCategoryWire>(&config);
+        export_type::<PermissionDecisionWire>(&config);
+        export_type::<PermissionRiskWire>(&config);
+        export_type::<RequestId>(&config);
+        export_type::<RoutingMode>(&config);
+        export_type::<RunErrorKind>(&config);
+        export_type::<RunId>(&config);
+        export_type::<RunOutput>(&config);
+        export_type::<ServiceError>(&config);
+        export_type::<ServiceEvent>(&config);
+        export_type::<SessionBudget>(&config);
+        export_type::<SessionConfig>(&config);
+        export_type::<SessionId>(&config);
+        export_type::<SessionInfo>(&config);
+        export_type::<SessionStatusWire>(&config);
+        export_type::<SourceInfo>(&config);
+        export_type::<SourceKindWire>(&config);
+        export_type::<StepIdWire>(&config);
+        export_type::<ToolCallIdWire>(&config);
+        export_type::<ToolStatusWire>(&config);
+        export_type::<ToolTrace>(&config);
+        export_type::<UsageInfo>(&config);
+        export_type::<UserInput>(&config);
+
+        write_index(&src_dir, &generated_dir);
+    }
 }
 
 #[cfg(test)]
@@ -1051,6 +1188,26 @@ mod tests {
             assert_tag(&command, expected_tag);
             assert_round_trip(command);
         }
+    }
+
+    #[test]
+    fn update_config_protocol_fixture_round_trips() {
+        let raw =
+            include_str!("../../../ui/packages/protocol/test/fixtures/update-config-command.json");
+        let value = serde_json::from_str::<Value>(raw).expect("parse protocol JSON fixture");
+        let command = serde_json::from_value::<Command>(value.clone())
+            .expect("fixture is a valid Command wire payload");
+
+        match &command {
+            Command::UpdateConfig { config } => {
+                assert!(config.providers.contains_key("anthropic"));
+                assert!(config.agents.contains_key("default"));
+            }
+            other => panic!("expected update_config command fixture, got {other:?}"),
+        }
+
+        let encoded = serde_json::to_value(command).expect("serialize fixture command");
+        assert_eq!(encoded, value);
     }
 
     #[test]

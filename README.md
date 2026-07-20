@@ -16,9 +16,12 @@ workspace skeleton for the engine and its direct support crates.
   the non-default `os-keyring` feature so tests never touch a real keyring), the
   `SourceRegistry` that projects hosted LLM sources to an agent-lib
   `ProviderConfig`, and a reserved slot for future local-agent integration.
+- `ui/packages/protocol`: generated TypeScript bindings for mag service wire
+  types. Regenerate them from Rust with `cargo test -p mag-service --features
+  ts-export export_ts`.
 
-Frontend and transport crates are intentionally out of scope for this workspace
-stage.
+The web UI and additional transport crates are landing incrementally; the
+protocol package is the first shared frontend artifact.
 
 ## Setup
 
@@ -33,6 +36,13 @@ Build and test the current skeleton with:
 ```sh
 cargo build --workspace
 cargo test --workspace
+```
+
+Regenerate and check protocol TypeScript bindings with:
+
+```sh
+cargo test -p mag-service --features ts-export export_ts
+git diff --exit-code -- ui/packages/protocol/src
 ```
 
 ## Usage
