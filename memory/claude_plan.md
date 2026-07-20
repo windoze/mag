@@ -1,29 +1,23 @@
 # Claude Execution Plan
 
 ## Scope
+- Follow `TODO.md` as the authoritative task list.
+- Identify and complete exactly the first incomplete task, where incomplete means the task heading is not prefixed with `[DONE]`.
+- Stop after documenting, validating, and committing that one task.
 
-This invocation will complete exactly the first incomplete task in `TODO.md`, then stop after committing the result.
-
-## Plan
-
-1. Read `TODO.md` to identify the first task whose heading is not prefixed with `[DONE]`.
-2. Review the selected task requirements, dependencies, validation instructions, and any relevant recent commit notes.
-3. Inspect only the code and tests needed for the selected task.
-4. Implement the task completely, or add the minimum prerequisite task to `TODO.md` if a concrete blocker makes completion impossible.
-5. Update this file when key execution steps complete or the plan materially changes.
-6. Run required formatting, linting, and tests in the required order unless only documentation changed and a prior green full run can be reused.
-7. Mark the selected task `[DONE]` in `TODO.md` and update its completion record after successful validation.
-8. Commit all relevant changes with a descriptive task-scoped message.
-9. Stop without starting the next task.
+## Execution Plan
+1. Read `TODO.md` and identify the first incomplete task before doing broader triage.
+2. Inspect only the files and tests relevant to that task, plus recent commit context if it is directly relevant.
+3. Implement the task exactly as specified, adding prerequisite tasks to `TODO.md` only if a concrete blocker makes direct completion impossible.
+4. Run formatting, linting, and relevant tests in the required order; run the full suite when code changes require it.
+5. Update `TODO.md` with a `[DONE]` prefix and completion record if the task is fully complete; update this plan file at key milestones.
+6. Review the git diff, then commit all task-related changes with a descriptive message.
 
 ## Progress
-
-- Initial execution plan recorded.
-- Selected first incomplete task: `W2-1 [TODO] crate 骨架 + REST 路由 + 错误投影`.
-- Reviewed `docs/WEB.md` §2.1/§2.3 and `MagService`; implementation will add a new `mag-web` crate with REST-only routes for W2-1, leaving SSE/static/auth for later W2 tasks.
-- Added the `mag-web` crate, REST router/serve entry, error projection, and handler-level scripted service tests.
-- Focused validation passed: `cargo test -p mag-web`.
-- Default validation passed: `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace`, and `cargo doc --no-deps --workspace`.
-- `TODO.md` now marks `W2-1` as `[DONE]` with completion details.
-- Runtime dependency check `cargo tree -p mag-web -e normal` shows no `mag-core` or `agent-lib`; `mag-config` appears only transitively through `mag-service`'s existing `ConfigDto` re-export.
-- Next step: stage the W2-1 changes, inspect the staged diff, commit, then stop.
+- Initial plan recorded before task execution.
+- Identified first incomplete task: `W2-2 [TODO] SSE 事件面`.
+- Current focus: inspect existing `mag-web` REST crate, `MagService::subscribe`, and `docs/WEB.md` §2.2 before implementing `/api/events`.
+- Implemented `/api/events` SSE routing draft with per-connection bounded forwarding, monotonic event IDs, comment heartbeat, and subscription cleanup on disconnect.
+- Added loopback-server SSE tests plus direct queue-overflow coverage; next step is formatting and focused validation.
+- Validation passed: `cargo fmt --all`, `cargo test -p mag-web`, `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace`, and `cargo doc --no-deps --workspace`.
+- Marked `W2-2` complete in `TODO.md`; next step is git diff review and commit.

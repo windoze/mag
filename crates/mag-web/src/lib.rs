@@ -11,18 +11,29 @@ use axum::{
     Json, Router,
     extract::{Path, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response,
+        sse::{Event as SseEvent, Sse},
+    },
     routing::{delete, get, post},
 };
+use futures::{Stream, StreamExt, stream};
 use mag_service::{
     ConfigDto, HistoryEntry, InteractionResponseWire, MagService, RequestId, RunId, ServiceError,
-    SessionConfig, SessionId, SessionInfo, SourceInfo, UserInput,
+    ServiceEvent, SessionConfig, SessionId, SessionInfo, SourceInfo, UserInput,
 };
 use serde::Serialize;
+use serde_json::Value;
 use std::{
+    convert::Infallible,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     sync::Arc,
+    time::Duration,
+};
+use tokio::{
+    sync::mpsc,
+    time::{self, Instant, MissedTickBehavior},
 };
 
 /// Options used when serving the web adapter over TCP.
@@ -73,10 +84,15 @@ pub async fn serve(service: Arc<dyn MagService>, opts: ServeOptions) -> std::io:
 
 /// Builds the REST router for an injected [`MagService`].
 pub fn router(service: Arc<dyn MagService>) -> Router {
-    let state = AppState { service };
+    router_with_sse_config(service, SseConfig::default())
+}
+
+fn router_with_sse_config(service: Arc<dyn MagService>, sse: SseConfig) -> Router {
+    let state = AppState { service, sse };
 
     Router::new()
         .route("/api/sessions", get(list_sessions).post(create_session))
+        .route("/api/events", get(events))
         .route("/api/sessions/{id}/resume", post(resume_session))
         .route("/api/sessions/{id}", delete(delete_session))
         .route("/api/sessions/{id}/history", get(get_session_history))
@@ -98,6 +114,22 @@ pub fn router(service: Arc<dyn MagService>) -> Router {
 #[derive(Clone)]
 struct AppState {
     service: Arc<dyn MagService>,
+    sse: SseConfig,
+}
+
+#[derive(Clone, Copy)]
+struct SseConfig {
+    heartbeat_interval: Duration,
+    queue_capacity: usize,
+}
+
+impl Default for SseConfig {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval: Duration::from_secs(15),
+            queue_capacity: 64,
+        }
+    }
 }
 
 /// Error type returned by web API handlers.
@@ -273,6 +305,95 @@ async fn apply_config(State(state): State<AppState>) -> Result<StatusCode, ApiEr
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn events(
+    State(state): State<AppState>,
+) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
+    let events = spawn_event_forwarder(state.service, state.sse.queue_capacity);
+    Sse::new(sse_response_stream(events, state.sse.heartbeat_interval))
+}
+
+fn spawn_event_forwarder(
+    service: Arc<dyn MagService>,
+    queue_capacity: usize,
+) -> mpsc::Receiver<SseEvent> {
+    let (sender, receiver) = mpsc::channel(queue_capacity.max(1));
+
+    tokio::spawn(async move {
+        let mut events = service.subscribe(None);
+        let mut next_id = 1_u64;
+
+        loop {
+            tokio::select! {
+                _ = sender.closed() => break,
+                next = events.next() => {
+                    let Some(event) = next else {
+                        break;
+                    };
+
+                    let frame = match service_event_to_sse(next_id, &event) {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            eprintln!("mag-web failed to serialize SSE event: {error}");
+                            break;
+                        }
+                    };
+
+                    match sender.try_send(frame) {
+                        Ok(()) => next_id += 1,
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            eprintln!("mag-web SSE client queue overflow; closing event stream");
+                            break;
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                    }
+                }
+            }
+        }
+    });
+
+    receiver
+}
+
+fn sse_response_stream(
+    receiver: mpsc::Receiver<SseEvent>,
+    heartbeat_interval: Duration,
+) -> impl Stream<Item = Result<SseEvent, Infallible>> {
+    let mut heartbeat = time::interval_at(Instant::now() + heartbeat_interval, heartbeat_interval);
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    stream::unfold(
+        (receiver, heartbeat),
+        |(mut receiver, mut heartbeat)| async move {
+            tokio::select! {
+                event = receiver.recv() => {
+                    event.map(|event| (Ok(event), (receiver, heartbeat)))
+                }
+                _ = heartbeat.tick() => {
+                    Some((Ok(SseEvent::default().comment("ping")), (receiver, heartbeat)))
+                }
+            }
+        },
+    )
+}
+
+fn service_event_to_sse(event_id: u64, event: &ServiceEvent) -> Result<SseEvent, String> {
+    let value = serde_json::to_value(event).map_err(|error| error.to_string())?;
+    let event_type = event_type(&value)?.to_owned();
+    let data = serde_json::to_string(&value).map_err(|error| error.to_string())?;
+
+    Ok(SseEvent::default()
+        .id(event_id.to_string())
+        .event(event_type)
+        .data(data))
+}
+
+fn event_type(value: &Value) -> Result<&str, String> {
+    value
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "serialized ServiceEvent missing type tag".to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,7 +406,22 @@ mod tests {
     use mag_service::{RoutingMode, ServiceEvent, SourceKindWire};
     use serde::de::DeserializeOwned;
     use serde_json::{Value, json};
-    use std::sync::Mutex;
+    use std::{
+        collections::BTreeMap,
+        net::{Ipv4Addr, SocketAddr},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::{Duration, Instant as StdInstant},
+    };
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+        net::{TcpListener, TcpStream},
+        sync::broadcast,
+        task::JoinHandle,
+        time::timeout,
+    };
     use tower::ServiceExt;
 
     #[derive(Clone, Debug, PartialEq)]
@@ -299,6 +435,7 @@ mod tests {
         PivotMessage(SessionId, UserInput),
         Cancel(SessionId),
         RespondInteraction(SessionId, RequestId, InteractionResponseWire),
+        Subscribe(Option<SessionId>),
         ListSources,
         ProbeLocalAgents,
         GetConfig,
@@ -307,10 +444,25 @@ mod tests {
         ApplyConfig,
     }
 
-    #[derive(Default)]
     struct ScriptedService {
         calls: Mutex<Vec<Call>>,
         next_error: Mutex<Option<ServiceError>>,
+        events: broadcast::Sender<ServiceEvent>,
+        subscriptions: AtomicUsize,
+        active_subscriptions: Arc<AtomicUsize>,
+    }
+
+    impl Default for ScriptedService {
+        fn default() -> Self {
+            let (events, _) = broadcast::channel(32);
+            Self {
+                calls: Mutex::new(Vec::new()),
+                next_error: Mutex::new(None),
+                events,
+                subscriptions: AtomicUsize::new(0),
+                active_subscriptions: Arc::new(AtomicUsize::new(0)),
+            }
+        }
     }
 
     impl ScriptedService {
@@ -331,6 +483,28 @@ mod tests {
 
         fn calls(&self) -> Vec<Call> {
             self.calls.lock().expect("calls mutex poisoned").clone()
+        }
+
+        fn send_event(&self, event: ServiceEvent) {
+            let _ = self.events.send(event);
+        }
+
+        fn subscription_count(&self) -> usize {
+            self.subscriptions.load(Ordering::SeqCst)
+        }
+
+        fn active_subscription_count(&self) -> usize {
+            self.active_subscriptions.load(Ordering::SeqCst)
+        }
+    }
+
+    struct SubscriptionGuard {
+        active: Arc<AtomicUsize>,
+    }
+
+    impl Drop for SubscriptionGuard {
+        fn drop(&mut self) {
+            self.active.fetch_sub(1, Ordering::SeqCst);
         }
     }
 
@@ -398,9 +572,27 @@ mod tests {
 
         fn subscribe(
             &self,
-            _id: Option<SessionId>,
+            id: Option<SessionId>,
         ) -> futures::stream::BoxStream<'static, ServiceEvent> {
-            stream::empty().boxed()
+            self.push(Call::Subscribe(id));
+            self.subscriptions.fetch_add(1, Ordering::SeqCst);
+            self.active_subscriptions.fetch_add(1, Ordering::SeqCst);
+
+            let receiver = self.events.subscribe();
+            let guard = SubscriptionGuard {
+                active: self.active_subscriptions.clone(),
+            };
+
+            stream::unfold((receiver, guard), |(mut receiver, guard)| async move {
+                loop {
+                    match receiver.recv().await {
+                        Ok(event) => return Some((event, (receiver, guard))),
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => return None,
+                    }
+                }
+            })
+            .boxed()
         }
 
         async fn list_sources(&self) -> Result<Vec<SourceInfo>, ServiceError> {
@@ -505,6 +697,199 @@ mod tests {
             .await
             .expect("response body readable");
         assert!(bytes.is_empty(), "204 response body must be empty");
+    }
+
+    fn text_delta(text: &str) -> ServiceEvent {
+        ServiceEvent::TextDelta {
+            id: session_id(),
+            text: text.to_owned(),
+        }
+    }
+
+    async fn spawn_loopback_server(
+        service: Arc<ScriptedService>,
+        heartbeat_interval: Duration,
+    ) -> (SocketAddr, JoinHandle<()>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("loopback listener binds");
+        let address = listener.local_addr().expect("listener has local address");
+        let app = router_with_sse_config(
+            service,
+            SseConfig {
+                heartbeat_interval,
+                queue_capacity: 8,
+            },
+        );
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("test server runs");
+        });
+
+        (address, handle)
+    }
+
+    async fn wait_for(mut predicate: impl FnMut() -> bool) {
+        let deadline = StdInstant::now() + Duration::from_secs(2);
+        while StdInstant::now() < deadline {
+            if predicate() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(predicate(), "condition was not met before timeout");
+    }
+
+    struct SseClient {
+        reader: BufReader<TcpStream>,
+        chunked: bool,
+        decoded: Vec<u8>,
+    }
+
+    impl SseClient {
+        async fn connect(address: SocketAddr) -> Self {
+            let mut stream = TcpStream::connect(address)
+                .await
+                .expect("SSE client connects");
+            let request = format!(
+                "GET /api/events HTTP/1.1\r\nHost: {address}\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n"
+            );
+            stream
+                .write_all(request.as_bytes())
+                .await
+                .expect("SSE request writes");
+
+            let mut reader = BufReader::new(stream);
+            let mut status = String::new();
+            reader
+                .read_line(&mut status)
+                .await
+                .expect("status line reads");
+            assert!(
+                status.starts_with("HTTP/1.1 200"),
+                "unexpected status line: {status:?}"
+            );
+
+            let mut chunked = false;
+            let mut event_stream = false;
+            loop {
+                let mut header = String::new();
+                let read = reader
+                    .read_line(&mut header)
+                    .await
+                    .expect("header line reads");
+                assert!(read > 0, "response ended before headers completed");
+
+                let header = header.trim_end();
+                if header.is_empty() {
+                    break;
+                }
+
+                let lower = header.to_ascii_lowercase();
+                if lower.starts_with("transfer-encoding:") && lower.contains("chunked") {
+                    chunked = true;
+                }
+                if lower.starts_with("content-type:") && lower.contains("text/event-stream") {
+                    event_stream = true;
+                }
+            }
+
+            assert!(event_stream, "SSE response must use text/event-stream");
+
+            Self {
+                reader,
+                chunked,
+                decoded: Vec::new(),
+            }
+        }
+
+        async fn next_frame(&mut self) -> String {
+            timeout(Duration::from_secs(2), self.read_frame())
+                .await
+                .expect("SSE frame arrives before timeout")
+        }
+
+        async fn read_frame(&mut self) -> String {
+            loop {
+                if let Some((index, separator_len)) = frame_separator(&self.decoded) {
+                    let frame = self.decoded.drain(..index).collect::<Vec<_>>();
+                    self.decoded.drain(..separator_len);
+                    return String::from_utf8(frame).expect("SSE frame is utf-8");
+                }
+
+                assert!(self.read_more().await, "SSE stream ended before next frame");
+            }
+        }
+
+        async fn read_more(&mut self) -> bool {
+            if self.chunked {
+                let mut size_line = String::new();
+                let read = self
+                    .reader
+                    .read_line(&mut size_line)
+                    .await
+                    .expect("chunk size line reads");
+                if read == 0 {
+                    return false;
+                }
+
+                let size_hex = size_line
+                    .trim_end()
+                    .split(';')
+                    .next()
+                    .expect("chunk size exists");
+                let size = usize::from_str_radix(size_hex, 16).expect("chunk size is hex");
+                if size == 0 {
+                    return false;
+                }
+
+                let mut chunk = vec![0; size];
+                self.reader
+                    .read_exact(&mut chunk)
+                    .await
+                    .expect("chunk body reads");
+                self.decoded.extend(chunk);
+
+                let mut trailer = [0_u8; 2];
+                self.reader
+                    .read_exact(&mut trailer)
+                    .await
+                    .expect("chunk trailer reads");
+                assert_eq!(&trailer, b"\r\n", "chunk must end with CRLF");
+                true
+            } else {
+                let mut buffer = [0_u8; 1024];
+                let read = self.reader.read(&mut buffer).await.expect("SSE body reads");
+                if read == 0 {
+                    return false;
+                }
+                self.decoded.extend_from_slice(&buffer[..read]);
+                true
+            }
+        }
+    }
+
+    fn frame_separator(bytes: &[u8]) -> Option<(usize, usize)> {
+        bytes
+            .windows(2)
+            .position(|window| window == b"\n\n")
+            .map(|index| (index, 2))
+            .or_else(|| {
+                bytes
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|index| (index, 4))
+            })
+    }
+
+    fn frame_fields(frame: &str) -> BTreeMap<String, String> {
+        frame
+            .lines()
+            .filter_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                Some((key.to_owned(), value.trim_start().to_owned()))
+            })
+            .collect()
     }
 
     #[tokio::test]
@@ -788,5 +1173,99 @@ mod tests {
             body_json::<Value>(response).await,
             json!({ "kind": "internal", "message": "internal server error" })
         );
+    }
+
+    #[tokio::test]
+    async fn sse_endpoint_streams_event_frames_with_ids_and_heartbeats() {
+        let service = Arc::new(ScriptedService::default());
+        let (address, server) =
+            spawn_loopback_server(service.clone(), Duration::from_millis(50)).await;
+        let mut client = SseClient::connect(address).await;
+        wait_for(|| service.subscription_count() == 1).await;
+
+        service.send_event(text_delta("hello"));
+
+        let frame = client.next_frame().await;
+        let fields = frame_fields(&frame);
+        assert_eq!(fields.get("id").map(String::as_str), Some("1"));
+        assert_eq!(fields.get("event").map(String::as_str), Some("text_delta"));
+        let data: Value =
+            serde_json::from_str(fields.get("data").expect("event frame contains JSON data"))
+                .expect("event data is JSON");
+        assert_eq!(data["type"], "text_delta");
+        assert_eq!(data["id"], json!(session_id()));
+        assert_eq!(data["text"], "hello");
+
+        let heartbeat = client.next_frame().await;
+        let heartbeat_fields = frame_fields(&heartbeat);
+        assert_eq!(heartbeat_fields.get("").map(String::as_str), Some("ping"));
+        assert!(
+            !heartbeat_fields.contains_key("id"),
+            "heartbeat comments should not consume event ids"
+        );
+
+        drop(client);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn sse_endpoint_broadcasts_to_independent_connections() {
+        let service = Arc::new(ScriptedService::default());
+        let (address, server) =
+            spawn_loopback_server(service.clone(), Duration::from_secs(5)).await;
+        let mut first = SseClient::connect(address).await;
+        let mut second = SseClient::connect(address).await;
+        wait_for(|| service.subscription_count() == 2).await;
+
+        service.send_event(ServiceEvent::ConfigChanged { revision: 7 });
+
+        for client in [&mut first, &mut second] {
+            let frame = client.next_frame().await;
+            let fields = frame_fields(&frame);
+            assert_eq!(fields.get("id").map(String::as_str), Some("1"));
+            assert_eq!(
+                fields.get("event").map(String::as_str),
+                Some("config_changed")
+            );
+            let data: Value =
+                serde_json::from_str(fields.get("data").expect("event frame contains JSON data"))
+                    .expect("event data is JSON");
+            assert_eq!(data, json!({ "type": "config_changed", "revision": 7 }));
+        }
+
+        assert_eq!(
+            service.calls(),
+            vec![Call::Subscribe(None), Call::Subscribe(None)]
+        );
+
+        drop(first);
+        drop(second);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn sse_forwarder_cleans_up_subscription_after_client_disconnect() {
+        let service = Arc::new(ScriptedService::default());
+        let (address, server) =
+            spawn_loopback_server(service.clone(), Duration::from_millis(50)).await;
+        let client = SseClient::connect(address).await;
+        wait_for(|| service.active_subscription_count() == 1).await;
+
+        drop(client);
+
+        wait_for(|| service.active_subscription_count() == 0).await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn sse_forwarder_disconnects_when_bounded_queue_overflows() {
+        let service = Arc::new(ScriptedService::default());
+        let _receiver = spawn_event_forwarder(service.clone(), 1);
+        wait_for(|| service.active_subscription_count() == 1).await;
+
+        service.send_event(text_delta("first"));
+        service.send_event(text_delta("second"));
+
+        wait_for(|| service.active_subscription_count() == 0).await;
     }
 }

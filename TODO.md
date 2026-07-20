@@ -223,7 +223,7 @@ CI 承载（引入 CI 时列为第一批）；⑥tool 输出为 agent-lib Conten
 - 聚焦测试使用 `tower::ServiceExt::oneshot` + scripted `MagService` 覆盖每条路由的方法调用映射、成功响应体、204 空响应、全部 `ServiceError` 变体投影与通用内部错误投影。
 - 验证通过：`cargo fmt --all`、`cargo test -p mag-web`、`cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`、`cargo doc --no-deps --workspace`。
 
-### W2-2 [TODO] SSE 事件面
+### W2-2 [DONE] SSE 事件面
 
 - **上下文**：`docs/WEB.md` §2.2。
 - **实现要求**：`GET /api/events` → `text/event-stream`：`subscribe(None)` 事件流 → 帧
@@ -232,6 +232,14 @@ CI 承载（引入 CI 时列为第一批）；⑥tool 输出为 agent-lib Conten
   任务。auth 中间件接入点预留（W2-3 启用）。
 - **验证条件**：聚焦测试：回环端口起 server，reqwest/自写 SSE 客户端收帧——事件帧格式、heartbeat、
   两个连接都收到广播、scripted service 停发后连接清理。默认验证序列全过。
+
+完成记录（2026-07-21）：
+
+- `mag-web` 新增 `GET /api/events`：每连接调用 `subscribe(None)`，以有界队列转发为 `text/event-stream`；事件帧含单调 `id:`、`event: <type>` 与 `data: <Event/ServiceEvent 同形 JSON>`。
+- SSE stream 内置约 15s `: ping` comment heartbeat；客户端断开时关闭转发任务并释放订阅；有界队列溢出时记录 stderr 日志并断开该连接，避免慢消费者阻塞服务事件流。
+- 多连接各自独立订阅，同一广播事件会进入各连接自己的 SSE 序列；auth 接入点仍保留到 W2-3。
+- 聚焦测试覆盖：回环端口 server + 自写 chunked SSE 客户端验证事件帧格式/heartbeat；双连接广播；客户端断开后的订阅清理；直接有界队列溢出断连。
+- 验证通过：`cargo fmt --all`、`cargo test -p mag-web`、`cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`、`cargo doc --no-deps --workspace`。
 
 ### W2-3 [TODO] token auth + 静态资源
 

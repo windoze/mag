@@ -9,9 +9,9 @@ futures.workspace = true
 mag-service = { path = "../mag-service" }
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["net", "rt"] }
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 
 [dev-dependencies]
 async-trait.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tower = { workspace = true, features = ["util"] }
