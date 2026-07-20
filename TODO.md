@@ -264,7 +264,7 @@ CI 承载（引入 CI 时列为第一批）；⑥tool 输出为 agent-lib Conten
 - 聚焦测试覆盖：正确/错误/缺失 token、默认生成 token、`--no-auth` loopback 直通、非 loopback 忽略 `--no-auth`、静态资源无 auth、SPA fallback、缺失 dist 占位页。
 - 验证通过：`cargo fmt --all`、`cargo test -p mag-web`、`cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo check -p mag-web --release`、`cargo test --workspace`、`cargo doc --no-deps --workspace`。
 
-### W2-4 [TODO] bin `mag --web` + 协议级 e2e
+### W2-4 [DONE] bin `mag --web` + 协议级 e2e
 
 - **上下文**：`docs/WEB.md` §1.3；bin 现有 `--acp`/`--config`（crates/mag/src/main.rs）。
 - **实现要求**：
@@ -277,6 +277,15 @@ CI 承载（引入 CI 时列为第一批）；⑥tool 输出为 agent-lib Conten
     GET/reload/apply → sources。可分多个测试。
   - mag-acp/CLI 路径回归不破。
 - **验证条件**：上述 e2e 全绿；默认验证序列全过。
+
+完成记录（2026-07-21）：
+
+- `mag` bin 新增 `--web [--host] [--port] [--token <t>] [--no-auth]`，与 `--acp` 平级且互斥；`--resume` 仍仅允许终端 CLI。web flags 未带 `--web`、`--token` 与 `--no-auth` 同用会报用法错误。
+- `mag --web` 沿用现有配置装配路径：`ConfigService::load_or_default` → `Engine::from_config` → `Arc<dyn MagService>` → `mag_web`。启动时先绑定 socket，再打印实际访问 URL；默认生成 token 时打印 `#t=<token>` fragment，外部提供 token 时不回显 token 并提示由调用方持有，`--no-auth` 打印 auth disabled。
+- `mag-web` 新增 `serve_prepared(listener, PreparedRouter)`，供上层 bin 在绑定后读取实际地址并启动 server；既有 `serve()` 继续保留。
+- 新增 `crates/mag/tests/web_e2e.rs` 协议级离线 e2e：fake LLM + 真实 `Engine` + 回环 TCP `mag-web` server + 原始 HTTP/SSE 客户端，覆盖建会话、SSE 流事件、工具审批、interaction 响应、run 继续、run 中 pivot→`pivot_applied`、cancel→cancelled run error、`GET history` 含 tool call、config GET/reload/apply、sources list/probe。
+- mag-acp/默认 CLI 路径回归通过；`mag-web` 依赖边界未变化，Engine 注入仍只在上层 `mag` bin/test 中发生。
+- 验证通过：`cargo fmt --all`、`cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test -p mag --bin mag`、`cargo test -p mag --test web_e2e`、`cargo test -p mag-web`、`cargo test --workspace`、`cargo doc --no-deps --workspace`。
 
 ### W2-R [TODO] W2 review
 

@@ -180,6 +180,22 @@ pub async fn serve(service: Arc<dyn MagService>, opts: ServeOptions) -> io::Resu
     let prepared = prepare_router(service, opts)?;
     let address = prepared.options().address();
     let listener = tokio::net::TcpListener::bind(address).await?;
+    serve_prepared(listener, prepared).await
+}
+
+/// Runs an already prepared router on an already bound TCP listener.
+///
+/// This lets the bin layer bind first, inspect the actual local address (for
+/// example when `--port 0` is used by tests), print the access URL, and then
+/// hand the listener to `mag-web` without duplicating router internals.
+///
+/// # Errors
+///
+/// Returns the server I/O error reported by axum.
+pub async fn serve_prepared(
+    listener: tokio::net::TcpListener,
+    prepared: PreparedRouter,
+) -> io::Result<()> {
     axum::serve(listener, prepared.into_router()).await
 }
 
