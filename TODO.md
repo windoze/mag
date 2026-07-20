@@ -1246,7 +1246,7 @@ GUI/web/CLI 无需感知多个会话通道。
     `large_enum_variant` 与 `collapsible_str_replace`，已修）3) `cargo test -p mag-cli` ✅（3 passed）4)
     `cargo test --workspace` ✅（全绿，1 ignored 为既有 zed 联调测试）5) `cargo doc --no-deps --workspace` ✅。
 
-### M6-3 [TODO] pivot/cancel/会话命令
+### M6-3 [DONE] pivot/cancel/会话命令
 
 - **上下文**：`docs/CLI.md` §2/§3.2（决策 D1 第二层在 CLI）。
 - **实现要求**：
@@ -1258,6 +1258,29 @@ GUI/web/CLI 无需感知多个会话通道。
     `/sources`、`/help`、`/quit`——行为按 §2 命令面。
 - **验证条件**：e2e：run 中输入触发 pivot（断言先 pivot 后无回落）；scripted `NotPivotable` 时断言回落
   `send_message`；Ctrl-C 路径（用信号或注入点）；各 slash 命令调用正确 service 方法。默认验证序列全过。
+
+  **完成记录**（2026-07-20）：
+  - 实现要点：`mag-cli` 主循环从全局 in-flight 计数改为按 `SessionId` 跟踪活动 run；普通文本在当前会话
+    run 进行中时先调 `pivot_message`，仅 `ServiceError::NotPivotable` 自动回落 `send_message`，保持
+    `docs/CLI.md` §3.2 决策 D1 的两层语义。`PivotQueued` / `PivotApplied` / `PivotDropped` 事件新增一行状态
+    渲染。Ctrl-C：pending 交互仍走 M6-2 的 cancel 决策；当前会话 run 进行中时调 `cancel(session_id)`；Idle
+    时忽略。非 TTY e2e 增加单独 ASCII ETX 行（`\u{3}`）作为 Ctrl-C 注入点。
+  - slash 命令：补齐 `/sessions`（列表并用 `*` 标当前）、`/resume <id>`、`/delete <id>`、`/cancel`、
+    `/sources`（依次调用 `list_sources` 与 `probe_local_agents` 并打印两组结果）和更新后的 `/help`；保留
+    `/new`、`/quit`。命令错误以 `[error]` 打印并保持 REPL 存活。
+  - 竞态修复：`NotPivotable` 回落路径可能在同一 session 上立即启动新 run，而旧 run 的 terminal 事件稍后才
+    到达；若直接按 session 清活动标记，`/quit` 可提前退出并丢新 run 输出。实现上在 NotPivotable 回落成功启动
+    新 run 时记录一次“跳过下一条旧 terminal”的计数，保证旧 terminal 不会清掉回落后新 run 的活动状态。
+  - 测试（全部离线，scripted `Arc<dyn MagService>` + 管道 stdin/stdout）：`mag-cli` e2e 从 3 个扩到 7 个，新增
+    `text_during_an_in_flight_run_uses_pivot_without_falling_back`、`not_pivotable_falls_back_to_send_message`、
+    `ctrl_c_during_an_in_flight_run_cancels_the_current_session`、
+    `slash_commands_call_the_matching_service_methods`；scripted service 记录 pivot/cancel/session/source 调用并
+    模拟 pivot 成功、NotPivotable 竞态回落和取消终态。既有 M6-1/M6-2 对话、`/new`、交互队列测试继续通过。
+  - 依赖边界：`cargo tree -p mag-cli -e normal --depth 1` 仅为 futures / mag-service / rustyline / tokio，未直接依赖
+    mag-core / agent-lib / mag-config。
+  - 门禁结果：1) `cargo fmt --all -- --check` ✅ 2) `cargo test -p mag-cli` ✅（7 passed）3)
+    `cargo clippy --all-targets -- -D warnings` ✅ 4) `cargo test --workspace` ✅（全绿，1 ignored 为既有 zed 联调测试）
+    5) `cargo doc --no-deps --workspace` ✅（0 warning）。
 
 ### M6-4 [TODO] `/config` 命令
 

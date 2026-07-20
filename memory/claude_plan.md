@@ -1,41 +1,27 @@
-执行计划
+# 执行计划
 
-1. 读取 `TODO.md`，按标题是否带有 `[DONE]` 判断第一个未完成任务，并核对该任务的验证要求与依赖。
-2. 检查最近提交和当前工作区状态，只关注与当前任务直接相关或会阻塞当前任务的问题，不做开放式历史问题扫查。
-3. 阅读当前任务涉及的代码、测试和文档，确定最小正确实现范围；如发现必须先修复的具体前置问题，则更新 `TODO.md` 并停止。
-4. 按任务要求实现代码或文档变更，避免 workaround 和偏离规格的实现。
-5. 按要求先运行格式化，再运行 lint，再运行相关测试和必要的完整测试；如出现未调度失败，修复或在 `TODO.md` 中加入最小前置任务。
-6. 更新 `TODO.md`：在完成任务标题前加 `[DONE]`，补全完成记录；仅当阶段级计划变化时才更新 `PLAN.md`。
-7. 检查变更，提交所有本次任务相关改动，提交后停止，不继续下一个任务。
+本文件记录当前调用的执行计划与关键进展。为避免记录不可审计的私有推理，这里只写可执行步骤、约束和后续更新。
 
-进度记录
+## 初始计划
 
-- 已创建本执行计划文件，下一步读取 `TODO.md` 确认第一个未完成任务。
-- 已读取 `TODO.md`，首个未完成任务为 `M6-1 [TODO] mag-cli 骨架：双任务 REPL + 基本对话渲染`。
-- 当前执行重点：新增只依赖 `mag-service` 与允许库的 `mag-cli` crate，提供 `Cli::run(Arc<dyn MagService>, opts)`，实现 stdin/rustyline 输入任务、service 事件渲染任务、基本会话创建、消息发送、`/new`、`/quit`，并补 scripted service 的管道 e2e。
-- 下一步检查工作区状态与最近提交，只处理与 M6-1 直接相关的未完成事项。
-- 已新增 `crates/mag-cli` crate、workspace 成员、`Cli::run` / `Cli::run_with_io`、基础 REPL 分派、事件渲染和 pipe e2e 测试；下一步运行格式化与聚焦测试，按编译反馈修正。
-- 验证已通过：`cargo fmt --all -- --check`、`cargo test -p mag-cli`、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`、`cargo doc --no-deps --workspace`。
-- 已将 `TODO.md` 中 M6-1 标记为 `[DONE]` 并补完成记录；下一步检查 diff 后提交。
-- 复查时补强 TTY prompt 输出路径，使其与 pipe prompt 一样经共享 stdout 锁写出；已重新通过完整验证序列。
-## 本轮执行计划
+1. 读取 `TODO.md`，按任务标题是否带 `[DONE]` 判断第一个未完成任务。
+2. 检查最新提交信息是否明确提到与该任务直接相关的未完成问题；只处理会阻塞当前任务的问题。
+3. 阅读当前任务涉及的代码、测试和文档，确认验收要求与依赖。
+4. 按任务要求做最小且完整的实现；如遇到阻塞当前任务的规格缺口或失败测试，优先修复或在 `TODO.md` 中插入最小前置任务并停止。
+5. 运行格式化、lint 和相关测试；若代码有变更，按要求先 `cargo fmt`，再 `cargo clippy --all-targets -- -D warnings`，最后运行必要测试或完整测试套件。
+6. 更新 `TODO.md`：完成时给任务标题加 `[DONE]` 并填写完成记录；仅当阶段计划变化时才更新 `PLAN.md`。
+7. 检查 git 状态和 diff，提交本次任务的所有相关变更，然后停止，不继续下一个任务。
 
-1. 读取 `TODO.md`，按标题是否带 `[DONE]` 判断第一个未完成任务，并核对相关依赖、验证要求和完成记录。
-2. 检查最近提交和当前工作区状态，仅确认是否存在与当前任务直接相关的未完成事项或未提交改动。
-3. 针对第一个未完成任务阅读必要代码与测试，明确最小正确实现范围，不做开放式历史问题扫描。
-4. 实现该任务；如果发现阻塞当前任务的规格不匹配或未排期失败测试，则按要求在 `TODO.md` 添加最小前置任务并停止。
-5. 运行格式化、lint 和相关测试；若代码变更需要完整验证，则在 lint 通过后运行完整测试套件。
-6. 在验证通过后，将当前任务标题加上 `[DONE]`，更新完成记录；仅当阶段级计划变化时更新 `PLAN.md`。
-7. 检查 diff 和 git 状态，提交本轮全部相关改动，然后停止，不推进下一项任务。
+## 进展记录
 
-进度：已读取 `TODO.md`，本轮第一个未完成任务为 `M6-2 [TODO] PromptCoordinator：交互提示（审批 + Question/Choice）`。
-
-## M6-2 具体执行步骤
-
-1. 检查 git 状态与最近提交，只处理与 M6-2 直接相关的未完成事项。
-2. 阅读 `crates/mag-cli` 现有双任务 REPL、测试与 `mag-service` 交互 wire 类型。
-3. 在 `mag-cli` 内实现交互协调：`InteractionRequested` 入队、非流式输出时逐条提示、按类型读取用户输入并调用 `respond_interaction`。已完成：render task 将交互事件转交 coordinator，coordinator 持有单一队列与 active prompt。
-4. 审批提示渲染可用 tool call 摘要、requirement reason 和 origin 前缀；Question 读取文本；Choice 渲染编号菜单并回传 index；pending 交互中的 Ctrl-C/EOF 映射为保守取消响应。已完成。
-5. 增加 scripted service 管道 e2e，覆盖审批、Question、Choice、delegate origin 标注和多条交互顺序。已完成。
-6. 运行规定验证序列，修复发现的问题。已通过：`cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test -p mag-cli`、`cargo test --workspace`、`cargo doc --no-deps --workspace`。
-7. 将 M6-2 标记 `[DONE]` 并补完成记录；提交本轮相关改动后停止。已更新 `TODO.md`，下一步检查 diff 并提交。
+- 已写入初始执行计划，下一步读取 `TODO.md`。
+- 已读取 `TODO.md`，首个未完成任务为 `M6-3 [TODO] pivot/cancel/会话命令`。
+- 已检查最新提交：`7e29bf1 [M6-1/M6-2] Add mag-cli REPL and prompt coordinator`，未发现提交信息中明确标注的未完成阻塞项。
+- 下一步检查 `crates/mag-cli` 当前实现和测试，补齐 pivot、cancel 与会话/source slash 命令，并扩展 e2e 覆盖。
+- 已完成初版代码改动：`mag-cli` 现在按 session 跟踪活动 run，普通文本在当前 run 进行中时先调 `pivot_message`，`NotPivotable` 自动回落 `send_message`；Ctrl-C 和 `/cancel` 调 `cancel`；新增 `/sessions`、`/resume`、`/delete`、`/sources` 命令；渲染 `PivotQueued/Applied/Dropped` 状态。
+- 已扩展 `mag-cli` e2e scripted service 和测试，覆盖 pivot 成功、NotPivotable 回落、Ctrl-C 取消、slash 命令服务调用。下一步运行格式化与测试。
+- `cargo test -p mag-cli` 首次编译发现 `session_id` 同时可变/不可变借用，已通过提前计算 `current_session_running` 修复。下一步重跑格式化与聚焦测试。
+- 聚焦测试通过后，`cargo clippy --all-targets -- -D warnings` 发现两个 `collapsible_if`，已按 lint 建议改为链式判断。下一步重跑格式化、聚焦测试和 clippy。
+- 随后 `not_pivotable_falls_back_to_send_message` 暴露同一 session 的旧 terminal 事件可在回落启动新 run 后清掉活动标记，导致 `/quit` 提前退出。已在 `NotPivotable` 回落路径增加“跳过下一条旧 terminal”计数，防止新 run 输出被丢弃。
+- 验证已通过：`cargo fmt --all -- --check`、`cargo test -p mag-cli`（7 passed）、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`、`cargo doc --no-deps --workspace`、`cargo tree -p mag-cli -e normal --depth 1`。
+- 已将 `TODO.md` 中 `M6-3` 标记为 `[DONE]` 并补完成记录。下一步检查 git diff/status 后提交。

@@ -14,7 +14,7 @@ use mag_service::{
     ApprovalDecisionWire, ApprovalRequirementWire, ConfigDto, InteractionKindWire,
     InteractionOrigin, InteractionResponseWire, MagService, RequestId, RoutingMode, RunId,
     RunOutput, ServiceError, ServiceEvent, SessionConfig, SessionId, SessionInfo, SourceInfo,
-    ToolCallIdWire, UsageInfo, UserInput,
+    SourceKindWire, ToolCallIdWire, UsageInfo, UserInput,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast;
@@ -45,7 +45,14 @@ struct InteractionReply {
 struct ScriptedService {
     events: broadcast::Sender<ServiceEvent>,
     sent: Arc<Mutex<Vec<SentMessage>>>,
+    pivots: Arc<Mutex<Vec<SentMessage>>>,
     replies: Arc<Mutex<Vec<InteractionReply>>>,
+    cancels: Arc<Mutex<Vec<SessionId>>>,
+    resumes: Arc<Mutex<Vec<SessionId>>>,
+    deletes: Arc<Mutex<Vec<SessionId>>>,
+    list_sessions_calls: Arc<Mutex<usize>>,
+    list_sources_calls: Arc<Mutex<usize>>,
+    probe_calls: Arc<Mutex<usize>>,
     create_count: Arc<Mutex<usize>>,
 }
 
@@ -55,7 +62,14 @@ impl ScriptedService {
         Self {
             events,
             sent: Arc::new(Mutex::new(Vec::new())),
+            pivots: Arc::new(Mutex::new(Vec::new())),
             replies: Arc::new(Mutex::new(Vec::new())),
+            cancels: Arc::new(Mutex::new(Vec::new())),
+            resumes: Arc::new(Mutex::new(Vec::new())),
+            deletes: Arc::new(Mutex::new(Vec::new())),
+            list_sessions_calls: Arc::new(Mutex::new(0)),
+            list_sources_calls: Arc::new(Mutex::new(0)),
+            probe_calls: Arc::new(Mutex::new(0)),
             create_count: Arc::new(Mutex::new(0)),
         }
     }
@@ -64,8 +78,36 @@ impl ScriptedService {
         Arc::clone(&self.sent)
     }
 
+    fn pivots(&self) -> Arc<Mutex<Vec<SentMessage>>> {
+        Arc::clone(&self.pivots)
+    }
+
     fn replies(&self) -> Arc<Mutex<Vec<InteractionReply>>> {
         Arc::clone(&self.replies)
+    }
+
+    fn cancels(&self) -> Arc<Mutex<Vec<SessionId>>> {
+        Arc::clone(&self.cancels)
+    }
+
+    fn resumes(&self) -> Arc<Mutex<Vec<SessionId>>> {
+        Arc::clone(&self.resumes)
+    }
+
+    fn deletes(&self) -> Arc<Mutex<Vec<SessionId>>> {
+        Arc::clone(&self.deletes)
+    }
+
+    fn list_sessions_calls(&self) -> Arc<Mutex<usize>> {
+        Arc::clone(&self.list_sessions_calls)
+    }
+
+    fn list_sources_calls(&self) -> Arc<Mutex<usize>> {
+        Arc::clone(&self.list_sources_calls)
+    }
+
+    fn probe_calls(&self) -> Arc<Mutex<usize>> {
+        Arc::clone(&self.probe_calls)
     }
 
     fn emit_interaction_script(&self, id: SessionId) {
@@ -104,6 +146,17 @@ impl ScriptedService {
     }
 }
 
+fn scripted_session_config(provider: &str, model: &str) -> SessionConfig {
+    SessionConfig {
+        provider: provider.to_owned(),
+        model: model.to_owned(),
+        tool_profile: None,
+        cwd: None,
+        routing: RoutingMode::default(),
+        budget: None,
+    }
+}
+
 #[async_trait]
 impl MagService for ScriptedService {
     async fn create_session(&self, _config: SessionConfig) -> Result<SessionId, ServiceError> {
@@ -114,14 +167,26 @@ impl MagService for ScriptedService {
     }
 
     async fn list_sessions(&self) -> Result<Vec<SessionInfo>, ServiceError> {
-        Ok(Vec::new())
+        *self.list_sessions_calls.lock().expect("lock") += 1;
+        Ok(vec![
+            SessionInfo {
+                id: SessionId::parse_str(SESSION_A).expect("valid session id"),
+                config: scripted_session_config("openai", "gpt-5-codex"),
+            },
+            SessionInfo {
+                id: SessionId::parse_str(SESSION_B).expect("valid session id"),
+                config: scripted_session_config("anthropic", "claude-sonnet"),
+            },
+        ])
     }
 
-    async fn resume_session(&self, _id: SessionId) -> Result<(), ServiceError> {
+    async fn resume_session(&self, id: SessionId) -> Result<(), ServiceError> {
+        self.resumes.lock().expect("lock").push(id);
         Ok(())
     }
 
-    async fn delete_session(&self, _id: SessionId) -> Result<(), ServiceError> {
+    async fn delete_session(&self, id: SessionId) -> Result<(), ServiceError> {
+        self.deletes.lock().expect("lock").push(id);
         Ok(())
     }
 
@@ -136,6 +201,9 @@ impl MagService for ScriptedService {
             RunId::parse_str(RUN_A).expect("valid run id")
         };
         let _ = self.events.send(ServiceEvent::RunStarted { id, run_id });
+        if input.text == "hold" || input.text == "race-finish" {
+            return Ok(run_id);
+        }
         if input.text == "interact" {
             self.emit_interaction_script(id);
             return Ok(run_id);
@@ -162,14 +230,47 @@ impl MagService for ScriptedService {
         Ok(run_id)
     }
 
-    async fn cancel(&self, _id: SessionId) -> Result<(), ServiceError> {
+    async fn cancel(&self, id: SessionId) -> Result<(), ServiceError> {
+        self.cancels.lock().expect("lock").push(id);
+        let _ = self.events.send(ServiceEvent::RunError {
+            id,
+            message: "cancelled by user".to_owned(),
+            kind: mag_service::RunErrorKind::Cancelled,
+        });
         Ok(())
     }
 
-    async fn pivot_message(&self, _id: SessionId, _input: UserInput) -> Result<(), ServiceError> {
-        Err(ServiceError::Unsupported {
-            operation: "pivot_message".to_owned(),
-        })
+    async fn pivot_message(&self, id: SessionId, input: UserInput) -> Result<(), ServiceError> {
+        self.pivots.lock().expect("lock").push(SentMessage {
+            session_id: id,
+            text: input.text.clone(),
+        });
+        if input.text != "pivot now" {
+            if input.text == "fallback after race" {
+                let _ = self.events.send(ServiceEvent::RunFinished {
+                    id,
+                    output: RunOutput {
+                        text: "race finished".to_owned(),
+                        usage: None,
+                    },
+                });
+            }
+            return Err(ServiceError::NotPivotable {
+                id,
+                reason: "no in-progress run".to_owned(),
+            });
+        }
+
+        let _ = self.events.send(ServiceEvent::PivotQueued { id });
+        let _ = self.events.send(ServiceEvent::PivotApplied { id });
+        let _ = self.events.send(ServiceEvent::RunFinished {
+            id,
+            output: RunOutput {
+                text: "pivot landed".to_owned(),
+                usage: None,
+            },
+        });
+        Ok(())
     }
 
     async fn respond_interaction(
@@ -214,11 +315,29 @@ impl MagService for ScriptedService {
     }
 
     async fn list_sources(&self) -> Result<Vec<SourceInfo>, ServiceError> {
-        Ok(Vec::new())
+        *self.list_sources_calls.lock().expect("lock") += 1;
+        Ok(vec![SourceInfo {
+            id: "openai".to_owned(),
+            name: "OpenAI".to_owned(),
+            kind: SourceKindWire::LlmProvider,
+            available: true,
+            version: Some("v1".to_owned()),
+            path: None,
+            capabilities: vec!["chat".to_owned()],
+        }])
     }
 
     async fn probe_local_agents(&self) -> Result<Vec<SourceInfo>, ServiceError> {
-        Ok(Vec::new())
+        *self.probe_calls.lock().expect("lock") += 1;
+        Ok(vec![SourceInfo {
+            id: "local-coder".to_owned(),
+            name: "Local Coder".to_owned(),
+            kind: SourceKindWire::LocalAgent,
+            available: false,
+            version: None,
+            path: Some("/missing/local-coder".to_owned()),
+            capabilities: vec!["acp".to_owned()],
+        }])
     }
 
     async fn get_config(&self) -> Result<ConfigDto, ServiceError> {
@@ -448,5 +567,136 @@ async fn prompt_coordinator_answers_queued_interactions_in_order() {
     assert_eq!(
         replies[2].response,
         InteractionResponseWire::Choice { index: 1 }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn text_during_an_in_flight_run_uses_pivot_without_falling_back() {
+    let service = Arc::new(ScriptedService::new());
+    let sent = service.sent();
+    let pivots = service.pivots();
+
+    let output = drive("hold\npivot now\n/quit\n", service).await;
+
+    assert!(output.contains("[pivot queued"), "{output}");
+    assert!(output.contains("[pivot applied"), "{output}");
+    assert!(output.contains("pivot landed"), "{output}");
+
+    let sent = sent.lock().expect("lock").clone();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].text, "hold");
+
+    let pivots = pivots.lock().expect("lock").clone();
+    assert_eq!(pivots.len(), 1);
+    assert_eq!(pivots[0].text, "pivot now");
+    assert_eq!(
+        pivots[0].session_id,
+        SessionId::parse_str(SESSION_A).unwrap()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn not_pivotable_falls_back_to_send_message() {
+    let service = Arc::new(ScriptedService::new());
+    let sent = service.sent();
+    let pivots = service.pivots();
+
+    let output = drive("race-finish\nfallback after race\n/quit\n", service).await;
+
+    assert!(output.contains("race finished"), "{output}");
+    assert!(
+        output.contains("stream:fallback after race:done"),
+        "{output}"
+    );
+
+    let pivots = pivots.lock().expect("lock").clone();
+    assert_eq!(pivots.len(), 1);
+    assert_eq!(pivots[0].text, "fallback after race");
+
+    let sent = sent.lock().expect("lock").clone();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0].text, "race-finish");
+    assert_eq!(sent[1].text, "fallback after race");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctrl_c_during_an_in_flight_run_cancels_the_current_session() {
+    let service = Arc::new(ScriptedService::new());
+    let cancels = service.cancels();
+
+    let output = drive("hold\n\u{3}\n/quit\n", service).await;
+
+    assert!(output.contains("[cancel requested"), "{output}");
+    assert!(
+        output.contains("[error cancelled] cancelled by user"),
+        "{output}"
+    );
+
+    let cancels = cancels.lock().expect("lock").clone();
+    assert_eq!(cancels, vec![SessionId::parse_str(SESSION_A).unwrap()]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slash_commands_call_the_matching_service_methods() {
+    let service = Arc::new(ScriptedService::new());
+    let resumes = service.resumes();
+    let deletes = service.deletes();
+    let cancels = service.cancels();
+    let list_sessions_calls = service.list_sessions_calls();
+    let list_sources_calls = service.list_sources_calls();
+    let probe_calls = service.probe_calls();
+
+    let output = drive(
+        &format!(
+            "/sessions\n/resume {SESSION_B}\n/delete {SESSION_A}\n/cancel\n/sources\n/help\n/quit\n"
+        ),
+        service,
+    )
+    .await;
+
+    assert!(
+        output.contains(&format!("* {SESSION_A} provider=openai model=gpt-5-codex")),
+        "{output}"
+    );
+    assert!(
+        output.contains(&format!(
+            "  {SESSION_B} provider=anthropic model=claude-sonnet"
+        )),
+        "{output}"
+    );
+    assert!(
+        output.contains(&format!("[session {SESSION_B} resumed]")),
+        "{output}"
+    );
+    assert!(
+        output.contains(&format!("[session {SESSION_A} deleted]")),
+        "{output}"
+    );
+    assert!(output.contains("[sources]"), "{output}");
+    assert!(
+        output.contains("- openai name=OpenAI kind=llm_provider available=true"),
+        "{output}"
+    );
+    assert!(output.contains("[probed sources]"), "{output}");
+    assert!(
+        output.contains("- local-coder name=Local Coder kind=local_agent available=false"),
+        "{output}"
+    );
+    assert!(output.contains("commands: /new, /sessions"), "{output}");
+
+    assert_eq!(*list_sessions_calls.lock().expect("lock"), 1);
+    assert_eq!(*list_sources_calls.lock().expect("lock"), 1);
+    assert_eq!(*probe_calls.lock().expect("lock"), 1);
+    assert_eq!(
+        resumes.lock().expect("lock").clone(),
+        vec![SessionId::parse_str(SESSION_B).unwrap()]
+    );
+    assert_eq!(
+        deletes.lock().expect("lock").clone(),
+        vec![SessionId::parse_str(SESSION_A).unwrap()]
+    );
+    assert_eq!(
+        cancels.lock().expect("lock").clone(),
+        vec![SessionId::parse_str(SESSION_B).unwrap()]
     );
 }

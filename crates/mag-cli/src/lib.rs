@@ -9,7 +9,7 @@
 //! render task prints service events, and the coordinator turns user text into
 //! [`MagService::send_message`] calls or resolves queued interaction prompts.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::io::IsTerminal;
 use std::sync::Arc;
@@ -19,7 +19,8 @@ use mag_service::{
     ApprovalDecisionWire, ApprovalRequirementWire, InteractionKindWire, InteractionOrigin,
     InteractionResponseWire, MagService, PermissionCategoryWire, PermissionDecisionWire,
     PermissionRiskWire, RequestId, RoutingMode, RunErrorKind, ServiceError, ServiceEvent,
-    SessionConfig, SessionId, StepIdWire, ToolCallIdWire, UserInput,
+    SessionConfig, SessionId, SessionInfo, SourceInfo, SourceKindWire, StepIdWire, ToolCallIdWire,
+    UserInput,
 };
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, Stdout};
 use tokio::sync::{Mutex, mpsc};
@@ -162,7 +163,8 @@ enum InputCommand {
 }
 
 enum RenderNotice {
-    Terminal,
+    RunStarted(SessionId),
+    Terminal(SessionId),
     Interaction(Box<PendingInteraction>),
     StreamEnded,
     Io(std::io::Error),
@@ -170,7 +172,10 @@ enum RenderNotice {
 
 enum LineOutcome {
     Continue,
-    StartedRun,
+    StartedRun {
+        id: SessionId,
+        skip_next_terminal: bool,
+    },
     Quit,
 }
 
@@ -353,12 +358,13 @@ where
     let render_handle = tokio::spawn(render_events(events, render_output, notice_tx));
     let input_handle = spawn_input(Arc::clone(&output), opts.prompt.clone(), input_tx);
 
-    let mut in_flight_runs = 0usize;
+    let mut active_runs = HashSet::new();
+    let mut skipped_terminals = HashMap::<SessionId, usize>::new();
     let mut quitting = false;
     let mut prompts = PromptCoordinator::default();
 
     loop {
-        if quitting && in_flight_runs == 0 {
+        if quitting && active_runs.is_empty() {
             break;
         }
 
@@ -369,22 +375,35 @@ where
                         if prompts.answer(&service, &output, line.clone()).await? {
                             continue;
                         }
+                        let current_session_running = active_runs.contains(&session_id);
                         match handle_line(
                             &service,
                             &opts,
                             &output,
                             &mut session_id,
                             line,
+                            current_session_running,
                         ).await? {
                             LineOutcome::Continue => {}
-                            LineOutcome::StartedRun => in_flight_runs += 1,
+                            LineOutcome::StartedRun {
+                                id,
+                                skip_next_terminal,
+                            } => {
+                                active_runs.insert(id);
+                                if skip_next_terminal {
+                                    *skipped_terminals.entry(id).or_default() += 1;
+                                }
+                            }
                             LineOutcome::Quit => quitting = true,
                         }
                     }
                     Some(InputCommand::Interrupted) => {
-                        // M6-3 gives Ctrl-C run-cancel semantics. Until then, an
-                        // idle interrupt keeps the REPL alive.
-                        let _ = prompts.cancel_active(&service, &output).await?;
+                        if prompts.cancel_active(&service, &output).await? {
+                            continue;
+                        }
+                        if active_runs.contains(&session_id) {
+                            request_cancel(&service, &output, session_id).await?;
+                        }
                     }
                     Some(InputCommand::Eof) | None => {
                         if prompts.has_pending() {
@@ -401,11 +420,18 @@ where
                     Some(RenderNotice::Interaction(interaction)) => {
                         prompts.enqueue(&output, session_id, *interaction).await?;
                     }
-                    Some(RenderNotice::Terminal) => {
-                        in_flight_runs = in_flight_runs.saturating_sub(1);
+                    Some(RenderNotice::RunStarted(id)) => {
+                        active_runs.insert(id);
+                    }
+                    Some(RenderNotice::Terminal(id)) => {
+                        if should_skip_terminal(&mut skipped_terminals, id) {
+                            continue;
+                        }
+                        active_runs.remove(&id);
                     }
                     Some(RenderNotice::StreamEnded) | None => {
-                        in_flight_runs = 0;
+                        active_runs.clear();
+                        skipped_terminals.clear();
                         if quitting {
                             break;
                         }
@@ -430,6 +456,7 @@ async fn handle_line<W>(
     output: &SharedOutput<W>,
     session_id: &mut SessionId,
     line: String,
+    current_session_running: bool,
 ) -> Result<LineOutcome, CliError>
 where
     W: AsyncWrite + Send + Unpin + 'static,
@@ -439,33 +466,308 @@ where
         return Ok(LineOutcome::Continue);
     }
 
-    match trimmed {
+    if trimmed.starts_with('/') {
+        return handle_slash_command(service, opts, output, session_id, trimmed).await;
+    }
+
+    if current_session_running {
+        pivot_or_send_message(service, output, *session_id, line).await
+    } else {
+        send_message(service, output, *session_id, line).await
+    }
+}
+
+async fn handle_slash_command<W>(
+    service: &Arc<dyn MagService>,
+    opts: &CliOptions,
+    output: &SharedOutput<W>,
+    session_id: &mut SessionId,
+    line: &str,
+) -> Result<LineOutcome, CliError>
+where
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    let mut parts = line.split_whitespace();
+    let command = parts.next().unwrap_or_default();
+    match command {
         "/quit" => Ok(LineOutcome::Quit),
         "/new" => {
-            let new_session = service.create_session(opts.session.clone()).await?;
-            *session_id = new_session;
-            write_line(output, &format!("[session {new_session}]\n")).await?;
+            if parts.next().is_some() {
+                write_line(output, "[error] usage: /new\n").await?;
+                return Ok(LineOutcome::Continue);
+            }
+            match service.create_session(opts.session.clone()).await {
+                Ok(new_session) => {
+                    *session_id = new_session;
+                    write_line(output, &format!("[session {new_session}]\n")).await?;
+                }
+                Err(error) => write_line(output, &format!("[error] {error}\n")).await?,
+            }
+            Ok(LineOutcome::Continue)
+        }
+        "/sessions" => {
+            if parts.next().is_some() {
+                write_line(output, "[error] usage: /sessions\n").await?;
+                return Ok(LineOutcome::Continue);
+            }
+            match service.list_sessions().await {
+                Ok(sessions) => render_sessions(output, &sessions, *session_id).await?,
+                Err(error) => write_line(output, &format!("[error] {error}\n")).await?,
+            }
+            Ok(LineOutcome::Continue)
+        }
+        "/resume" => {
+            let Some(raw_id) = parts.next() else {
+                write_line(output, "[error] usage: /resume <session-id>\n").await?;
+                return Ok(LineOutcome::Continue);
+            };
+            if parts.next().is_some() {
+                write_line(output, "[error] usage: /resume <session-id>\n").await?;
+                return Ok(LineOutcome::Continue);
+            }
+            let id = match SessionId::parse_str(raw_id) {
+                Ok(id) => id,
+                Err(error) => {
+                    write_line(output, &format!("[error] invalid session id: {error}\n")).await?;
+                    return Ok(LineOutcome::Continue);
+                }
+            };
+            match service.resume_session(id).await {
+                Ok(()) => {
+                    *session_id = id;
+                    write_line(output, &format!("[session {id} resumed]\n")).await?;
+                }
+                Err(error) => write_line(output, &format!("[error] {error}\n")).await?,
+            }
+            Ok(LineOutcome::Continue)
+        }
+        "/delete" => {
+            let Some(raw_id) = parts.next() else {
+                write_line(output, "[error] usage: /delete <session-id>\n").await?;
+                return Ok(LineOutcome::Continue);
+            };
+            if parts.next().is_some() {
+                write_line(output, "[error] usage: /delete <session-id>\n").await?;
+                return Ok(LineOutcome::Continue);
+            }
+            let id = match SessionId::parse_str(raw_id) {
+                Ok(id) => id,
+                Err(error) => {
+                    write_line(output, &format!("[error] invalid session id: {error}\n")).await?;
+                    return Ok(LineOutcome::Continue);
+                }
+            };
+            match service.delete_session(id).await {
+                Ok(()) => write_line(output, &format!("[session {id} deleted]\n")).await?,
+                Err(error) => write_line(output, &format!("[error] {error}\n")).await?,
+            }
+            Ok(LineOutcome::Continue)
+        }
+        "/cancel" => {
+            if parts.next().is_some() {
+                write_line(output, "[error] usage: /cancel\n").await?;
+                return Ok(LineOutcome::Continue);
+            }
+            request_cancel(service, output, *session_id).await?;
+            Ok(LineOutcome::Continue)
+        }
+        "/sources" => {
+            if parts.next().is_some() {
+                write_line(output, "[error] usage: /sources\n").await?;
+                return Ok(LineOutcome::Continue);
+            }
+            match service.list_sources().await {
+                Ok(sources) => render_sources(output, "sources", &sources).await?,
+                Err(error) => {
+                    write_line(output, &format!("[error] list_sources: {error}\n")).await?
+                }
+            }
+            match service.probe_local_agents().await {
+                Ok(sources) => render_sources(output, "probed sources", &sources).await?,
+                Err(error) => {
+                    write_line(output, &format!("[error] probe_local_agents: {error}\n")).await?
+                }
+            }
             Ok(LineOutcome::Continue)
         }
         "/help" => {
-            write_line(output, "commands: /new, /help, /quit\n").await?;
+            if parts.next().is_some() {
+                write_line(output, "[error] usage: /help\n").await?;
+                return Ok(LineOutcome::Continue);
+            }
+            write_line(
+                output,
+                "commands: /new, /sessions, /resume <id>, /delete <id>, /cancel, /sources, /help, /quit\n",
+            )
+            .await?;
             Ok(LineOutcome::Continue)
         }
-        command if command.starts_with('/') => {
+        _ => {
             write_line(output, &format!("[error] unknown command `{command}`\n")).await?;
             Ok(LineOutcome::Continue)
         }
-        _ => match service
-            .send_message(*session_id, UserInput::text(line))
-            .await
-        {
-            Ok(_) => Ok(LineOutcome::StartedRun),
-            Err(error) => {
-                write_line(output, &format!("[error] {error}\n")).await?;
-                Ok(LineOutcome::Continue)
-            }
-        },
     }
+}
+
+async fn pivot_or_send_message<W>(
+    service: &Arc<dyn MagService>,
+    output: &SharedOutput<W>,
+    session_id: SessionId,
+    line: String,
+) -> Result<LineOutcome, CliError>
+where
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    match service
+        .pivot_message(session_id, UserInput::text(line.clone()))
+        .await
+    {
+        Ok(()) => Ok(LineOutcome::Continue),
+        Err(ServiceError::NotPivotable { .. }) => {
+            send_message_with_terminal_skip(service, output, session_id, line).await
+        }
+        Err(error) => {
+            write_line(output, &format!("[error] {error}\n")).await?;
+            Ok(LineOutcome::Continue)
+        }
+    }
+}
+
+async fn send_message<W>(
+    service: &Arc<dyn MagService>,
+    output: &SharedOutput<W>,
+    session_id: SessionId,
+    line: String,
+) -> Result<LineOutcome, CliError>
+where
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    send_message_inner(service, output, session_id, line, false).await
+}
+
+async fn send_message_with_terminal_skip<W>(
+    service: &Arc<dyn MagService>,
+    output: &SharedOutput<W>,
+    session_id: SessionId,
+    line: String,
+) -> Result<LineOutcome, CliError>
+where
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    send_message_inner(service, output, session_id, line, true).await
+}
+
+async fn send_message_inner<W>(
+    service: &Arc<dyn MagService>,
+    output: &SharedOutput<W>,
+    session_id: SessionId,
+    line: String,
+    skip_next_terminal: bool,
+) -> Result<LineOutcome, CliError>
+where
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    match service
+        .send_message(session_id, UserInput::text(line))
+        .await
+    {
+        Ok(_) => Ok(LineOutcome::StartedRun {
+            id: session_id,
+            skip_next_terminal,
+        }),
+        Err(error) => {
+            write_line(output, &format!("[error] {error}\n")).await?;
+            Ok(LineOutcome::Continue)
+        }
+    }
+}
+
+async fn request_cancel<W>(
+    service: &Arc<dyn MagService>,
+    output: &SharedOutput<W>,
+    session_id: SessionId,
+) -> Result<(), CliError>
+where
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    match service.cancel(session_id).await {
+        Ok(()) => write_line(output, &format!("[cancel requested {session_id}]\n")).await?,
+        Err(error) => write_line(output, &format!("[error] {error}\n")).await?,
+    }
+    Ok(())
+}
+
+fn should_skip_terminal(skipped_terminals: &mut HashMap<SessionId, usize>, id: SessionId) -> bool {
+    let Some(skips) = skipped_terminals.get_mut(&id) else {
+        return false;
+    };
+    *skips -= 1;
+    if *skips == 0 {
+        skipped_terminals.remove(&id);
+    }
+    true
+}
+
+async fn render_sessions<W>(
+    output: &SharedOutput<W>,
+    sessions: &[SessionInfo],
+    current_session: SessionId,
+) -> Result<(), std::io::Error>
+where
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    let mut rendered = "[sessions]\n".to_owned();
+    if sessions.is_empty() {
+        rendered.push_str("(none)\n");
+    } else {
+        for session in sessions {
+            let marker = if session.id == current_session {
+                "*"
+            } else {
+                " "
+            };
+            rendered.push_str(&format!(
+                "{marker} {} provider={} model={}\n",
+                session.id, session.config.provider, session.config.model
+            ));
+        }
+    }
+    write_line(output, &rendered).await
+}
+
+async fn render_sources<W>(
+    output: &SharedOutput<W>,
+    label: &str,
+    sources: &[SourceInfo],
+) -> Result<(), std::io::Error>
+where
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    let mut rendered = format!("[{label}]\n");
+    if sources.is_empty() {
+        rendered.push_str("(none)\n");
+    } else {
+        for source in sources {
+            rendered.push_str(&format!(
+                "- {} name={} kind={} available={}",
+                source.id,
+                source.name,
+                source_kind(&source.kind),
+                source.available
+            ));
+            if let Some(version) = &source.version {
+                rendered.push_str(&format!(" version={version}"));
+            }
+            if let Some(path) = &source.path {
+                rendered.push_str(&format!(" path={path}"));
+            }
+            if !source.capabilities.is_empty() {
+                rendered.push_str(&format!(" capabilities={}", source.capabilities.join(",")));
+            }
+            rendered.push('\n');
+        }
+    }
+    write_line(output, &rendered).await
 }
 
 async fn read_pipe_lines<R, W>(
@@ -486,6 +788,12 @@ async fn read_pipe_lines<R, W>(
 
         match lines.next_line().await {
             Ok(Some(line)) => {
+                if line == "\u{3}" {
+                    if tx.send(InputCommand::Interrupted).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
                 let quit = line.trim() == "/quit";
                 if tx.send(InputCommand::Line(line)).await.is_err() || quit {
                     break;
@@ -581,15 +889,26 @@ async fn render_events<S, W>(
             continue;
         }
 
-        let terminal = matches!(
-            event,
-            ServiceEvent::RunFinished { .. } | ServiceEvent::RunError { .. }
-        );
+        let started = match &event {
+            ServiceEvent::RunStarted { id, .. } => Some(*id),
+            _ => None,
+        };
+        let terminal = match &event {
+            ServiceEvent::RunFinished { id, .. } | ServiceEvent::RunError { id, .. } => Some(*id),
+            _ => None,
+        };
         if let Err(error) = render_event(&output, &mut state, event).await {
             let _ = notice_tx.send(RenderNotice::Io(error)).await;
             return;
         }
-        if terminal && notice_tx.send(RenderNotice::Terminal).await.is_err() {
+        if let Some(id) = started
+            && notice_tx.send(RenderNotice::RunStarted(id)).await.is_err()
+        {
+            return;
+        }
+        if let Some(id) = terminal
+            && notice_tx.send(RenderNotice::Terminal(id)).await.is_err()
+        {
             return;
         }
     }
@@ -639,6 +958,15 @@ where
             )
             .await?;
             state.streamed_text = false;
+        }
+        ServiceEvent::PivotQueued { id } => {
+            write_line(output, &format!("\n[pivot queued {id}]\n")).await?;
+        }
+        ServiceEvent::PivotApplied { id } => {
+            write_line(output, &format!("\n[pivot applied {id}]\n")).await?;
+        }
+        ServiceEvent::PivotDropped { id, reason } => {
+            write_line(output, &format!("\n[pivot dropped {id}] {reason}\n")).await?;
         }
         _ => {}
     }
@@ -842,6 +1170,16 @@ fn permission_risk(risk: &PermissionRiskWire) -> &'static str {
         PermissionRiskWire::Medium => "medium",
         PermissionRiskWire::High => "high",
         PermissionRiskWire::Critical => "critical",
+        _ => "unknown",
+    }
+}
+
+fn source_kind(kind: &SourceKindWire) -> &'static str {
+    match kind {
+        SourceKindWire::LlmProvider => "llm_provider",
+        SourceKindWire::LocalAgent => "local_agent",
+        SourceKindWire::ToolRuntime => "tool_runtime",
+        SourceKindWire::Other => "other",
         _ => "unknown",
     }
 }
