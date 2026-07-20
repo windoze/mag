@@ -227,7 +227,7 @@ Engine
 
 > **历史注记**：本设计早期版本因 facade 把 interaction handler 硬编码成同步 `FacadeApproval` 而计划"下沉
 > 自组 scope"；agent-lib M7-1 落地注入口后此约束消解，改为 facade 注入路径。mag 早期 C1 曾按自组 scope
-> 实现，随 C1 重做切到本方案（见 `../TODO.md`）。
+> 实现，随 C1 重做切到本方案（见 `docs/archive/2026-07-19-mag-service/TODO.md`）。
 
 driver actor 一次 `SendMessage` 的处理：
 1. 组装 / 复用该会话的 facade `Agent`：`Agent::builder().provider(..).model(..).tool(..)
@@ -310,8 +310,8 @@ committed_at）、`messages`（可选冗余，供列表预览）。
   注入口，签名 / 相对 `.approval(..)` 的优先级 / 同步 + 流式两路生效均与 `AgentBuilder::interaction_handler`
   完全对齐。因此恢复出的会话重注入 `IpcApproval` 后即可继续跨进程审批，**需审批的会话恢复不再受限**。
   snapshot 仍是 data-only、不携带该运行期句柄，故恢复时**必须**重注入；未重注入才回落到同步 `FacadeApproval`
-  （与恢复前行为一致，向后兼容）。原「恢复只对纯对话 / 只读工具会话可用」的限制已作废（见 `../PLAN.md` R-B、
-  `../TODO.md` C4-1）。
+  （与恢复前行为一致，向后兼容）。原「恢复只对纯对话 / 只读工具会话可用」的限制已作废（见 `docs/archive/2026-07-19-mag-service/PLAN.md` R-B、
+  `docs/archive/2026-07-19-mag-service/TODO.md` C4-1）。
 
 ---
 
@@ -567,13 +567,13 @@ trait ToolPlugin {
 
 ## 10. 分阶段里程碑
 
-**先做 service（mag-core，见 `../PLAN.md`/`../TODO.md` 的 C 系列引擎主干），再做 interface。** service 稳定后，
+**先做 service（mag-core，见 `docs/archive/2026-07-19-mag-service/` 的 C 系列引擎主干），再做 interface。** service 稳定后，
 **第一个 interface 走 ACP**（公开规范，headless 可脚本化验证 service 外观），GUI/web 后置。每阶段可独立
 demo，协议向后兼容累加。
 
 | 阶段 | 主题 | 产出 | 验证 |
 |---|---|---|---|
-| **S** | service 主干 | mag-core 引擎（会话 / 流式 / 工具 / 审批 / 持久化）+ 抽取 `mag-service` 抽象接口、`Engine impl MagService`。见 `../PLAN.md` C 系列 | 全离线单元/集成测试（fake `LlmClient`）；`MagService` trait 一次按近全集成型 |
+| **S** | service 主干 | mag-core 引擎（会话 / 流式 / 工具 / 审批 / 持久化）+ 抽取 `mag-service` 抽象接口、`Engine impl MagService`。见 `docs/archive/2026-07-19-mag-service/PLAN.md` C 系列 | 全离线单元/集成测试（fake `LlmClient`）；`MagService` trait 一次按近全集成型 |
 | **I1** | ACP interface（第一个） | mag-acp：`dyn MagService` ↔ ACP（`initialize` / `session/new` / `session/prompt` / `session/update` streaming / `session/request_permission` / `session/cancel`）；`mag --acp` 子进程模式 | Zed（或 agent-lib 的 ACP client）驱动 mag：发 prompt 看到流式回复；工具审批经 `session/request_permission` 往返；cancel 生效。ACP 只用 `MagService` 子集 |
 | **I2** | 本地 agent 来源 | 打开 external features；`probe_local_agents`；用 `default_external_session_handler(..)`；`.external_agent(..)` 委派 | 单个本地 agent 在 worktree 跑改代码任务，看到 delegation trace + artifact；缺二进制时 skip |
 | **I3** | multi-agent | 同时挂本地 LLM subagent + 本地 CLI agent，共享 `ask_<name>` 委派 | supervisor 把"审查"派给 LLM subagent、"改代码"派给 codex，trace 正确，usage 聚合，审批各层受控 |
@@ -592,7 +592,7 @@ demo，协议向后兼容累加。
    `ChatSession` 作纯对话脚手架，随后切到 `Agent` + 注入。
 2. **restore 审批注入口（缺口已消解）**。agent-lib **M7-F1** 已给 `Agent::restore()` 补上
    `interaction_handler(..)` 注入口（与 `AgentBuilder` 对齐），恢复出的会话重注入 `IpcApproval` 后即可跨进程
-   审批，需审批的会话恢复不再受限；未重注入才回落到同步 `FacadeApproval`（向后兼容）。见 §3.6、`../PLAN.md` R-B。
+   审批，需审批的会话恢复不再受限；未重注入才回落到同步 `FacadeApproval`（向后兼容）。见 §3.6、`docs/archive/2026-07-19-mag-service/PLAN.md` R-B。
 3. **snapshot 只能在 committed 一致点**。run 进行中崩溃/退出，会话回到上一个 committed 点，进行中的
    turn 丢失；本地 agent 更麻烦（可能已改工作区）→ `MarkInterrupted` 保守默认。
 4. **web / ACP 的安全边界**。web 绑 `127.0.0.1` 不够（DNS-rebinding / 本机其它进程）→ 加启动时生成的

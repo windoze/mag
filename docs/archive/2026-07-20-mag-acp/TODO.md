@@ -1,10 +1,10 @@
 # TODO：mag-acp 落地任务单（mag 作为 ACP server）
 
-> 依据 [`PLAN.md`](PLAN.md) 与**唯一设计输入** [`docs/ACP.md`](docs/ACP.md)（参照 [`docs/DESIGN.md`](docs/DESIGN.md)
+> 依据 [`PLAN.md`](PLAN.md) 与**唯一设计输入** [`docs/ACP.md`](../../ACP.md)（参照 [`docs/DESIGN.md`](../../DESIGN.md)
 > §5 概览、§3.0 `MagService` trait）。
 > **范围：只做 `mag-acp` crate（mag 第一个 interface，ACP agent 端）。** service 主干（`mag-service` +
 > `mag-core` + `mag-tools`/`mag-sources`）已全部 `[DONE]`、`MagService` 契约已冻结，其已完成计划归档在
-> [`docs/archive/2026-07-19-mag-service/`](docs/archive/2026-07-19-mag-service/)。其它 interface（web / Tauri /
+> [`docs/archive/2026-07-19-mag-service/`](../2026-07-19-mag-service/)。其它 interface（web / Tauri /
 > 前端）不在本单内。
 
 ## 通用执行规则

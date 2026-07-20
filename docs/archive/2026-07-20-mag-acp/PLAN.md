@@ -1,11 +1,11 @@
 # 实施计划：mag-acp（mag 作为 ACP server，第一个落地 interface）
 
-> **唯一设计输入**：[`docs/ACP.md`](docs/ACP.md)（mag-acp 的实现级设计）。参照 [`docs/DESIGN.md`](docs/DESIGN.md)
+> **唯一设计输入**：[`docs/ACP.md`](../../ACP.md)（mag-acp 的实现级设计）。参照 [`docs/DESIGN.md`](../../DESIGN.md)
 > §5（ACP 概览）、§3.0（`MagService` trait，mag-acp 面对的接口）。
 >
 > service 主干（`mag-service` 接口 + `mag-core` 实现 + `mag-tools`/`mag-sources` 核心）已全部 `[DONE]`、
 > `MagService` 契约已冻结，其已完成计划归档在
-> [`docs/archive/2026-07-19-mag-service/`](docs/archive/2026-07-19-mag-service/)。**本计划只覆盖第一个
+> [`docs/archive/2026-07-19-mag-service/`](../2026-07-19-mag-service/)。**本计划只覆盖第一个
 > interface：`mag-acp` crate。** 逐任务清单见 [`TODO.md`](TODO.md)。
 
 ## 目标
