@@ -389,6 +389,9 @@ impl From<Event> for ServiceEvent {
             Event::DelegationFailed { id, trace } => Self::DelegationFailed { id, trace },
             Event::DelegationMessage { id, message } => Self::DelegationMessage { id, message },
             Event::LocalAgentsProbed { available } => Self::LocalAgentsProbed { available },
+            Event::PivotQueued { id } => Self::PivotQueued { id },
+            Event::PivotApplied { id } => Self::PivotApplied { id },
+            Event::PivotDropped { id, reason } => Self::PivotDropped { id, reason },
         }
     }
 }

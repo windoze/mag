@@ -38,7 +38,7 @@ use tokio::{
 
 use crate::{
     EventBus,
-    driver::SessionDriver,
+    driver::{PivotQueue, SessionDriver, TurnOutcome},
     engine::approval::{AskFrontendDecider, IpcApproval},
     persistence::Persistence,
 };
@@ -65,6 +65,15 @@ enum SessionCommand {
     },
     /// Cancel the session's active run, if any (cancel-handle side-channel).
     CancelRun,
+    /// Queue a pivot message for the session's in-flight run (pivot-queue
+    /// side-channel, `docs/CLI.md` §3.2); replies `NotPivotable` when no run
+    /// is in progress.
+    PivotMessage {
+        /// User-visible pivot text.
+        text: String,
+        /// Channel used to report the queueing or the `NotPivotable` rejection.
+        reply: oneshot::Sender<Result<(), ServiceError>>,
+    },
     /// Resolve a pending interaction request, waking the parked driver.
     RespondInteraction {
         /// Request identity emitted by [`Event::InteractionRequested`].
@@ -102,12 +111,15 @@ struct SessionActor {
     store: Arc<Persistence>,
     /// Cancel handle for the active run, present only while a run is in flight.
     cancel: Option<CancelHandle>,
+    /// Pivot queue for the active run, present only while a run is in flight
+    /// (`docs/CLI.md` §3.2); its presence is the actor's in-progress marker.
+    pivots: Option<PivotQueue>,
     /// Commands received while a run was active, replayed once it finishes.
     deferred: VecDeque<SessionCommand>,
     /// Sender the run task uses to hand the driver back on completion.
-    run_done_tx: mpsc::UnboundedSender<Box<SessionDriver>>,
+    run_done_tx: mpsc::UnboundedSender<(Box<SessionDriver>, TurnOutcome)>,
     /// Receiver that reclaims the driver once a run task finishes.
-    run_done_rx: mpsc::UnboundedReceiver<Box<SessionDriver>>,
+    run_done_rx: mpsc::UnboundedReceiver<(Box<SessionDriver>, TurnOutcome)>,
 }
 
 impl SessionActor {
@@ -131,6 +143,7 @@ impl SessionActor {
             approval,
             store,
             cancel: None,
+            pivots: None,
             deferred: VecDeque::new(),
             run_done_tx,
             run_done_rx,
@@ -156,7 +169,20 @@ impl SessionActor {
                     Some(command) => self.handle(command),
                     None => break,
                 },
-                Some(driver) = self.run_done_rx.recv() => {
+                Some((driver, outcome)) = self.run_done_rx.recv() => {
+                    // A pivot that raced the run's end — queued after the
+                    // driver's own final drain but before the actor observed
+                    // the run finishing — is dropped here with the same
+                    // terminal reason (`docs/CLI.md` §3.2).
+                    if let Some(pivots) = self.pivots.take() {
+                        let reason = outcome.pivot_drop_reason();
+                        for _ in pivots.drain() {
+                            let _ = self.events.emit(Event::PivotDropped {
+                                id: self.session_id,
+                                reason: reason.to_owned(),
+                            });
+                        }
+                    }
                     self.state = DriverState::Idle(driver);
                     self.cancel = None;
                 }
@@ -181,6 +207,25 @@ impl SessionActor {
                 if let Some(cancel) = &self.cancel {
                     cancel.cancel();
                 }
+            }
+            SessionCommand::PivotMessage { text, reply } => {
+                let result = match &self.pivots {
+                    Some(pivots) => {
+                        pivots.push(text);
+                        // Announce the queueing before replying, so a
+                        // subscriber always observes `PivotQueued` once
+                        // `pivot_message` has returned `Ok`.
+                        let _ = self.events.emit(Event::PivotQueued {
+                            id: self.session_id,
+                        });
+                        Ok(())
+                    }
+                    None => Err(ServiceError::NotPivotable {
+                        id: self.session_id,
+                        reason: "no in-progress run".to_owned(),
+                    }),
+                };
+                let _ = reply.send(result);
             }
             SessionCommand::RespondInteraction {
                 request_id,
@@ -227,16 +272,18 @@ impl SessionActor {
 
         let cancel = CancelHandle::new();
         self.cancel = Some(cancel.clone());
+        let pivots = PivotQueue::new();
+        self.pivots = Some(pivots.clone());
         let events = self.events.clone();
         let store = self.store.clone();
         let run_done = self.run_done_tx.clone();
         let session_id = self.session_id;
         tokio::task::spawn_local(async move {
-            driver
-                .run_turn(session_id, text, &events, &cancel, &store)
+            let outcome = driver
+                .run_turn(session_id, text, &events, &cancel, &pivots, &store)
                 .await;
             // Hand the driver back so the session can start its next run.
-            let _ = run_done.send(driver);
+            let _ = run_done.send((driver, outcome));
         });
     }
 }
@@ -431,6 +478,39 @@ impl SessionManager {
         if let Some(sender) = self.sender(session_id) {
             let _ = sender.send(SessionCommand::CancelRun);
         }
+    }
+
+    /// Routes a pivot message to the session actor and awaits queueing
+    /// (`docs/CLI.md` §3.2).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError::NotPivotable`] when no actor exists (a
+    /// clientless engine never has an in-progress run) or the session's run
+    /// already ended, and [`ServiceError::Backend`] when the actor stopped
+    /// before replying.
+    pub(crate) async fn pivot_message(
+        &self,
+        session_id: SessionId,
+        text: String,
+    ) -> Result<(), ServiceError> {
+        let Some(sender) = self.sender(session_id) else {
+            // No actor means no in-progress run, so this is an honest
+            // `NotPivotable` rather than a backend failure.
+            return Err(ServiceError::NotPivotable {
+                id: session_id,
+                reason: "no in-progress run".to_owned(),
+            });
+        };
+        let (reply, reply_rx) = oneshot::channel();
+        sender
+            .send(SessionCommand::PivotMessage { text, reply })
+            .map_err(|_| ServiceError::Backend {
+                message: "session actor stopped".to_owned(),
+            })?;
+        reply_rx.await.map_err(|_| ServiceError::Backend {
+            message: "session actor dropped the pivot before replying".to_owned(),
+        })?
     }
 
     /// Routes an interaction response to the session actor, which resolves the

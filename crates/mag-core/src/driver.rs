@@ -19,9 +19,10 @@
 //! [`IpcApproval`]; tools without a permission stay auto-allowed and never
 //! interrupt the run.
 
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::{
-    Arc,
+    Arc, Mutex, PoisonError,
     atomic::{AtomicU64, Ordering},
 };
 
@@ -31,8 +32,9 @@ use agent_lib::{
     agent::{BudgetLimits, InteractionHandler, WorktreeRef},
     client::LlmClient,
     facade::{
-        Agent, AgentSnapshot, ApprovalPolicy, CancelHandle, FacadeError, Tool, ToolContext,
-        ToolResult, ToolTrace as FacadeToolTrace, UsageSummary, WireRunEvent, WireRunOutput,
+        Agent, AgentRunStream, AgentSnapshot, ApprovalPolicy, CancelHandle, FacadeError, Tool,
+        ToolContext, ToolResult, ToolTrace as FacadeToolTrace, UsageSummary, WireRunEvent,
+        WireRunOutput,
     },
 };
 use mag_service::{
@@ -47,6 +49,53 @@ use crate::{EventBus, engine::approval::IpcApproval, persistence::Persistence};
 
 const DEFAULT_MAX_TOKENS: u32 = 512;
 const DEFAULT_MAX_STEPS: u32 = 8;
+
+/// Shared pivot queue bridging one in-flight run and its session actor
+/// (`docs/CLI.md` §3.2, decision D1).
+///
+/// This is the pivot counterpart of the [`CancelHandle`] side-channel: the
+/// session actor pushes user pivot messages into the queue while
+/// [`SessionDriver::run_turn`] — the only owner of the run's mutable
+/// [`AgentRunStream`] — drains it after every stream poll and tries
+/// [`AgentRunStream::interject`]. The lock is synchronous, never held across
+/// an `.await`, and poisoning is recovered rather than propagated, mirroring
+/// the codebase's unified poison-recovery policy.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PivotQueue {
+    inner: Arc<Mutex<VecDeque<String>>>,
+}
+
+impl PivotQueue {
+    /// Creates an empty pivot queue for one run.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Queues one pivot message (FIFO order is preserved for draining).
+    pub(crate) fn push(&self, text: String) {
+        self.lock().push_back(text);
+    }
+
+    /// Pops the oldest queued pivot, if any.
+    fn pop_front(&self) -> Option<String> {
+        self.lock().pop_front()
+    }
+
+    /// Returns a pivot to the front of the queue after a retryable rejection.
+    fn push_front(&self, text: String) {
+        self.lock().push_front(text);
+    }
+
+    /// Removes and returns every queued pivot, preserving FIFO order.
+    pub(crate) fn drain(&self) -> Vec<String> {
+        self.lock().drain(..).collect()
+    }
+
+    /// Locks the queue, recovering the guard from a poisoned lock.
+    fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<String>> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 /// One session's stateful facade [`Agent`] plus a run-id source.
 ///
@@ -188,23 +237,40 @@ impl SessionDriver {
     /// A cancelled or failed turn is not snapshotted: its committed history is
     /// unchanged from the prior committed point, whose snapshot (if any) is
     /// already durable.
+    ///
+    /// Pivot messages queued through `pivots` are drained after every stream
+    /// poll — exactly when the run may be parked on a step boundary with the
+    /// facade's pivot window open — and injected through
+    /// [`AgentRunStream::interject`] (`docs/CLI.md` §3.2). An accepted pivot is
+    /// announced as [`Event::PivotApplied`] and enters the conversation like a
+    /// user message, so the committed snapshot persists it exactly as a
+    /// `send_message` turn would. Pivots still queued when the run ends —
+    /// finished, failed, or cancelled — are each announced as
+    /// [`Event::PivotDropped`] with the run's terminal reason *before* the
+    /// terminal event is emitted, and the outcome is returned so the session
+    /// actor can drop any pivot that raced the run's end with the same reason.
     pub(crate) async fn run_turn(
         &mut self,
         session_id: SessionId,
         text: String,
         events: &EventBus,
         cancel: &CancelHandle,
+        pivots: &PivotQueue,
         store: &Persistence,
-    ) {
+    ) -> TurnOutcome {
         let mut stream = match self.agent.stream_with_cancel(text, cancel.clone()).await {
             Ok(stream) => stream,
             Err(error) => {
+                drop_pivots(session_id, pivots, events, PIVOT_DROP_RUN_FAILED);
                 let _ = events.emit(Event::RunError {
                     id: session_id,
                     message: error.to_string(),
                     kind: error_kind(&error),
                 });
-                return;
+                return TurnOutcome::Failed {
+                    kind: error_kind(&error),
+                    message: error.to_string(),
+                };
             }
         };
 
@@ -217,6 +283,10 @@ impl SessionDriver {
                     {
                         let _ = events.emit(mag_event);
                     }
+                    // After every poll the run may be parked on a step boundary
+                    // with the facade's pivot window open: try landing the
+                    // queued pivots before the next poll drives past it.
+                    drain_pivots(session_id, &mut stream, pivots, events);
                 }
                 // A cancelled run surfaces from the facade as a stream error;
                 // report it through the dedicated cancellation outcome rather
@@ -238,7 +308,11 @@ impl SessionDriver {
         // intact) so the next `run_turn` on this driver can proceed.
         drop(stream);
 
-        let terminal = match outcome {
+        // Any pivot still queued at the end of the run never reached a step
+        // boundary: report it dropped with the run's terminal reason.
+        drop_pivots(session_id, pivots, events, outcome.pivot_drop_reason());
+
+        let terminal = match &outcome {
             TurnOutcome::Completed => match final_output {
                 Some(output) => {
                     // Persist the committed snapshot before announcing completion.
@@ -256,8 +330,8 @@ impl SessionDriver {
             },
             TurnOutcome::Failed { kind, message } => Event::RunError {
                 id: session_id,
-                message,
-                kind,
+                message: message.clone(),
+                kind: *kind,
             },
             TurnOutcome::Cancelled => Event::RunError {
                 id: session_id,
@@ -266,6 +340,7 @@ impl SessionDriver {
             },
         };
         let _ = events.emit(terminal);
+        outcome
     }
 
     /// Captures the agent's committed [`AgentSnapshot`] and writes it to `store`.
@@ -293,7 +368,7 @@ impl SessionDriver {
 }
 
 /// Terminal outcome of one [`SessionDriver::run_turn`] drive loop.
-enum TurnOutcome {
+pub(crate) enum TurnOutcome {
     /// The facade stream reached its terminal `Done`.
     Completed,
     /// The facade stream yielded a failure carrying this message.
@@ -305,6 +380,76 @@ enum TurnOutcome {
     },
     /// The run's [`CancelHandle`] fired while the turn was in flight.
     Cancelled,
+}
+
+impl TurnOutcome {
+    /// Reason string stamped on [`Event::PivotDropped`] when a queued pivot
+    /// outlives its run (`docs/CLI.md` §3.2).
+    pub(crate) fn pivot_drop_reason(&self) -> &'static str {
+        match self {
+            Self::Completed => PIVOT_DROP_RUN_FINISHED,
+            Self::Failed { .. } => PIVOT_DROP_RUN_FAILED,
+            Self::Cancelled => PIVOT_DROP_RUN_CANCELLED,
+        }
+    }
+}
+
+/// [`Event::PivotDropped`] reason for a run that finished normally.
+const PIVOT_DROP_RUN_FINISHED: &str = "run finished before the pivot could be applied";
+/// [`Event::PivotDropped`] reason for a run that failed.
+const PIVOT_DROP_RUN_FAILED: &str = "run failed before the pivot could be applied";
+/// [`Event::PivotDropped`] reason for a run that was cancelled.
+const PIVOT_DROP_RUN_CANCELLED: &str = "run cancelled before the pivot could be applied";
+
+/// Drains the run's pivot queue, attempting [`AgentRunStream::interject`] on
+/// each queued pivot (`docs/CLI.md` §3.2).
+///
+/// Called after every stream poll, which is exactly when the run may be
+/// parked on a step boundary with the facade's pivot window open. A pivot
+/// accepted by the facade is announced as [`Event::PivotApplied`].
+/// [`FacadeError::InvalidState`] means the window is not (or no longer) open —
+/// a side-effect-free, retry-safe rejection — so the pivot returns to the
+/// front of the queue and is retried after the next poll. Any other error is
+/// permanent: the pivot leaves the queue as [`Event::PivotDropped`].
+fn drain_pivots(
+    session_id: SessionId,
+    stream: &mut AgentRunStream<'_>,
+    pivots: &PivotQueue,
+    events: &EventBus,
+) {
+    while let Some(text) = pivots.pop_front() {
+        match stream.interject(text.as_str()) {
+            Ok(()) => {
+                let _ = events.emit(Event::PivotApplied { id: session_id });
+            }
+            Err(FacadeError::InvalidState(_)) => {
+                pivots.push_front(text);
+                break;
+            }
+            Err(error) => {
+                let _ = events.emit(Event::PivotDropped {
+                    id: session_id,
+                    reason: format!("pivot rejected: {error}"),
+                });
+            }
+        }
+    }
+}
+
+/// Reports every pivot still queued for a finished run as
+/// [`Event::PivotDropped`] with `reason`, preserving queue order.
+fn drop_pivots(
+    session_id: SessionId,
+    pivots: &PivotQueue,
+    events: &EventBus,
+    reason: &'static str,
+) {
+    for _ in pivots.drain() {
+        let _ = events.emit(Event::PivotDropped {
+            id: session_id,
+            reason: reason.to_owned(),
+        });
+    }
 }
 
 /// Maps a [`FacadeError`] onto its wire [`RunErrorKind`] classification.

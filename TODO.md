@@ -126,7 +126,7 @@ mag-core driver 落地 pivot 队列旁路（agent-lib `interject()`）。第二�
     3) `cargo clippy --all-targets -- -D warnings` ✅ 4) `cargo test --workspace` ✅（全绿，
     无失败）5) `cargo doc --no-deps --workspace` ✅。
 
-### M1-2 [TODO] mag-core：driver pivot 队列旁路
+### M1-2 [DONE] mag-core：driver pivot 队列旁路
 
 - **上下文**：`docs/CLI.md` §3.2；agent-lib `AgentRunStream::interject()` 锚点（仅 step 边界窗口接受，
   InvalidState 失败无副作用、盲重试安全）。CancelHandle 同构模式见 driver.rs 现有 cancel 实现。
@@ -142,6 +142,44 @@ mag-core driver 落地 pivot 队列旁路（agent-lib `interject()`）。第二�
 - **验证条件**：聚焦测试：fake LLM 下 (a) run 进行中 pivot 被接受且 `PivotQueued`→`PivotApplied` 顺序正确、
   pivot 文本进入后续 LLM 请求上下文；(b) 无 run 时 pivot 返回 `NotPivotable`；(c) run 恰好结束时 pivot 未
   落地发 `PivotDropped`；(d) pivot 后 session 持久化包含 pivot 消息。默认验证序列全过。
+
+  **完成记录**（2026-07-21）：
+  - 实现要点：`Engine::pivot_message` 落地——未知会话 `SessionNotFound`，否则经 `SessionManager` 路由到
+    会话 actor；actor 以 `pivots: Option<PivotQueue>`（仅 run 在飞时为 `Some`）作为 in-progress 标记，
+    无 run → `NotPivotable{id, reason:"no in-progress run"}`，有 run → 入队、发 `PivotQueued`（先于回复
+    `Ok`，保证订阅者在 `pivot_message` 返回前必见 `PivotQueued`）。driver `run_turn` 每次
+    `stream.next().await` 返回后 drain `PivotQueue` 尝试 `stream.interject()`：`Ok` → `PivotApplied`；
+    `InvalidState`（窗口未开/已被占，无副作用、盲重试安全）→ 退回队首下次重试；其它错误 → 出队发
+    `PivotDropped{reason:"pivot rejected: .."}`。run 结束（含 `stream_with_cancel` 立即失败路径）对残留
+    队列逐条发 `PivotDropped`，reason 区分 finished/failed/cancelled，且先于 terminal 事件发出。
+  - 前置缺口（按通用规则记录）：M1-1 只在 `ServiceEvent` 加了三个 `Pivot*` 变体，mag-core `EventBus`
+    承载的 wire 枚举 `Event`（mag-service `lib.rs`）没有对应变体无法发事件——本任务按向后兼容方式补上
+    `Event::{PivotQueued,PivotApplied,PivotDropped}`（追加变体 + `From<Event> for ServiceEvent` 投影 +
+    roundtrip/稳定 tag 用例），`Command` 协议未动。
+  - 关键设计：① 队列与 CancelHandle 共存方式——`PivotQueue`（`Arc<Mutex<VecDeque<String>>>`，锁不跨
+    `.await`、poison 恢复）与 `CancelHandle` 同构：actor 持有克隆做入队，run 任务持有克隆在 poll 后
+    drain，互不触碰 agent `&mut`；② 竞态兜底——run 任务在 `run_turn` 末尾 drain 一次后，actor 回收
+    driver 时（`run_done` 通道载荷扩为 `(Box<SessionDriver>, TurnOutcome)`）用同一
+    `outcome.pivot_drop_reason()` 再 drain 一次，吃掉「run 刚 drain 完 pivot 才入队」的缝隙，pivot
+    绝不静默丢失；③ interject 重试策略——靠 agent-lib 窗口机制（tool step 后 sink 未 drain 完之前窗口
+    保持开）在每次 poll 后盲试，`InvalidState` 留队；④ 持久化接入点——不加新路径：被接受的 pivot 经
+    agent-lib pivot 语义成为 user message 进入对话历史，run 提交时由既有
+    `persist_committed_snapshot` 快照落盘（与 `send_message` 完全同路径），未落地 pivot 不进历史。
+  - 测试（全部离线，`engine::pivot` 模块，5 个）：(a)
+    `pivot_mid_run_is_applied_at_the_step_boundary_and_enters_llm_context`——gate 卡住的 stub 工具使
+    run 确定性地在飞，断言 `PivotQueued`→`PivotApplied` 顺序、无 `PivotDropped`、第二个 LLM 请求含
+    pivot user message；(b) `pivot_without_an_in_progress_run_reports_not_pivotable`——idle 会话 /
+    未知会话（`SessionNotFound`）/ 无 client 引擎三态；(c) 两个 drop 场景：
+    `queued_pivot_is_dropped_when_the_run_is_cancelled`（stalling 流 + cancel，reason 含 cancelled）
+    与 `queued_pivot_is_dropped_when_the_run_finishes_without_a_boundary`（新增 `StreamGate` 门控脚本
+    使单 text step 无边界可注入，run 正常结束，reason 含 finished），均断言 `PivotDropped` 先于
+    terminal 事件；(d) `applied_pivot_is_persisted_with_the_committed_snapshot`——`with_persistence`
+    引擎落 pivot 后快照 JSON 含 pivot 与原始消息文本。test_support 新增 `StreamGate` 与
+    `StreamScript::Gated`/`gated_text_stream`（与既有 `Stall` 同族的确定性门控 fixture）。聚焦测试连跑
+    5 次无 flake，单测试 < 1s。
+  - 门禁结果：1) `cargo fmt --all -- --check` ✅ 2) `cargo test -p mag-core pivot` ✅（5 passed）
+    3) `cargo clippy --all-targets -- -D warnings` ✅ 4) `cargo test --workspace` ✅（全绿，无失败）
+    5) `cargo doc --no-deps --workspace` ✅。
 
 ### M1-R [TODO] M1 review
 

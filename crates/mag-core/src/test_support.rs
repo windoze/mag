@@ -39,6 +39,17 @@ pub(crate) enum StreamScript {
     Complete(Vec<StreamEvent>),
     /// Yield the events, then pend forever (the run never completes on its own).
     Stall(Vec<StreamEvent>),
+    /// Yield `head`, wait for `gate` to open, then yield `tail` and end the
+    /// stream: a run parked mid-response so a pivot can be queued while no
+    /// step boundary remains (`docs/CLI.md` §3.2).
+    Gated {
+        /// Events yielded before the gate.
+        head: Vec<StreamEvent>,
+        /// Gate holding back the tail events.
+        gate: Arc<StreamGate>,
+        /// Events yielded once the gate opens.
+        tail: Vec<StreamEvent>,
+    },
 }
 
 impl StreamScript {
@@ -46,7 +57,38 @@ impl StreamScript {
     fn events(self) -> Vec<StreamEvent> {
         match self {
             Self::Complete(events) | Self::Stall(events) => events,
+            // The non-streaming `chat` endpoint folds the whole response at
+            // once, so the gate is meaningless there and the script degrades
+            // to its plain concatenation.
+            Self::Gated { head, tail, .. } => head.into_iter().chain(tail).collect(),
         }
+    }
+}
+
+/// Test gate holding a scripted stream (or a stub tool) back until the test
+/// releases it, giving cross-thread commands such as pivot or cancel a
+/// deterministic window to land.
+#[derive(Debug)]
+pub(crate) struct StreamGate {
+    permits: tokio::sync::Semaphore,
+}
+
+impl StreamGate {
+    /// Creates a closed gate.
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            permits: tokio::sync::Semaphore::new(0),
+        })
+    }
+
+    /// Releases one waiter (or the next one to arrive).
+    pub(crate) fn open(&self) {
+        self.permits.add_permits(1);
+    }
+
+    /// Waits until [`open`](Self::open) releases the gate.
+    pub(crate) async fn wait(&self) {
+        let _ = self.permits.acquire().await;
     }
 }
 
@@ -139,6 +181,16 @@ impl LlmClient for FakeLlmClient {
             StreamScript::Stall(events) => Ok(stream::iter(events.into_iter().map(Ok))
                 .chain(stream::pending::<Result<StreamEvent, ClientError>>())
                 .boxed()),
+            StreamScript::Gated { head, gate, tail } => {
+                let gated_tail = stream::once(async move {
+                    gate.wait().await;
+                    stream::iter(tail.into_iter().map(Ok::<_, ClientError>))
+                })
+                .flatten();
+                Ok(stream::iter(head.into_iter().map(Ok::<_, ClientError>))
+                    .chain(gated_tail)
+                    .boxed())
+            }
         }
     }
 }
@@ -192,6 +244,43 @@ pub(crate) fn stalling_text_stream(chunks: &[&str]) -> StreamScript {
         delta: Delta::Text((*chunk).to_owned()),
     }));
     StreamScript::Stall(events)
+}
+
+/// Builds a gated text stream: the given chunks are emitted as live text
+/// deltas, then the stream parks on `gate` before closing the block with
+/// `usage` and `MessageStop`.
+///
+/// This models a run parked mid-response with no further step boundary, so a
+/// pivot queued from another thread can never land and must be reported as
+/// [`PivotDropped`](mag_service::ServiceEvent::PivotDropped) once the gate
+/// opens and the run finishes (`docs/CLI.md` §3.2).
+pub(crate) fn gated_text_stream(
+    chunks: &[&str],
+    gate: Arc<StreamGate>,
+    usage: Usage,
+) -> StreamScript {
+    let block_id = BlockId::new("text-1");
+    let mut head = vec![
+        StreamEvent::MessageStart {
+            role: Role::Assistant,
+        },
+        StreamEvent::BlockStart {
+            id: block_id.clone(),
+            kind: BlockKind::Text,
+        },
+    ];
+    head.extend(chunks.iter().map(|chunk| StreamEvent::BlockDelta {
+        id: block_id.clone(),
+        delta: Delta::Text((*chunk).to_owned()),
+    }));
+    let tail = vec![
+        StreamEvent::BlockStop { id: block_id },
+        StreamEvent::Usage(usage),
+        StreamEvent::MessageStop {
+            stop_reason: Normalized::from_mapped(StopReason::EndTurn, "end_turn"),
+        },
+    ];
+    StreamScript::Gated { head, gate, tail }
 }
 
 /// Builds a complete tool-use response stream.

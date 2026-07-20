@@ -226,13 +226,16 @@ impl MagService for Engine {
         Ok(())
     }
 
-    async fn pivot_message(&self, _id: SessionId, _input: UserInput) -> Result<(), ServiceError> {
-        // The pivot queue bypass (driver-side `interject()` drain plus
-        // `PivotQueued`/`PivotApplied`/`PivotDropped` events) is implemented
-        // in M1-2; until then the engine reports pivoting as unsupported.
-        Err(ServiceError::Unsupported {
-            operation: "pivot_message".to_owned(),
-        })
+    async fn pivot_message(&self, id: SessionId, input: UserInput) -> Result<(), ServiceError> {
+        {
+            let sessions = self.inner.sessions.lock().await;
+            if !sessions.contains_key(&id) {
+                return Err(ServiceError::SessionNotFound { id });
+            }
+        }
+        // Attachments follow the `send_message` envelope: only the text is
+        // pivoted into the run (`docs/CLI.md` §3.2).
+        self.inner.manager.pivot_message(id, input.text).await
     }
 
     async fn respond_interaction(
@@ -1894,6 +1897,481 @@ mod persist {
                 ServiceEvent::RunFinished { id, output } if *id == session && output.text == "done"
             ),
             "the resumed approved turn must finish with the follow-up text: {rest:?}",
+        );
+    }
+}
+
+#[cfg(test)]
+mod pivot {
+    //! Pivot queue bypass tests driven through the public [`MagService`]
+    //! surface (`docs/CLI.md` §3.2, decision D1; M1-2).
+    //!
+    //! Everything runs offline through a scripted [`FakeLlmClient`]. A
+    //! gate-held stub tool (and gated scripts) park the run at deterministic
+    //! points, so the pivot command — issued from the test thread — provably
+    //! reaches the session actor before the run moves on.
+
+    use std::{
+        path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use agent_lib::{
+        client::LlmClient,
+        facade::{ToolContext, ToolResult},
+        model::{
+            content::ContentBlock,
+            message::{Message, Role},
+            tool::Tool,
+            usage::Usage,
+        },
+    };
+    use async_trait::async_trait;
+    use futures::stream::BoxStream;
+    use mag_service::{
+        MagService, RoutingMode, RunErrorKind, ServiceError, ServiceEvent, SessionConfig,
+        SessionId, UserInput,
+    };
+    use mag_tools::{ToolPlugin, ToolRegistry};
+    use serde_json::{Value, json};
+    use tokio::time::{Duration, timeout};
+    use uuid::Uuid;
+
+    use crate::test_support::{
+        FakeLlmClient, StreamGate, gated_text_stream, stalling_text_stream, text_stream_with_usage,
+        tool_use_stream,
+    };
+
+    use super::Engine;
+
+    /// A unique temporary database path that deletes its files on drop.
+    struct TempDb {
+        path: PathBuf,
+    }
+
+    impl TempDb {
+        fn new() -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos();
+            let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "mag-pivot-{}-{nanos}-{unique}.sqlite",
+                std::process::id()
+            ));
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_file(self.path.with_extension("sqlite-wal"));
+            let _ = std::fs::remove_file(self.path.with_extension("sqlite-shm"));
+        }
+    }
+
+    /// A stub tool that parks on `gate` before answering, holding the run in
+    /// flight so a pivot can be queued deterministically from another thread.
+    #[derive(Debug)]
+    struct GatedTool {
+        gate: Arc<StreamGate>,
+    }
+
+    #[async_trait]
+    impl ToolPlugin for GatedTool {
+        fn name(&self) -> &str {
+            "hold"
+        }
+
+        fn declaration(&self) -> Tool {
+            Tool {
+                name: "hold".to_owned(),
+                description: "stub tool that waits on a test gate".to_owned(),
+                input_schema: json!({ "type": "object", "properties": {} }),
+            }
+        }
+
+        async fn invoke(&self, _ctx: ToolContext, _args: Value) -> ToolResult {
+            self.gate.wait().await;
+            ToolResult::text("held")
+        }
+    }
+
+    fn gated_registry(gate: Arc<StreamGate>) -> ToolRegistry {
+        ToolRegistry::new().register(Arc::new(GatedTool { gate }))
+    }
+
+    fn config() -> SessionConfig {
+        SessionConfig {
+            provider: "fake".to_owned(),
+            model: "fake-pivot".to_owned(),
+            tool_profile: None,
+            cwd: None,
+            routing: RoutingMode::ModelRouted,
+            budget: None,
+        }
+    }
+
+    fn usage(input: u32, output: u32) -> Usage {
+        Usage {
+            input,
+            output,
+            total: Some(input + output),
+            ..Usage::default()
+        }
+    }
+
+    async fn create_session(engine: &Engine) -> SessionId {
+        engine
+            .create_session(config())
+            .await
+            .expect("create session")
+    }
+
+    async fn next_event(events: &mut BoxStream<'static, ServiceEvent>) -> ServiceEvent {
+        timeout(Duration::from_secs(2), futures::StreamExt::next(events))
+            .await
+            .expect("event timed out")
+            .expect("event stream closed")
+    }
+
+    /// Reads events until (and including) the run's terminal event.
+    async fn collect_until_terminal(
+        events: &mut BoxStream<'static, ServiceEvent>,
+    ) -> Vec<ServiceEvent> {
+        let mut collected = Vec::new();
+        loop {
+            let event = next_event(events).await;
+            let terminal = matches!(
+                event,
+                ServiceEvent::RunFinished { .. } | ServiceEvent::RunError { .. }
+            );
+            collected.push(event);
+            if terminal {
+                return collected;
+            }
+        }
+    }
+
+    /// Index of the first event matching `predicate`, panicking when absent.
+    fn position(events: &[ServiceEvent], predicate: impl Fn(&ServiceEvent) -> bool) -> usize {
+        events
+            .iter()
+            .position(predicate)
+            .expect("expected event is present")
+    }
+
+    fn text(message: &Message) -> String {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn pivot_mid_run_is_applied_at_the_step_boundary_and_enters_llm_context() {
+        let gate = StreamGate::new();
+        let fake = FakeLlmClient::scripted(vec![
+            tool_use_stream("hold", "call-1", json!({})),
+            text_stream_with_usage(&["ack"], usage(5, 2)),
+        ]);
+        let client: Arc<dyn LlmClient> = fake.clone();
+        let engine = Engine::with_llm_client_and_tools(client, gated_registry(gate.clone()));
+        let session = create_session(&engine).await;
+        let mut events = engine.subscribe(Some(session));
+
+        engine
+            .send_message(session, UserInput::text("start"))
+            .await
+            .expect("send message");
+        assert!(matches!(
+            next_event(&mut events).await,
+            ServiceEvent::RunStarted { id, .. } if id == session
+        ));
+        // The stub tool is parked on the gate; the run is deterministically
+        // in flight when the pivot command is issued.
+        assert!(matches!(
+            next_event(&mut events).await,
+            ServiceEvent::ToolStarted { id, .. } if id == session
+        ));
+
+        // The actor announces `PivotQueued` before the call returns `Ok`.
+        engine
+            .pivot_message(session, UserInput::text("pivot please"))
+            .await
+            .expect("pivot queued while the run is in flight");
+        assert_eq!(
+            next_event(&mut events).await,
+            ServiceEvent::PivotQueued { id: session }
+        );
+
+        // Releasing the tool lets the run reach its step boundary, where the
+        // driver's post-poll drain lands the pivot through `interject()`.
+        gate.open();
+        let rest = collect_until_terminal(&mut events).await;
+
+        let applied = position(
+            &rest,
+            |event| matches!(event, ServiceEvent::PivotApplied { id } if *id == session),
+        );
+        assert!(
+            matches!(rest.last(), Some(ServiceEvent::RunFinished { id, .. }) if *id == session),
+            "the pivoted run must finish: {rest:?}",
+        );
+        assert!(
+            applied < rest.len() - 1,
+            "PivotApplied precedes the terminal event: {rest:?}",
+        );
+        assert!(
+            !rest
+                .iter()
+                .any(|event| matches!(event, ServiceEvent::PivotDropped { .. })),
+            "an applied pivot is never dropped: {rest:?}",
+        );
+
+        // The accepted pivot enters the conversation as a user message, so
+        // the follow-up LLM request carries it.
+        let requests = fake.stream_requests();
+        assert_eq!(requests.len(), 2, "tool step plus pivoted final step");
+        assert!(
+            requests[1]
+                .messages
+                .iter()
+                .any(|message| message.role == Role::User
+                    && text(message).contains("pivot please")),
+            "second LLM request should include the pivot user message: {:?}",
+            requests[1].messages,
+        );
+    }
+
+    #[tokio::test]
+    async fn pivot_without_an_in_progress_run_reports_not_pivotable() {
+        let fake = FakeLlmClient::scripted(Vec::new());
+        let client: Arc<dyn LlmClient> = fake;
+        let engine = Engine::with_llm_client(client);
+        let session = create_session(&engine).await;
+
+        // An idle session has no in-progress run: first-layer pivot semantics
+        // report `NotPivotable` and never fall back to `send_message`.
+        let error = engine
+            .pivot_message(session, UserInput::text("hi"))
+            .await
+            .expect_err("an idle session cannot accept a pivot");
+        assert!(
+            matches!(error, ServiceError::NotPivotable { id, .. } if id == session),
+            "expected NotPivotable, got {error:?}",
+        );
+
+        // An unknown session reports not-found, not NotPivotable.
+        let missing = SessionId::new(Uuid::from_u128(0xdead));
+        assert_eq!(
+            engine.pivot_message(missing, UserInput::text("hi")).await,
+            Err(ServiceError::SessionNotFound { id: missing })
+        );
+
+        // A clientless engine spawns no session actor, so it never has an
+        // in-progress run either.
+        let clientless = Engine::new();
+        let idle = create_session(&clientless).await;
+        let error = clientless
+            .pivot_message(idle, UserInput::text("hi"))
+            .await
+            .expect_err("a clientless engine cannot accept a pivot");
+        assert!(
+            matches!(error, ServiceError::NotPivotable { id, .. } if id == idle),
+            "expected NotPivotable, got {error:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_pivot_is_dropped_when_the_run_is_cancelled() {
+        let fake = FakeLlmClient::scripted_streams(vec![stalling_text_stream(&["working"])]);
+        let client: Arc<dyn LlmClient> = fake;
+        let engine = Engine::with_llm_client(client);
+        let session = create_session(&engine).await;
+        let mut events = engine.subscribe(Some(session));
+
+        engine
+            .send_message(session, UserInput::text("start"))
+            .await
+            .expect("send message");
+        assert!(matches!(
+            next_event(&mut events).await,
+            ServiceEvent::RunStarted { id, .. } if id == session
+        ));
+        assert_eq!(
+            next_event(&mut events).await,
+            ServiceEvent::TextDelta {
+                id: session,
+                text: "working".to_owned(),
+            }
+        );
+
+        // The run is stalled mid-stream: a single text step never opens a
+        // pivot boundary, so the pivot stays queued.
+        engine
+            .pivot_message(session, UserInput::text("too late"))
+            .await
+            .expect("pivot queued while the run is in flight");
+        assert_eq!(
+            next_event(&mut events).await,
+            ServiceEvent::PivotQueued { id: session }
+        );
+
+        // A cancel preempts the run; the queued pivot is dropped with the
+        // cancellation reason before the terminal event.
+        engine.cancel(session).await.expect("cancel session");
+        let rest = collect_until_terminal(&mut events).await;
+
+        let dropped = position(
+            &rest,
+            |event| matches!(event, ServiceEvent::PivotDropped { id, reason } if *id == session && reason.contains("cancelled")),
+        );
+        let terminal = position(
+            &rest,
+            |event| matches!(event, ServiceEvent::RunError { id, kind, .. } if *id == session && *kind == RunErrorKind::Cancelled),
+        );
+        assert!(
+            dropped < terminal,
+            "PivotDropped precedes the terminal cancellation: {rest:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_pivot_is_dropped_when_the_run_finishes_without_a_boundary() {
+        let gate = StreamGate::new();
+        let fake = FakeLlmClient::scripted_streams(vec![gated_text_stream(
+            &["almost"],
+            gate.clone(),
+            usage(3, 1),
+        )]);
+        let client: Arc<dyn LlmClient> = fake;
+        let engine = Engine::with_llm_client(client);
+        let session = create_session(&engine).await;
+        let mut events = engine.subscribe(Some(session));
+
+        engine
+            .send_message(session, UserInput::text("start"))
+            .await
+            .expect("send message");
+        assert!(matches!(
+            next_event(&mut events).await,
+            ServiceEvent::RunStarted { id, .. } if id == session
+        ));
+        assert_eq!(
+            next_event(&mut events).await,
+            ServiceEvent::TextDelta {
+                id: session,
+                text: "almost".to_owned(),
+            }
+        );
+
+        // The run is parked mid-response on the gate; its single text step
+        // has no pivot boundary left, so the pivot can never land.
+        engine
+            .pivot_message(session, UserInput::text("redirect"))
+            .await
+            .expect("pivot queued while the run is in flight");
+        assert_eq!(
+            next_event(&mut events).await,
+            ServiceEvent::PivotQueued { id: session }
+        );
+
+        // The run finishing preempts the queued pivot: it is dropped with the
+        // normal-completion reason before the terminal event.
+        gate.open();
+        let rest = collect_until_terminal(&mut events).await;
+
+        let dropped = position(
+            &rest,
+            |event| matches!(event, ServiceEvent::PivotDropped { id, reason } if *id == session && reason.contains("finished")),
+        );
+        let terminal = position(
+            &rest,
+            |event| matches!(event, ServiceEvent::RunFinished { id, output } if *id == session && output.text == "almost"),
+        );
+        assert!(
+            dropped < terminal,
+            "PivotDropped precedes the terminal finish: {rest:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn applied_pivot_is_persisted_with_the_committed_snapshot() {
+        let db = TempDb::new();
+        let gate = StreamGate::new();
+        let fake = FakeLlmClient::scripted(vec![
+            tool_use_stream("hold", "call-1", json!({})),
+            text_stream_with_usage(&["ack"], usage(5, 2)),
+        ]);
+        let client: Arc<dyn LlmClient> = fake;
+        let engine = Engine::with_persistence(client, gated_registry(gate.clone()), &db.path)
+            .expect("open persistent engine");
+        let session = create_session(&engine).await;
+        let mut events = engine.subscribe(Some(session));
+
+        engine
+            .send_message(session, UserInput::text("start"))
+            .await
+            .expect("send message");
+        assert!(matches!(
+            next_event(&mut events).await,
+            ServiceEvent::RunStarted { id, .. } if id == session
+        ));
+        assert!(matches!(
+            next_event(&mut events).await,
+            ServiceEvent::ToolStarted { id, .. } if id == session
+        ));
+        engine
+            .pivot_message(session, UserInput::text("pivot please"))
+            .await
+            .expect("pivot queued while the run is in flight");
+        assert_eq!(
+            next_event(&mut events).await,
+            ServiceEvent::PivotQueued { id: session }
+        );
+        gate.open();
+        let rest = collect_until_terminal(&mut events).await;
+        assert!(
+            rest.iter()
+                .any(|event| matches!(event, ServiceEvent::PivotApplied { id } if *id == session)),
+            "the pivot lands at the step boundary: {rest:?}",
+        );
+        assert!(
+            matches!(rest.last(), Some(ServiceEvent::RunFinished { id, .. }) if *id == session),
+            "the pivoted run must finish: {rest:?}",
+        );
+
+        // The committed snapshot — persisted before `RunFinished` fired — is
+        // the same persistence path `send_message` turns use, so the pivot
+        // message survives a restart.
+        let snapshot = engine
+            .inner
+            .store
+            .load_snapshot(session)
+            .expect("load snapshot")
+            .expect("a committed run must persist a snapshot");
+        let json = serde_json::to_string(&snapshot).expect("serialize snapshot");
+        assert!(
+            json.contains("pivot please"),
+            "persisted snapshot should carry the pivot message: {json}",
+        );
+        assert!(
+            json.contains("start"),
+            "persisted snapshot should carry the original message: {json}",
         );
     }
 }

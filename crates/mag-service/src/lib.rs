@@ -274,6 +274,28 @@ pub enum Event {
         /// Available sources discovered by the probe.
         available: Vec<SourceInfo>,
     },
+    /// A pivot message was accepted into a session's pivot queue.
+    ///
+    /// First layer of the two-layer pivot semantics (`docs/CLI.md` §3.2,
+    /// decision D1); the transport-facing twin of
+    /// [`ServiceEvent::PivotQueued`](crate::ServiceEvent::PivotQueued).
+    PivotQueued {
+        /// Session whose in-progress run the pivot targets.
+        id: SessionId,
+    },
+    /// A queued pivot message was injected into the run at a step boundary.
+    PivotApplied {
+        /// Session whose run accepted the pivot.
+        id: SessionId,
+    },
+    /// A queued pivot message was dropped because the run ended (finished,
+    /// failed, or cancelled) before it could be applied at a step boundary.
+    PivotDropped {
+        /// Session whose run the pivot targeted.
+        id: SessionId,
+        /// Human-readable reason the pivot was dropped.
+        reason: String,
+    },
 }
 
 /// Machine-readable classification of a [`Event::RunError`].
@@ -961,6 +983,15 @@ mod tests {
                     available: vec![source()],
                 },
                 "local_agents_probed",
+            ),
+            (Event::PivotQueued { id: session_id() }, "pivot_queued"),
+            (Event::PivotApplied { id: session_id() }, "pivot_applied"),
+            (
+                Event::PivotDropped {
+                    id: session_id(),
+                    reason: "run cancelled".to_owned(),
+                },
+                "pivot_dropped",
             ),
         ];
 
