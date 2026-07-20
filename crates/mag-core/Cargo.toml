@@ -7,6 +7,7 @@ edition.workspace = true
 agent-lib.workspace = true
 async-trait.workspace = true
 futures.workspace = true
+mag-config = { path = "../mag-config" }
 mag-service = { path = "../mag-service" }
 mag-sources = { path = "../mag-sources" }
 mag-tools = { path = "../mag-tools" }

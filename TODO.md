@@ -515,7 +515,7 @@ GUI/web/CLI 无需感知多个会话通道。
     目标全 ok，1 ignored 为既有 `#[ignore]` 联调测试）5) `cargo doc --no-deps --workspace` ✅
     （touch 强制重建 mag-config，0 warning）。
 
-### M3-3 [TODO] mag-core：`ConfigService`
+### M3-3 [DONE] mag-core：`ConfigService`
 
 - **上下文**：`docs/CLI.md` §4.3。
 - **实现要求**：
@@ -531,6 +531,45 @@ GUI/web/CLI 无需感知多个会话通道。
   - watch 触发的自动 reload 失败只记 warn 日志，不发错误事件、不换快照。
 - **验证条件**：聚焦测试（用 tempdir 配置文件）：update 后 current() 返回新快照且文件落盘；reload 拾取
   外部手改；损坏文件 reload 报错且快照不变；自写不触发回环（若 watch 启用）。默认验证序列全过。
+
+  **完成记录**（2026-07-22）：
+  - 实现要点：新增 `crates/mag-core/src/config.rs`（lib.rs `mod config;` + re-export
+    `ConfigService`/`ConfigChange`；模块 rustdoc 引用 `docs/CLI.md` §4.3、决策 D2/D4）。`ConfigService`
+    持有 `RwLock<Arc<ConfigSnapshot>>`（std RwLock、poison 恢复、锁不跨 `.await`，与 `PivotQueue`
+    同纪律）+ write-through 文件路径 + `broadcast::Sender<ConfigChange>`；revision 计数直接住在快照
+    内（`ConfigSnapshot::revision`），不与 DO 图分离，初始快照为 0、每次成功应用 +1。mag-core 新增
+    path 依赖 `mag-config`（合法方向：core → config 纯数据 crate）。API 全同步（唯一阻塞操作是小
+    文件 I/O，无 `.await` 持锁问题）：`load_or_default(path)` / `current()`（廉价 Arc 克隆即会话
+    钉住）/ `revision()` / `path()` / `subscribe()` / `update(dto)` / `reload()`。
+  - `update(dto)` 管线：resolve（含 validate）→ `save_atomic` write-through → 换快照 + revision+1 →
+    广播 `ConfigChange`。写盘失败不换快照（内存与文件一致优先，报错）；resolve 失败文件与快照都不动。
+  - `reload()` 管线：`ConfigDto::load` → resolve → 换快照 + revision+1 → 广播；文件缺失/损坏/语义非法
+    均报错且保留当前快照（不崩），文件修复后 reload 自然恢复。
+  - 关键决策：① **信号机制选型 = `tokio::sync::broadcast`**——载荷 `ConfigChange{revision,
+    snapshot: Arc<ConfigSnapshot>}`（容量 16，Lagged 订阅者可重读 `current()`，最新状态恒权威）；
+    多订阅者、lag-tolerant、与既有 `EventBus` fan-out 同构，M3-4 据此桥接
+    `ServiceEvent::ConfigChanged{revision}`，比回调注册表更适合 service 层转发；无订阅者时发送为
+    no-op（镜像 `EventBus::emit`）。② **watch 降级为仅显式 reload**——`cargo add notify` 清单层成功
+    但 `cargo fetch --offline` 失败（crate 文件不在本地 registry 缓存，拉取需网络），按任务书降级；
+    自写回环防护（去抖 ~300ms + 自写指纹去重）随之不需要——仅显式 reload 时回环不可能发生。模块
+    rustdoc 记录了降级原因与 watcher 落地时的回环防护要求。③ **写者串行化**——`update`/`reload`
+    全程持写锁（resolve→落盘→换根），revision 赋值、文件内容、内存快照三者天然一致，无并发交错。
+    ④ `load_or_default`：文件不存在 → 内置默认空快照（`ConfigDto::default()` resolve，revision 0，
+    不报错、不建文件，验证原型友好，bin 层 M3-6 用）；文件存在但损坏 → **报错**（§4.2「装配失败
+    给诊断，不静默降级」）。
+  - 测试（全部离线，`config::tests`，12 个，tempdir 配置目录复用 `TempDb` 同款
+    pid+nanos+counter+Drop 模式）：缺文件 → 默认空快照且不建文件；已有文件 → 加载且
+    agent→provider Arc 共享；启动即损坏 → `Parse` 错；update 换快照 + 文件落盘逐字节等价 + 旧钉住
+    快照不变；写盘失败（父路径被普通文件占用）→ `Io` 错、快照不换、无信号；非法 DTO（悬空 provider
+    引用）→ `Validation` 错带 `agents.default.provider` 路径、文件与快照不动；reload 拾取外部手改
+    （model 变更 + 新增 `[tools.shell]`）；损坏文件 reload → `Parse` 错、快照不换、修文件后恢复；
+    语义非法文件 reload → `Validation` 错、快照不换；订阅者按序收到 update/reload 两条
+    `ConfigChange`（revision 1/2 递增、载荷快照与 `current()` 同一 Arc、失败操作不发信号）；
+    并发读者只见到旧/新完整快照。聚焦测试连跑 3 次无 flake，单测试 < 1s。
+  - 门禁结果：1) `cargo fmt --all -- --check` ✅ 2) `cargo test -p mag-core config` ✅（12 passed，
+    连跑 3 次无 flake）3) `cargo clippy --all-targets -- -D warnings` ✅ 4) `cargo test --workspace`
+    ✅（全绿，1 ignored 为既有 `#[ignore]` 联调测试）5) `cargo doc --no-deps --workspace` ✅
+    （0 warning）。
 
 ### M3-4 [TODO] mag-service：配置方法 + `ConfigChanged` 事件
 
