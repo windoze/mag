@@ -24,3 +24,4 @@
 - 下一步运行 `cargo test -p mag-service` 与 mag-core 聚焦测试；若通过，再运行 clippy、workspace test、doc。
 - 验证已通过：`cargo test -p mag-service`、三个 mag-core 聚焦测试、`cargo clippy --all-targets -- -D warnings`、`cargo fmt --all -- --check`、`cargo test --workspace`、`cargo doc --no-deps --workspace`。
 - 已将 `TODO.md` 中 `W1-3` 标记为 `[DONE]` 并补完成记录；下一步检查 git 差异并提交本次任务变更。
+- 已完成提交前检查，提交 W1-3 任务变更，并确认工作区无未提交变更。
