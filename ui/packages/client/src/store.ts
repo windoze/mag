@@ -360,6 +360,15 @@ export class SessionStore {
     return result;
   }
 
+  /** Deletes a session and removes all local view state after the server accepts it. */
+  async deleteSession(id: SessionId): Promise<void> {
+    await this.transport.send({ type: "delete_session", id });
+    this.openSessionIds.delete(id);
+    this.sessions.delete(id);
+    this.sessionOrder = this.sessionOrder.filter((sessionId) => sessionId !== id);
+    this.notify();
+  }
+
   /** Sends a user message and appends the local user bubble after the server accepts it. */
   async sendMessage(
     id: SessionId,
@@ -793,7 +802,9 @@ export class SessionStore {
       completedRunIds: new Set()
     };
     this.sessions.set(id, session);
-    this.sessionOrder.push(id);
+    if (!this.sessionOrder.includes(id)) {
+      this.sessionOrder.push(id);
+    }
     return session;
   }
 

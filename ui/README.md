@@ -40,3 +40,18 @@ pnpm --filter @mag/ui storybook
 
 `protocol:generate` runs `cargo test -p mag-service --features ts-export export_ts`
 from the repository root and refreshes `packages/protocol/src/generated/`.
+
+## Manual Web Smoke
+
+The app shell is covered by vitest with a scripted transport. For a real `mag-web`
+smoke against the W2 server, run from the repository root:
+
+```sh
+export PATH="$HOME/.cargo/bin:$PATH"
+npx --yes pnpm@10.14.0 --dir ui -r build
+cargo run -p mag -- --web --host 127.0.0.1 --port 3000
+```
+
+Open the printed URL, including the `#t=<token>` fragment when auth is enabled.
+Create or select a session, send a message, approve any interaction card, try a
+pivot while a run is active, and press cancel to verify the REST+SSE loop.

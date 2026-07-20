@@ -389,7 +389,7 @@ CI 承载（引入 CI 时列为第一批）；⑥tool 输出为 agent-lib Conten
 - 组件交互测试覆盖 `InteractionCard` Approval/Question/Choice/Permission 提交回调 payload（含 choice 零基 index、permission deny reason、approval `step_id = call_id`）。
 - 验证通过：`npx --yes pnpm@10.14.0 --filter @mag/ui build`、`npx --yes pnpm@10.14.0 --filter @mag/ui test`、`npx --yes pnpm@10.14.0 --filter @mag/ui build-storybook`、`cargo fmt --all`、`npx --yes pnpm@10.14.0 format:write`、`cargo fmt --all -- --check`、`npx --yes pnpm@10.14.0 format`、`npx --yes pnpm@10.14.0 lint`、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`、`npx --yes pnpm@10.14.0 -r test`、`npx --yes pnpm@10.14.0 -r build`、`cargo doc --no-deps --workspace`。
 
-### W3-4 [TODO] app-web 壳：对话闭环
+### W3-4 [DONE] app-web 壳：对话闭环
 
 - **上下文**：`docs/WEB.md` §5.1/§5.2；W3-2/W3-3 就位。
 - **实现要求**：壳装配——fragment token 提取（`#t=`）→ sessionStorage → transport 注入；
@@ -398,6 +398,15 @@ CI 承载（引入 CI 时列为第一批）；⑥tool 输出为 agent-lib Conten
   （409 回落）、cancel。
 - **验证条件**：vitest 壳级测试（mock transport）；与 W2 server 的真实联调脚本（`#[ignore]` 或
   手动说明）；`pnpm -r test`/`pnpm -r build` 绿；默认验证序列全过。
+
+完成记录（2026-07-21）：
+
+- `@mag/app-web` 从占位页替换为实际 thin shell：启动时捕获 `#t=<token>` 到 `sessionStorage` 并清理 URL fragment，默认 `HttpSseTransport` 通过 token supplier 注入 Bearer；生产路径使用模块级 `SessionStore` 单例，测试可注入 scripted transport/store。
+- 完成会话视图闭环：左栏展示 `SessionInfo` 标题/时间/状态，新建会话、点击恢复（resume + history）、删除确认；主区 `ThreadView` 渲染历史与 SSE 增量的消息、工具卡、delegation 卡、交互卡、pivot/run error；底部 composer 接入发送、run 中 pivot 优先且 409 `not_pivotable` 自动回落 `send_message`、cancel；pending 交互计数提示；`config_changed` 展示 toast。
+- 接入 Sources/Config 占位路由，保持 W4 前页面入口稳定；右栏提供当前 run/全局 running 会话摘要与 delegation drill-down 插槽说明。
+- `@mag/client` 补 `SessionStore::deleteSession`，并修复 `syncSessionInfos` 在新列出会话上重复写入 `sessionOrder` 导致 sidebar 重复 key 的问题。
+- 新增 app-web 壳级 vitest（scripted mock transport）覆盖 token 捕获、会话列表/恢复/history、新建/删除、工具与审批卡渲染、审批响应提交、pivot 409 回落、cancel、Sources/Config 路由；`ui/README.md` 补充真实 W2 server 手动 web smoke 流程。
+- 验证通过：`cargo fmt --all`、`npx --yes pnpm@10.14.0 format:write`、`cargo fmt --all -- --check`、`npx --yes pnpm@10.14.0 --filter @mag/app-web test`、`npx --yes pnpm@10.14.0 --filter @mag/client test`、`cargo clippy --all-targets -- -D warnings`、`npx --yes pnpm@10.14.0 format`、`npx --yes pnpm@10.14.0 lint`、`npx --yes pnpm@10.14.0 --filter @mag/app-web build`、`cargo test --workspace`、`npx --yes pnpm@10.14.0 -r test`、`cargo doc --no-deps --workspace`、`npx --yes pnpm@10.14.0 -r build`。
 
 ### W3-R [TODO] W3 review
 

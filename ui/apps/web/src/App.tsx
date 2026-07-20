@@ -1,21 +1,515 @@
-import { clientPackageName } from "@mag/client";
-import { Button } from "@mag/ui";
+import {
+  HttpSseTransport,
+  SessionStore,
+  TransportError,
+  type ITransport,
+  type RunView,
+  type SessionStoreSnapshot,
+  type SessionView,
+  type ThreadItem
+} from "@mag/client";
+import {
+  Button,
+  Composer,
+  SessionSidebar,
+  ThreadView,
+  type ComposerMode,
+  type InteractionResponseView,
+  type SidebarSessionView,
+  type ThreadItemView
+} from "@mag/ui";
 import "@mag/ui/styles.css";
+import * as React from "react";
 
-/** Minimal web shell rendered by the Vite app skeleton. */
-export function App(): React.JSX.Element {
+import {
+  captureFragmentToken,
+  readStoredToken,
+  type ShellHistory,
+  type ShellLocation,
+  type ShellStorage
+} from "./token";
+
+const DEFAULT_SESSION_CONFIG = {
+  provider: "openai",
+  model: "gpt-5-codex",
+  routing: "model_routed"
+} satisfies Parameters<SessionStore["createSession"]>[0];
+
+let browserStore: SessionStore | undefined;
+
+type Route =
+  | { readonly page: "session"; readonly sessionId?: string }
+  | { readonly page: "sources" }
+  | { readonly page: "config" };
+
+/** Optional test hooks for injecting scripted transports without changing production wiring. */
+export interface AppProps {
+  /** Prebuilt store; mainly used by shell-level tests. */
+  readonly store?: SessionStore;
+  /** Transport used to create a per-App store when `store` is not supplied. */
+  readonly transport?: ITransport;
+  /** Storage implementation for token capture. Defaults to `sessionStorage`. */
+  readonly storage?: ShellStorage;
+  /** Location used for `#t=` token capture. Defaults to `window.location`. */
+  readonly location?: ShellLocation;
+  /** History used to remove captured token fragments. Defaults to `window.history`. */
+  readonly history?: ShellHistory;
+}
+
+/** Thin web shell that wires auth, routing, SessionStore, and shared UI components. */
+export function App(props: AppProps = {}): React.JSX.Element {
+  const [store] = React.useState(() => createStore(props));
+  const snapshot = useSessionStoreSnapshot(store);
+  const [route, setRoute] = React.useState<Route>({ page: "session" });
+  const [composerValue, setComposerValue] = React.useState("");
+  const [pendingAction, setPendingAction] = React.useState<string>();
+  const [error, setError] = React.useState<string>();
+  const [notice, setNotice] = React.useState<string>();
+  const activeSession = selectActiveSession(snapshot, route);
+  const activeSessionId = activeSession?.id;
+  const activeRun = isActiveRun(activeSession?.run);
+  const composerMode = composerModeFor(activeSession?.run);
+  const pendingInteractionCount = activeSession?.pendingInteractions.length ?? 0;
+
+  React.useEffect(() => {
+    captureFragmentToken(props.storage, props.location, props.history);
+    let cancelled = false;
+    store.start();
+    store.refreshSessions().catch((refreshError: unknown) => {
+      if (!cancelled) {
+        setError(errorMessage(refreshError));
+      }
+    });
+
+    return () => {
+      cancelled = true;
+      store.stop();
+    };
+  }, [props.history, props.location, props.storage, store]);
+
+  React.useEffect(() => {
+    if (snapshot.configRevision !== undefined) {
+      setNotice(
+        `Config updated (r${snapshot.configRevision}); apply takes effect at each session's next turn boundary.`
+      );
+    }
+  }, [snapshot.configRevision]);
+
+  const runAction = async (name: string, action: () => Promise<void>): Promise<void> => {
+    setPendingAction(name);
+    setError(undefined);
+    try {
+      await action();
+    } catch (actionError: unknown) {
+      setError(errorMessage(actionError));
+    } finally {
+      setPendingAction(undefined);
+    }
+  };
+
+  const createAndOpenSession = async (): Promise<string> => {
+    const created = await store.createSession(DEFAULT_SESSION_CONFIG);
+    setRoute({ page: "session", sessionId: created.id });
+    await store.openSession(created.id);
+    await store.refreshSessions();
+    return created.id;
+  };
+
+  const openSession = async (sessionId: string): Promise<void> => {
+    setRoute({ page: "session", sessionId });
+    await store.openSession(sessionId, { resume: true });
+  };
+
+  const sendComposerText = async (rawText: string): Promise<void> => {
+    const text = rawText.trim();
+    if (text.length === 0) {
+      return;
+    }
+
+    const sessionId = activeSessionId ?? (await createAndOpenSession());
+    if (activeRun) {
+      try {
+        await store.pivotMessage(sessionId, text);
+      } catch (pivotError: unknown) {
+        if (!isTransportErrorKind(pivotError, "not_pivotable")) {
+          throw pivotError;
+        }
+        await store.sendMessage(sessionId, text);
+      }
+    } else {
+      await store.sendMessage(sessionId, text);
+    }
+    setComposerValue("");
+    await store.refreshSessions();
+  };
+
+  const respondInteraction = async (
+    requestId: string,
+    response: InteractionResponseView
+  ): Promise<void> => {
+    if (activeSessionId === undefined) {
+      return;
+    }
+
+    await store.respondInteraction(
+      activeSessionId,
+      requestId,
+      response as Parameters<SessionStore["respondInteraction"]>[2]
+    );
+  };
+
   return (
-    <main className="min-h-screen bg-background p-8 text-foreground">
-      <section className="mx-auto flex max-w-3xl flex-col gap-4 rounded-lg border border-border bg-white/80 p-6 shadow-sm">
-        <p className="text-sm font-medium uppercase tracking-wide text-primary">mag web</p>
-        <h1 className="text-3xl font-semibold">Shared UI workspace ready</h1>
-        <p className="text-sm text-foreground/70">
-          The web shell depends on @mag/ui and {clientPackageName}; transport wiring lands in W3-2.
-        </p>
-        <div>
-          <Button type="button">New chat</Button>
+    <main className="flex min-h-screen flex-col bg-background text-foreground md:flex-row">
+      <SessionSidebar
+        activeSessionId={activeSessionId}
+        className="h-72 w-full shrink-0 border-b border-r-0 md:h-screen md:w-72 md:border-b-0 md:border-r"
+        sessions={snapshot.sessions.map(toSidebarSession)}
+        onDeleteSession={(sessionId) => {
+          if (!confirmDelete(sessionId, snapshot.sessions)) {
+            return;
+          }
+          void runAction("delete-session", async () => {
+            await store.deleteSession(sessionId);
+            if (activeSessionId === sessionId) {
+              setRoute({ page: "session" });
+            }
+          });
+        }}
+        onNewSession={() =>
+          void runAction("new-session", async () => void (await createAndOpenSession()))
+        }
+        onOpenConfig={() => setRoute({ page: "config" })}
+        onOpenSources={() => setRoute({ page: "sources" })}
+        onSelectSession={(sessionId) =>
+          void runAction("open-session", async () => openSession(sessionId))
+        }
+      />
+
+      <section className="flex min-h-[42rem] min-w-0 flex-1 flex-col md:h-screen md:min-h-0">
+        <ShellHeader
+          activeSession={activeSession}
+          connectionStatus={snapshot.connectionStatus}
+          pendingAction={pendingAction}
+          route={route}
+        />
+        <StatusMessage error={error} notice={notice} onDismissNotice={() => setNotice(undefined)} />
+        <div className="min-h-0 flex-1 overflow-y-auto bg-muted/30">
+          {route.page === "sources" ? (
+            <PlaceholderPage
+              actionLabel="Back to chat"
+              description="Sources management lands in W4. This route is wired now so the shell navigation is stable."
+              title="Sources"
+              onAction={() => setRoute({ page: "session", sessionId: activeSessionId })}
+            />
+          ) : route.page === "config" ? (
+            <PlaceholderPage
+              actionLabel="Back to chat"
+              description="The text ConfigEditor lands in W4. Token-authenticated routing is already available."
+              title="Config"
+              onAction={() => setRoute({ page: "session", sessionId: activeSessionId })}
+            />
+          ) : (
+            <ThreadView
+              className="mx-auto max-w-5xl"
+              emptyState={
+                activeSessionId === undefined
+                  ? "Create or select a session, then send a message."
+                  : "This session has no committed history yet."
+              }
+              items={(activeSession?.thread ?? []).map(toThreadItemView)}
+              onRespondInteraction={(requestId, response) => {
+                void runAction("respond-interaction", async () =>
+                  respondInteraction(requestId, response)
+                );
+              }}
+            />
+          )}
         </div>
+        {route.page === "session" ? (
+          <div className="border-t border-border bg-background p-3">
+            <Composer
+              className="mx-auto max-w-5xl"
+              disabled={pendingAction === "send-message" || pendingAction === "new-session"}
+              mode={composerMode}
+              pendingInteractionCount={pendingInteractionCount}
+              value={composerValue}
+              onCancel={() => {
+                if (activeSessionId !== undefined) {
+                  void runAction("cancel-run", async () => store.cancelRun(activeSessionId));
+                }
+              }}
+              onSend={(text) => void runAction("send-message", async () => sendComposerText(text))}
+              onValueChange={setComposerValue}
+            />
+          </div>
+        ) : null}
       </section>
+
+      <RightRail activeSession={activeSession} sessions={snapshot.sessions} />
     </main>
   );
+}
+
+function createStore(props: AppProps): SessionStore {
+  if (props.store !== undefined) {
+    return props.store;
+  }
+  if (props.transport !== undefined) {
+    return new SessionStore(props.transport);
+  }
+  if (browserStore === undefined) {
+    browserStore = new SessionStore(new HttpSseTransport({ token: () => readStoredToken() }));
+  }
+  return browserStore;
+}
+
+function useSessionStoreSnapshot(store: SessionStore): SessionStoreSnapshot {
+  const [snapshot, setSnapshot] = React.useState(() => store.getSnapshot());
+
+  React.useEffect(() => {
+    setSnapshot(store.getSnapshot());
+    return store.subscribe((nextSnapshot) => setSnapshot(nextSnapshot));
+  }, [store]);
+
+  return snapshot;
+}
+
+function selectActiveSession(
+  snapshot: SessionStoreSnapshot,
+  route: Route
+): SessionView | undefined {
+  if (route.page !== "session" || route.sessionId === undefined) {
+    return undefined;
+  }
+  return snapshot.sessions.find((session) => session.id === route.sessionId);
+}
+
+function toSidebarSession(session: SessionView): SidebarSessionView {
+  const config = session.info?.config ?? session.config;
+  return {
+    id: session.id,
+    title: session.info?.title ?? firstUserMessage(session)?.text ?? session.id,
+    cwd: config?.cwd,
+    lastActiveAt: session.info?.last_active_at,
+    status: session.status,
+    subtitle: config === undefined ? undefined : `${config.provider} / ${config.model}`
+  };
+}
+
+function firstUserMessage(session: SessionView): { readonly text: string } | undefined {
+  return session.messages.find((message) => message.role === "user");
+}
+
+function toThreadItemView(item: ThreadItem): ThreadItemView {
+  switch (item.type) {
+    case "message":
+      return { type: "message", message: item.message };
+    case "tool_call":
+      return { type: "tool_call", toolCall: item.toolCall };
+    case "delegation":
+      return {
+        type: "delegation",
+        delegation: {
+          id: item.delegation.id,
+          delegate: item.delegation.trace.delegate,
+          status: item.delegation.trace.status,
+          task: item.delegation.trace.task,
+          output: item.delegation.trace.output,
+          message: item.delegation.trace.message,
+          usage: item.delegation.trace.usage
+        }
+      };
+    case "interaction":
+      return {
+        type: "interaction",
+        interaction: {
+          requestId: item.interaction.requestId,
+          kind: item.interaction.kind,
+          origin: item.interaction.origin,
+          status: item.interaction.status,
+          response: item.interaction.response
+        }
+      };
+    case "pivot":
+      return { type: "pivot", notice: item.notice };
+    case "run_error":
+      return { type: "run_error", error: item.error };
+  }
+}
+
+function isActiveRun(run: RunView | undefined): boolean {
+  return run?.state === "running" || run?.state === "awaiting_interaction";
+}
+
+function composerModeFor(run: RunView | undefined): ComposerMode {
+  return isActiveRun(run) ? "running" : "idle";
+}
+
+function isTransportErrorKind(error: unknown, kind: string): boolean {
+  if (error instanceof TransportError) {
+    return error.kind === kind;
+  }
+  return typeof error === "object" && error !== null && "kind" in error && error.kind === kind;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function confirmDelete(sessionId: string, sessions: readonly SessionView[]): boolean {
+  const session = sessions.find((candidate) => candidate.id === sessionId);
+  const title = session?.info?.title ?? sessionId;
+  if (typeof window === "undefined" || typeof window.confirm !== "function") {
+    return true;
+  }
+  return window.confirm(`Delete session "${title}"? This cannot be undone.`);
+}
+
+function ShellHeader({
+  activeSession,
+  connectionStatus,
+  pendingAction,
+  route
+}: {
+  readonly activeSession?: SessionView;
+  readonly connectionStatus: SessionStoreSnapshot["connectionStatus"];
+  readonly pendingAction?: string;
+  readonly route: Route;
+}): React.JSX.Element {
+  const title =
+    route.page === "sources"
+      ? "Sources"
+      : route.page === "config"
+        ? "Config"
+        : (activeSession?.info?.title ?? "Conversation");
+
+  return (
+    <header className="flex flex-wrap items-center justify-between gap-3 border-b border-border bg-card px-4 py-3">
+      <div className="min-w-0">
+        <p className="text-xs font-semibold uppercase tracking-wide text-primary">mag web</p>
+        <h1 className="truncate text-lg font-semibold">{title}</h1>
+      </div>
+      <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+        {pendingAction !== undefined ? <span>{pendingAction.replaceAll("-", " ")}...</span> : null}
+        <span className="rounded-full border border-border bg-background px-2 py-1">
+          {connectionStatus}
+        </span>
+      </div>
+    </header>
+  );
+}
+
+function StatusMessage({
+  error,
+  notice,
+  onDismissNotice
+}: {
+  readonly error?: string;
+  readonly notice?: string;
+  readonly onDismissNotice: () => void;
+}): React.JSX.Element | null {
+  if (error === undefined && notice === undefined) {
+    return null;
+  }
+
+  return (
+    <div className="space-y-2 border-b border-border bg-background px-4 py-3">
+      {error !== undefined ? (
+        <div className="rounded-lg border border-destructive/20 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          {error}
+        </div>
+      ) : null}
+      {notice !== undefined ? (
+        <div className="flex items-center justify-between gap-3 rounded-lg border border-primary/20 bg-primary/10 px-3 py-2 text-sm text-primary">
+          <span>{notice}</span>
+          <Button size="sm" type="button" variant="ghost" onClick={onDismissNotice}>
+            Dismiss
+          </Button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function PlaceholderPage({
+  actionLabel,
+  description,
+  onAction,
+  title
+}: {
+  readonly actionLabel: string;
+  readonly description: string;
+  readonly onAction: () => void;
+  readonly title: string;
+}): React.JSX.Element {
+  return (
+    <div className="flex min-h-full items-center justify-center p-6">
+      <section className="max-w-lg rounded-2xl border border-dashed border-border bg-card p-6 text-center shadow-sm">
+        <p className="text-xs font-semibold uppercase tracking-wide text-primary">route ready</p>
+        <h2 className="mt-2 text-2xl font-semibold">{title}</h2>
+        <p className="mt-3 text-sm text-muted-foreground">{description}</p>
+        <Button className="mt-5" type="button" variant="outline" onClick={onAction}>
+          {actionLabel}
+        </Button>
+      </section>
+    </div>
+  );
+}
+
+function RightRail({
+  activeSession,
+  sessions
+}: {
+  readonly activeSession?: SessionView;
+  readonly sessions: readonly SessionView[];
+}): React.JSX.Element {
+  const runningSessions = sessions.filter((session) => isActiveRun(session.run));
+
+  return (
+    <aside className="hidden w-72 shrink-0 flex-col gap-4 border-l border-border bg-card p-4 xl:flex">
+      <section>
+        <h2 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+          Current run
+        </h2>
+        <p className="mt-2 rounded-lg bg-muted p-3 text-sm">
+          {activeSession === undefined ? "No session selected." : runSummary(activeSession.run)}
+        </p>
+      </section>
+      <section>
+        <h2 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+          Running sessions
+        </h2>
+        <div className="mt-2 space-y-2">
+          {runningSessions.length === 0 ? (
+            <p className="rounded-lg border border-dashed border-border p-3 text-sm text-muted-foreground">
+              Nothing running.
+            </p>
+          ) : (
+            runningSessions.map((session) => (
+              <div className="rounded-lg border border-border p-3 text-sm" key={session.id}>
+                <p className="truncate font-medium">{session.info?.title ?? session.id}</p>
+                <p className="text-xs text-muted-foreground">{runSummary(session.run)}</p>
+              </div>
+            ))
+          )}
+        </div>
+      </section>
+      <section className="rounded-lg border border-dashed border-border p-3 text-sm text-muted-foreground">
+        Delegate drill-down lands in W4; delegation cards already render inline in the thread.
+      </section>
+    </aside>
+  );
+}
+
+function runSummary(run: RunView): string {
+  switch (run.state) {
+    case "idle":
+      return "Idle";
+    case "running":
+      return run.runId === undefined ? "Running" : `Running ${run.runId}`;
+    case "awaiting_interaction":
+      return run.runId === undefined ? "Awaiting interaction" : `Awaiting interaction ${run.runId}`;
+    case "error":
+      return `${run.kind}: ${run.message}`;
+  }
 }
