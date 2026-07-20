@@ -33,9 +33,9 @@ use async_trait::async_trait;
 use futures::channel::mpsc;
 use futures::stream::{BoxStream, StreamExt};
 use mag_service::{
-    ApprovalDecisionWire, ApprovalRequirementWire, InteractionKindWire, InteractionResponseWire,
-    MagService, RequestId, RunErrorKind, RunId, RunOutput, ServiceError, ServiceEvent,
-    SessionConfig, SessionId, SessionInfo, SourceInfo, ToolCallIdWire, UserInput,
+    ApprovalDecisionWire, ApprovalRequirementWire, InteractionKindWire, InteractionOrigin,
+    InteractionResponseWire, MagService, RequestId, RunErrorKind, RunId, RunOutput, ServiceError,
+    ServiceEvent, SessionConfig, SessionId, SessionInfo, SourceInfo, ToolCallIdWire, UserInput,
 };
 use tokio::sync::Notify;
 
@@ -69,6 +69,7 @@ fn approval_interaction() -> ServiceEvent {
                 reason: Some("writes to disk".to_owned()),
             },
         },
+        origin: InteractionOrigin::default(),
     }
 }
 

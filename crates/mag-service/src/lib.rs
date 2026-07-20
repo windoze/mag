@@ -240,6 +240,11 @@ pub enum Event {
         request_id: RequestId,
         /// Interaction details to render or decide.
         kind: InteractionKindWire,
+        /// Origin attribution for the interaction (`docs/CLI.md` §3.3,
+        /// decision D5); defaults to the root origin so events serialized
+        /// before this field existed still deserialize.
+        #[serde(default)]
+        origin: InteractionOrigin,
     },
     /// A delegated child-agent task started.
     DelegationStarted {
@@ -493,6 +498,45 @@ pub struct DelegationMessageWire {
     pub delegate: String,
     /// Message text emitted by the delegated agent.
     pub text: String,
+}
+
+/// Origin attribution for an interaction request (`docs/CLI.md` §3.3,
+/// decision D5).
+///
+/// Sub-agent (delegate) interactions are not delivered over a separate
+/// channel: they surface as ordinary interaction requests on the root
+/// session's event stream, and this payload records where they came from so
+/// interfaces can render attribution (for example `[from codex@depth1]`). It
+/// is the wire counterpart of agent-lib's `InteractionOrigin { delegate,
+/// depth }` (the wire keeps the depth as `u32`; agent-lib uses `usize`).
+///
+/// The default is the *root* origin — `delegate: None, depth: 0` — meaning
+/// the interaction was produced by the root session's own agent. Because the
+/// event fields carrying this payload are `#[serde(default)]`, events
+/// serialized before attribution existed still deserialize as
+/// root-originated.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InteractionOrigin {
+    /// Name of the delegate (sub-agent) that produced the interaction.
+    ///
+    /// `None` means the interaction was produced by the root session's own
+    /// agent — the default for interactions that predate sub-agent
+    /// attribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegate: Option<String>,
+    /// Delegation depth of the producing agent: `0` is the root session's own
+    /// agent, `1` a direct delegate, and so on.
+    #[serde(default)]
+    pub depth: u32,
+}
+
+impl InteractionOrigin {
+    /// Returns `true` when the interaction was produced by the root session's
+    /// own agent rather than by a delegate.
+    #[must_use]
+    pub fn is_root(&self) -> bool {
+        self.delegate.is_none()
+    }
 }
 
 /// Interaction request shown to a user or policy engine.
@@ -947,6 +991,7 @@ mod tests {
                     id: session_id(),
                     request_id: request_id(),
                     kind: interaction_kind(),
+                    origin: InteractionOrigin::default(),
                 },
                 "interaction_requested",
             ),
@@ -998,6 +1043,50 @@ mod tests {
         for (event, expected_tag) in cases {
             assert_tag(&event, expected_tag);
             assert_round_trip(event);
+        }
+    }
+
+    #[test]
+    fn interaction_origin_defaults_to_root_and_round_trips() {
+        let root = InteractionOrigin::default();
+        assert_eq!(root.delegate, None);
+        assert_eq!(root.depth, 0);
+        assert!(root.is_root());
+
+        let delegated = InteractionOrigin {
+            delegate: Some("codex".to_owned()),
+            depth: 1,
+        };
+        assert!(!delegated.is_root());
+        assert_round_trip(delegated);
+        assert_round_trip(root);
+
+        // A bare `depth`-only payload (the serialized root origin) decodes
+        // back to the root origin.
+        let decoded = serde_json::from_value::<InteractionOrigin>(json!({ "depth": 0 }))
+            .expect("serialized root origin");
+        assert_eq!(decoded, InteractionOrigin::default());
+    }
+
+    #[test]
+    fn interaction_requested_without_origin_deserializes_as_root() {
+        // Legacy wire shape (pre-`docs/CLI.md` §3.3 attribution): no `origin`
+        // key at all. It must decode with the default root origin so events
+        // serialized before the field existed stay readable.
+        let legacy = json!({
+            "type": "interaction_requested",
+            "id": session_id(),
+            "request_id": request_id(),
+            "kind": { "kind": "question", "prompt": "Proceed?" },
+        });
+        let decoded = serde_json::from_value::<Event>(legacy)
+            .expect("legacy interaction_requested without origin");
+        match decoded {
+            Event::InteractionRequested { origin, .. } => {
+                assert_eq!(origin, InteractionOrigin::default());
+                assert!(origin.is_root());
+            }
+            other => panic!("expected interaction_requested, got {other:?}"),
         }
     }
 

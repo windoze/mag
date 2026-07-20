@@ -236,7 +236,7 @@ mag-core driver 落地 pivot 队列旁路（agent-lib `interject()`）。第二�
 目标：子 agent（delegate）产生的 `InteractionRequested` 统一 pop 到 root 会话事件流，并标注来源；
 GUI/web/CLI 无需感知多个会话通道。
 
-### M2-1 [TODO] mag-service：`InteractionOrigin` wire 类型 + 事件字段
+### M2-1 [DONE] mag-service：`InteractionOrigin` wire 类型 + 事件字段
 
 - **上下文**：`docs/CLI.md` §3.3；agent-lib 已提供 `InteractionOrigin{delegate:Option<String>,
   depth:usize}`（子 agent 交互路由到父级注入 handler 时携带）。
@@ -246,6 +246,40 @@ GUI/web/CLI 无需感知多个会话通道。
   - `ServiceEvent::InteractionRequested` 新增字段 `#[serde(default)] origin: InteractionOrigin`
     （default = root，向后兼容旧事件流与消费者）。
 - **验证条件**：序列化兼容单测（无 origin 字段的旧 JSON 可反序列化、新 JSON 含 origin）；默认验证序列全过。
+
+  **完成记录**（2026-07-20）：
+  - 实现要点：`crates/mag-service/src/lib.rs` 新增 wire 类型
+    `InteractionOrigin{delegate:Option<String>, depth:u32}`（derive `Default`，root =
+    `delegate:None, depth:0`；`delegate` 按 crate 惯例 `#[serde(default,
+    skip_serializing_if = "Option::is_none")]`，`depth` 带 `#[serde(default)]` 容错），附
+    `is_root()` 访问器；`ServiceEvent::InteractionRequested` 与 wire `Event::InteractionRequested`
+    **两个枚举同步**新增 `#[serde(default)] origin: InteractionOrigin`（M1-2 教训：双枚举都要动），
+    `From<Event> for ServiceEvent` 投影同步携带 origin。全部只加不改，`Command` 协议未动。
+  - 关键决策：① origin 字段**不是** `Option<InteractionOrigin>`——`docs/CLI.md` §3.3 草稿写的是
+    `Option<..>`（`None` = root），TODO 任务规范定为裸类型 + `#[serde(default)]`（default =
+    root），以 TODO 为准：少一层嵌套、serde 语义等价（旧事件无字段 → default root）；② 草稿里的
+    `agent: AgentIdWire` 字段不取——Permission 类交互本就有 `actor` 承载权限语义主体，origin 只做
+    渲染归属（§3.3 原文「origin 与 actor 互补」）；③ depth 用 `u32`（agent-lib 侧是 `usize`，
+    wire 收窄为定宽类型，M2-2 映射时转换）；④ `IpcApproval` 发事件处（mag-core
+    `engine/approval.rs`）暂填 `InteractionOrigin::default()` 并注明 M2-2 接线真实 origin——本任务
+    只做契约，子 agent origin 映射属 M2-2。
+  - rustdoc：`InteractionOrigin`、两个 `InteractionRequested` 变体的 `origin` 字段、
+    `ServiceEvent::InteractionRequested` 变体级文档均引用 `docs/CLI.md` §3.3（决策 D5），注明
+    `delegate:None` = root 会话自身产生、与 Permission `actor` 的互补关系。
+  - 下游编译适配（纯机械，不改语义）：mag-core `IpcApproval` emit 处补 `origin` 字段；mag-core
+    `engine.rs` 两处与 `e2e_offline.rs` 一处穷尽模式补 `..`；mag-acp 三个测试文件
+    （`e2e_acp.rs`/`permission_bridge.rs`/`cancel.rs`）共四处 `InteractionRequested` 字面构造补
+    `origin: InteractionOrigin::default()`。
+  - 测试（全部离线）：mag-service 新增 3 个——`interaction_origin_defaults_to_root_and_round_trips`
+    （default = root、`is_root()`、delegated/default 双 roundtrip、裸 `{depth:0}` 解码回 root）；
+    `interaction_requested_without_origin_deserializes_as_root`（lib.rs 与 service.rs 各一：无
+    `origin` 键的旧 JSON → default root）。既有 roundtrip 用例中 `ServiceEvent::InteractionRequested`
+    改带 delegated origin（`codex@depth1`）覆盖新字段 roundtrip；投影用例新增
+    `Event::InteractionRequested → ServiceEvent::InteractionRequested`（delegated origin）一条，
+    验证投影完整。`cargo test -p mag-service` 17 passed。
+  - 门禁结果：1) `cargo fmt --all -- --check` ✅ 2) `cargo test -p mag-service` ✅（17 passed）
+    3) `cargo clippy --all-targets -- -D warnings` ✅ 4) `cargo test --workspace` ✅（18 个测试
+    目标全 ok，无失败）5) `cargo doc --no-deps --workspace` ✅。
 
 ### M2-2 [TODO] mag-core：子 agent 交互 origin 映射
 

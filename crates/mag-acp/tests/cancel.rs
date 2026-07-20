@@ -36,9 +36,9 @@ use async_trait::async_trait;
 use futures::channel::mpsc;
 use futures::stream::{BoxStream, StreamExt};
 use mag_service::{
-    ApprovalDecisionWire, ApprovalRequirementWire, InteractionKindWire, InteractionResponseWire,
-    MagService, RequestId, RunErrorKind, RunId, ServiceError, ServiceEvent, SessionConfig,
-    SessionId, SessionInfo, SourceInfo, ToolCallIdWire, UserInput,
+    ApprovalDecisionWire, ApprovalRequirementWire, InteractionKindWire, InteractionOrigin,
+    InteractionResponseWire, MagService, RequestId, RunErrorKind, RunId, ServiceError,
+    ServiceEvent, SessionConfig, SessionId, SessionInfo, SourceInfo, ToolCallIdWire, UserInput,
 };
 use tokio::sync::Notify;
 
@@ -405,6 +405,7 @@ async fn cancel_does_not_leak_into_the_next_turn() {
             call_id: ToolCallIdWire::parse_str(TOOL_CALL_UUID).expect("valid uuid"),
             requirement: ApprovalRequirementWire::RequireApproval { reason: None },
         },
+        origin: InteractionOrigin::default(),
     };
     let service = Arc::new(TwoRunService {
         scripts: Mutex::new(vec![vec![approval()], vec![approval()]].into()),
@@ -519,6 +520,7 @@ async fn cancel_during_pending_permission_wraps_up_both_sides() {
                 reason: Some("writes to disk".to_owned()),
             },
         },
+        origin: InteractionOrigin::default(),
     };
     // Model the post-M4-0 race: the service already resolved the parked
     // interaction itself on cancellation, so the bridge's late answer finds

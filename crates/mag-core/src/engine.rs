@@ -1352,6 +1352,7 @@ mod tool_turn {
                 id,
                 request_id,
                 kind,
+                ..
             } => {
                 assert_eq!(id, session);
                 assert!(
@@ -1864,6 +1865,7 @@ mod persist {
                 id,
                 request_id,
                 kind,
+                ..
             } => {
                 assert_eq!(id, session);
                 assert!(

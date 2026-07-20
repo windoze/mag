@@ -393,6 +393,7 @@ async fn drain_to_interaction(
             id,
             request_id,
             kind,
+            ..
         } = &event
         {
             assert_eq!(*id, session, "interaction leaked to another session");

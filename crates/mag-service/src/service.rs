@@ -18,8 +18,9 @@ use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt};
 
 use crate::{
-    DelegationMessageWire, DelegationTrace, Event, InteractionKindWire, InteractionResponseWire,
-    RequestId, RunErrorKind, RunId, RunOutput, SessionConfig, SessionId, SourceInfo, ToolTrace,
+    DelegationMessageWire, DelegationTrace, Event, InteractionKindWire, InteractionOrigin,
+    InteractionResponseWire, RequestId, RunErrorKind, RunId, RunOutput, SessionConfig, SessionId,
+    SourceInfo, ToolTrace,
 };
 
 /// Transport-neutral service facade implemented by `mag-core::Engine`.
@@ -260,6 +261,11 @@ pub enum ServiceEvent {
         trace: ToolTrace,
     },
     /// The service is waiting for an external interaction response.
+    ///
+    /// Sub-agent (delegate) interactions pop up to the root session through
+    /// this same variant, attributed by `origin` (`docs/CLI.md` §3.3,
+    /// decision D5); interfaces handle every pending interaction through one
+    /// queue without tracking per-delegate channels.
     InteractionRequested {
         /// Session that owns the pending interaction.
         id: SessionId,
@@ -268,6 +274,11 @@ pub enum ServiceEvent {
         request_id: RequestId,
         /// Interaction details to render or decide.
         kind: InteractionKindWire,
+        /// Origin attribution for the interaction; defaults to the root
+        /// origin ([`InteractionOrigin::default`]) so events serialized before
+        /// this field existed still deserialize.
+        #[serde(default)]
+        origin: InteractionOrigin,
     },
     /// A delegated child-agent task started.
     DelegationStarted {
@@ -379,10 +390,12 @@ impl From<Event> for ServiceEvent {
                 id,
                 request_id,
                 kind,
+                origin,
             } => Self::InteractionRequested {
                 id,
                 request_id,
                 kind,
+                origin,
             },
             Event::DelegationStarted { id, trace } => Self::DelegationStarted { id, trace },
             Event::DelegationFinished { id, trace } => Self::DelegationFinished { id, trace },
@@ -691,6 +704,10 @@ mod tests {
                         subject: json!({ "path": "src/lib.rs" }),
                         reason: None,
                     },
+                    origin: InteractionOrigin {
+                        delegate: Some("codex".to_owned()),
+                        depth: 1,
+                    },
                 },
                 "interaction_requested",
             ),
@@ -815,6 +832,30 @@ mod tests {
                     available: vec![source()],
                 },
             ),
+            (
+                Event::InteractionRequested {
+                    id: session_id(),
+                    request_id: RequestId::new(uuid(2)),
+                    kind: InteractionKindWire::Question {
+                        prompt: "Proceed?".to_owned(),
+                    },
+                    origin: InteractionOrigin {
+                        delegate: Some("codex".to_owned()),
+                        depth: 1,
+                    },
+                },
+                ServiceEvent::InteractionRequested {
+                    id: session_id(),
+                    request_id: RequestId::new(uuid(2)),
+                    kind: InteractionKindWire::Question {
+                        prompt: "Proceed?".to_owned(),
+                    },
+                    origin: InteractionOrigin {
+                        delegate: Some("codex".to_owned()),
+                        depth: 1,
+                    },
+                },
+            ),
         ];
 
         for (event, expected) in cases {
@@ -877,6 +918,28 @@ mod tests {
                 attachments: Vec::new(),
             },
         );
+    }
+
+    #[test]
+    fn interaction_requested_without_origin_deserializes_as_root() {
+        // Legacy event-stream shape (pre-`docs/CLI.md` §3.3 attribution): no
+        // `origin` key at all. It must decode with the default root origin so
+        // old recordings and old consumers keep working.
+        let legacy = json!({
+            "type": "interaction_requested",
+            "id": session_id(),
+            "request_id": RequestId::new(uuid(2)),
+            "kind": { "kind": "question", "prompt": "Proceed?" },
+        });
+        let decoded = serde_json::from_value::<ServiceEvent>(legacy)
+            .expect("legacy interaction_requested without origin");
+        match decoded {
+            ServiceEvent::InteractionRequested { origin, .. } => {
+                assert_eq!(origin, InteractionOrigin::default());
+                assert!(origin.is_root());
+            }
+            other => panic!("expected interaction_requested, got {other:?}"),
+        }
     }
 
     #[test]

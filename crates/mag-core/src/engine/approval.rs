@@ -38,8 +38,8 @@ use agent_lib::conversation::ToolCallId;
 use async_trait::async_trait;
 use mag_service::{
     AgentIdWire, ApprovalDecisionWire, ApprovalRequirementWire, Event, InteractionKindWire,
-    InteractionResponseWire, PermissionCategoryWire, PermissionDecisionWire, PermissionRiskWire,
-    RequestId, ServiceError, SessionId, ToolCallIdWire,
+    InteractionOrigin, InteractionResponseWire, PermissionCategoryWire, PermissionDecisionWire,
+    PermissionRiskWire, RequestId, ServiceError, SessionId, ToolCallIdWire,
 };
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -204,6 +204,9 @@ impl IpcApproval {
             id: self.session_id,
             request_id,
             kind,
+            // M2-1 adds the attribution field; M2-2 threads the delegate's
+            // real origin here — until then every interaction is root-origin.
+            origin: InteractionOrigin::default(),
         });
 
         tokio::select! {

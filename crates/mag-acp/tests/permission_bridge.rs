@@ -40,9 +40,9 @@ use async_trait::async_trait;
 use futures::channel::mpsc;
 use futures::stream::{BoxStream, StreamExt};
 use mag_service::{
-    ApprovalDecisionWire, ApprovalRequirementWire, InteractionKindWire, InteractionResponseWire,
-    MagService, RequestId, RunId, RunOutput, ServiceError, ServiceEvent, SessionConfig, SessionId,
-    SessionInfo, SourceInfo, ToolCallIdWire, UserInput,
+    ApprovalDecisionWire, ApprovalRequirementWire, InteractionKindWire, InteractionOrigin,
+    InteractionResponseWire, MagService, RequestId, RunId, RunOutput, ServiceError, ServiceEvent,
+    SessionConfig, SessionId, SessionInfo, SourceInfo, ToolCallIdWire, UserInput,
 };
 
 // A fixed, valid session UUID the scripted service stamps on every event so the
@@ -79,6 +79,7 @@ fn approval_interaction() -> ServiceEvent {
                 reason: Some("writes to disk".to_owned()),
             },
         },
+        origin: InteractionOrigin::default(),
     }
 }
 
