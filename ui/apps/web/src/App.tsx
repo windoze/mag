@@ -2,6 +2,7 @@ import {
   HttpSseTransport,
   SessionStore,
   TransportError,
+  type DelegationGroupView,
   type ITransport,
   type RunView,
   type SessionStoreSnapshot,
@@ -11,9 +12,12 @@ import {
 import {
   Button,
   Composer,
+  DelegateThreadPanel,
   SessionSidebar,
   ThreadView,
   type ComposerMode,
+  type DelegateThreadItemView,
+  type DelegationItemView,
   type InteractionResponseView,
   type SidebarSessionView,
   type ThreadItemView
@@ -65,11 +69,15 @@ export function App(props: AppProps = {}): React.JSX.Element {
   const [pendingAction, setPendingAction] = React.useState<string>();
   const [error, setError] = React.useState<string>();
   const [notice, setNotice] = React.useState<string>();
+  const [selectedDelegate, setSelectedDelegate] = React.useState<string>();
+  const [railCollapsed, setRailCollapsed] = React.useState(false);
   const activeSession = selectActiveSession(snapshot, route);
   const activeSessionId = activeSession?.id;
   const activeRun = isActiveRun(activeSession?.run);
   const composerMode = composerModeFor(activeSession?.run);
   const pendingInteractionCount = activeSession?.pendingInteractions.length ?? 0;
+  const delegationGroups =
+    activeSessionId === undefined ? [] : store.selectDelegationGroups(activeSessionId);
 
   React.useEffect(() => {
     captureFragmentToken(props.storage, props.location, props.history);
@@ -94,6 +102,33 @@ export function App(props: AppProps = {}): React.JSX.Element {
       );
     }
   }, [snapshot.configRevision]);
+
+  React.useEffect(() => {
+    setSelectedDelegate(undefined);
+  }, [activeSessionId]);
+
+  React.useEffect(() => {
+    if (
+      selectedDelegate !== undefined &&
+      !delegationGroups.some((group) => group.delegate === selectedDelegate)
+    ) {
+      setSelectedDelegate(undefined);
+    }
+  });
+
+  const openDelegateGroup = (delegate: string): void => {
+    setSelectedDelegate(delegate);
+    setRailCollapsed(false);
+  };
+
+  const openDelegation = (delegationId: string): void => {
+    const delegation = activeSession?.delegations.find(
+      (candidate) => candidate.id === delegationId
+    );
+    if (delegation !== undefined) {
+      openDelegateGroup(delegation.trace.delegate);
+    }
+  };
 
   const runAction = async (name: string, action: () => Promise<void>): Promise<void> => {
     setPendingAction(name);
@@ -190,7 +225,9 @@ export function App(props: AppProps = {}): React.JSX.Element {
           activeSession={activeSession}
           connectionStatus={snapshot.connectionStatus}
           pendingAction={pendingAction}
+          railCollapsed={railCollapsed}
           route={route}
+          onToggleRail={() => setRailCollapsed((collapsed) => !collapsed)}
         />
         <StatusMessage error={error} notice={notice} onDismissNotice={() => setNotice(undefined)} />
         <div className="min-h-0 flex-1 overflow-y-auto bg-muted/30">
@@ -217,6 +254,7 @@ export function App(props: AppProps = {}): React.JSX.Element {
                   : "This session has no committed history yet."
               }
               items={(activeSession?.thread ?? []).map(toThreadItemView)}
+              onOpenDelegation={openDelegation}
               onRespondInteraction={(requestId, response) => {
                 void runAction("respond-interaction", async () =>
                   respondInteraction(requestId, response)
@@ -245,7 +283,20 @@ export function App(props: AppProps = {}): React.JSX.Element {
         ) : null}
       </section>
 
-      <RightRail activeSession={activeSession} sessions={snapshot.sessions} />
+      <RightRail
+        activeSession={activeSession}
+        collapsed={railCollapsed}
+        groups={delegationGroups}
+        selectedDelegate={selectedDelegate}
+        sessions={snapshot.sessions}
+        onCloseDelegate={() => setSelectedDelegate(undefined)}
+        onRespondInteraction={(requestId, response) => {
+          void runAction("respond-interaction", async () =>
+            respondInteraction(requestId, response)
+          );
+        }}
+        onSelectDelegate={openDelegateGroup}
+      />
     </main>
   );
 }
@@ -368,12 +419,16 @@ function confirmDelete(sessionId: string, sessions: readonly SessionView[]): boo
 function ShellHeader({
   activeSession,
   connectionStatus,
+  onToggleRail,
   pendingAction,
+  railCollapsed,
   route
 }: {
   readonly activeSession?: SessionView;
   readonly connectionStatus: SessionStoreSnapshot["connectionStatus"];
+  readonly onToggleRail: () => void;
   readonly pendingAction?: string;
+  readonly railCollapsed: boolean;
   readonly route: Route;
 }): React.JSX.Element {
   const title =
@@ -394,6 +449,15 @@ function ShellHeader({
         <span className="rounded-full border border-border bg-background px-2 py-1">
           {connectionStatus}
         </span>
+        <Button
+          aria-label={railCollapsed ? "Expand right rail" : "Collapse right rail"}
+          size="sm"
+          type="button"
+          variant="ghost"
+          onClick={onToggleRail}
+        >
+          {railCollapsed ? "⟨ rail" : "rail ⟩"}
+        </Button>
       </div>
     </header>
   );
@@ -458,15 +522,35 @@ function PlaceholderPage({
 
 function RightRail({
   activeSession,
+  collapsed,
+  groups,
+  onCloseDelegate,
+  onRespondInteraction,
+  onSelectDelegate,
+  selectedDelegate,
   sessions
 }: {
   readonly activeSession?: SessionView;
+  readonly collapsed: boolean;
+  readonly groups: readonly DelegationGroupView[];
+  readonly onCloseDelegate: () => void;
+  readonly onRespondInteraction: (requestId: string, response: InteractionResponseView) => void;
+  readonly onSelectDelegate: (delegate: string) => void;
+  readonly selectedDelegate?: string;
   readonly sessions: readonly SessionView[];
 }): React.JSX.Element {
   const runningSessions = sessions.filter((session) => isActiveRun(session.run));
+  const selectedGroup = groups.find((group) => group.delegate === selectedDelegate);
 
   return (
-    <aside className="hidden w-72 shrink-0 flex-col gap-4 border-l border-border bg-card p-4 xl:flex">
+    <aside
+      aria-label="Session progress rail"
+      className={
+        collapsed
+          ? "hidden w-72 shrink-0 flex-col gap-4 overflow-y-auto border-l border-border bg-card p-4"
+          : "hidden w-72 shrink-0 flex-col gap-4 overflow-y-auto border-l border-border bg-card p-4 xl:flex"
+      }
+    >
       <section>
         <h2 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
           Current run
@@ -475,6 +559,58 @@ function RightRail({
           {activeSession === undefined ? "No session selected." : runSummary(activeSession.run)}
         </p>
       </section>
+      <section>
+        <h2 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+          Delegates
+        </h2>
+        <div className="mt-2 space-y-2">
+          {groups.length === 0 ? (
+            <p className="rounded-lg border border-dashed border-border p-3 text-sm text-muted-foreground">
+              No delegates in this session.
+            </p>
+          ) : (
+            groups.map((group) => {
+              const latest = group.delegations.at(-1)?.trace;
+              const pendingCount = group.items.filter(
+                (item) => item.type === "interaction" && item.interaction.status === "pending"
+              ).length;
+              return (
+                <button
+                  className={`w-full rounded-lg border p-3 text-left text-sm transition hover:border-primary/40 ${
+                    group.delegate === selectedDelegate
+                      ? "border-primary/60 bg-primary/5"
+                      : "border-border"
+                  }`}
+                  key={group.id}
+                  type="button"
+                  onClick={() => onSelectDelegate(group.delegate)}
+                >
+                  <span className="flex items-center justify-between gap-2">
+                    <span className="truncate font-medium">{group.delegate}</span>
+                    {latest !== undefined ? (
+                      <span className="text-[11px] text-muted-foreground">{latest.status}</span>
+                    ) : null}
+                  </span>
+                  <span className="mt-1 block text-xs text-muted-foreground">
+                    {groupSummary(group, pendingCount)}
+                  </span>
+                </button>
+              );
+            })
+          )}
+        </div>
+      </section>
+      {selectedGroup !== undefined ? (
+        <DelegateThreadPanel
+          delegate={selectedGroup.delegate}
+          depth={selectedGroup.depth}
+          items={selectedGroup.items.map(toDelegateThreadItem)}
+          status={selectedGroup.delegations.at(-1)?.trace.status}
+          usage={latestUsage(selectedGroup)}
+          onClose={onCloseDelegate}
+          onRespondInteraction={onRespondInteraction}
+        />
+      ) : null}
       <section>
         <h2 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
           Running sessions
@@ -494,11 +630,40 @@ function RightRail({
           )}
         </div>
       </section>
-      <section className="rounded-lg border border-dashed border-border p-3 text-sm text-muted-foreground">
-        Delegate drill-down lands in W4; delegation cards already render inline in the thread.
-      </section>
     </aside>
   );
+}
+
+function toDelegateThreadItem(item: DelegationGroupView["items"][number]): DelegateThreadItemView {
+  if (item.type === "message") {
+    return { type: "message", message: { id: item.id, text: item.text } };
+  }
+  return {
+    type: "interaction",
+    interaction: {
+      requestId: item.interaction.requestId,
+      kind: item.interaction.kind,
+      origin: item.interaction.origin,
+      status: item.interaction.status,
+      response: item.interaction.response
+    }
+  };
+}
+
+function latestUsage(group: DelegationGroupView): DelegationItemView["usage"] {
+  const withUsage = group.delegations.filter((delegation) => delegation.trace.usage !== undefined);
+  return withUsage.at(-1)?.trace.usage;
+}
+
+function groupSummary(group: DelegationGroupView, pendingCount: number): string {
+  const parts = [`${group.items.length} item${group.items.length === 1 ? "" : "s"}`];
+  if (group.depth !== undefined) {
+    parts.push(`depth ${group.depth}`);
+  }
+  if (pendingCount > 0) {
+    parts.push(`${pendingCount} pending`);
+  }
+  return parts.join(" · ");
 }
 
 function runSummary(run: RunView): string {

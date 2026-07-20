@@ -55,14 +55,22 @@ export interface ToolCallView {
   readonly source: ItemSource;
 }
 
+/** A delegated-agent message wrapped with its arrival order in the session stream. */
+export interface StoredDelegationMessage {
+  /** Monotonic arrival sequence shared with interactions for stable interleaving. */
+  readonly seq: number;
+  /** Wire payload emitted by the delegated agent. */
+  readonly message: DelegationMessageWire;
+}
+
 /** Delegated-agent card state keyed by run/delegate identity. */
 export interface DelegationView {
   /** Stable view-model identity. */
   readonly id: string;
   /** Latest delegation lifecycle snapshot. */
   trace: DelegationTrace;
-  /** Messages emitted by the delegated agent. */
-  readonly messages: DelegationMessageWire[];
+  /** Messages emitted by the delegated agent, in arrival order. */
+  readonly messages: StoredDelegationMessage[];
   /** Source that first produced this card. */
   readonly source: ItemSource;
 }
@@ -75,6 +83,8 @@ export interface InteractionView {
   readonly kind: InteractionKindWire;
   /** Origin attribution inherited from the service event. */
   readonly origin: InteractionOrigin;
+  /** Monotonic arrival sequence shared with delegation messages. */
+  readonly seq: number;
   /** UI lifecycle for the request. */
   status: "pending" | "responded";
   /** Response submitted through the store, when known. */
@@ -109,6 +119,37 @@ export type ThreadItem =
   | { readonly type: "interaction"; readonly interaction: InteractionView }
   | { readonly type: "pivot"; readonly notice: PivotNotice }
   | { readonly type: "run_error"; readonly error: RunErrorNotice };
+
+/** One sub-thread item inside a delegation group, in arrival order. */
+export type DelegationGroupItem =
+  | {
+      readonly type: "message";
+      /** Stable item identity derived from the delegation key and arrival sequence. */
+      readonly id: string;
+      /** Message text emitted by the delegated agent. */
+      readonly text: string;
+    }
+  | { readonly type: "interaction"; readonly interaction: InteractionView };
+
+/**
+ * Drill-down view for one delegate: every delegation lifecycle card for that
+ * delegate name plus the activity attributed to it (decision D5). Wire tool
+ * events carry no origin, so the sub-thread aggregates delegation messages and
+ * origin-attributed interactions; tool-card badges render whenever an origin
+ * is available.
+ */
+export interface DelegationGroupView {
+  /** Stable group identity, equal to the delegate name. */
+  readonly id: string;
+  /** Delegate name shared by the group. */
+  readonly delegate: string;
+  /** Delegation lifecycle cards for this delegate, in arrival order. */
+  readonly delegations: readonly DelegationView[];
+  /** Deepest origin depth observed on attributed interactions, when any exist. */
+  readonly depth?: number;
+  /** Arrival-ordered sub-thread items attributed to this delegate. */
+  readonly items: readonly DelegationGroupItem[];
+}
 
 /** Current run state for a session. */
 export type RunView =
@@ -225,6 +266,7 @@ export class SessionStore {
   private reconnectHandle: ReturnType<typeof setTimeout> | undefined;
   private started = false;
   private sequence = 0;
+  private itemSeq = 0;
   /**
    * In-flight history refreshes keyed by session. While a refresh is awaiting
    * the server snapshot, live events for that session are buffered and
@@ -307,6 +349,70 @@ export class SessionStore {
   selectPendingInteractions(id: SessionId): readonly InteractionView[] {
     const pending = this.sessions.get(id)?.pendingInteractions;
     return pending === undefined ? [] : [...pending];
+  }
+
+  /**
+   * Groups one session's delegation activity per delegate name for the
+   * drill-down rail: lifecycle cards plus arrival-ordered messages and
+   * origin-attributed interactions. Delegates that only ever surfaced through
+   * an interaction origin (no `delegation_*` trace on the wire) still get a
+   * group with an empty `delegations` list.
+   */
+  selectDelegationGroups(id: SessionId): readonly DelegationGroupView[] {
+    const session = this.sessions.get(id);
+    if (session === undefined) {
+      return [];
+    }
+
+    interface GroupDraft {
+      readonly delegate: string;
+      readonly delegations: DelegationView[];
+      depth?: number;
+      readonly entries: { readonly seq: number; readonly item: DelegationGroupItem }[];
+    }
+
+    const drafts = new Map<string, GroupDraft>();
+    const draftFor = (delegate: string): GroupDraft => {
+      const existing = drafts.get(delegate);
+      if (existing !== undefined) {
+        return existing;
+      }
+      const draft: GroupDraft = { delegate, delegations: [], entries: [] };
+      drafts.set(delegate, draft);
+      return draft;
+    };
+
+    session.delegations.forEach((delegation) => {
+      const draft = draftFor(delegation.trace.delegate);
+      draft.delegations.push(delegation);
+      delegation.messages.forEach((stored) =>
+        draft.entries.push({
+          seq: stored.seq,
+          item: {
+            type: "message",
+            id: `${delegation.id}:msg:${stored.seq}`,
+            text: stored.message.text
+          }
+        })
+      );
+    });
+    session.interactions.forEach((interaction) => {
+      const delegate = interaction.origin.delegate;
+      if (delegate === undefined) {
+        return;
+      }
+      const draft = draftFor(delegate);
+      draft.entries.push({ seq: interaction.seq, item: { type: "interaction", interaction } });
+      draft.depth = Math.max(draft.depth ?? 0, interaction.origin.depth);
+    });
+
+    return [...drafts.values()].map((draft) => ({
+      id: draft.delegate,
+      delegate: draft.delegate,
+      delegations: [...draft.delegations],
+      depth: draft.depth,
+      items: draft.entries.sort((left, right) => left.seq - right.seq).map((entry) => entry.item)
+    }));
   }
 
   /** Sends `list_sessions` and syncs sidebar metadata. */
@@ -749,7 +855,13 @@ export class SessionStore {
       return;
     }
 
-    const interaction = { requestId, kind, origin, status: "pending" } satisfies InteractionView;
+    const interaction = {
+      requestId,
+      kind,
+      origin,
+      seq: this.nextSeq(),
+      status: "pending"
+    } satisfies InteractionView;
     this.installInteraction(session, interaction);
     session.run =
       session.run.state === "running" || session.run.state === "awaiting_interaction"
@@ -787,16 +899,17 @@ export class SessionStore {
   private applyDelegationMessage(id: SessionId, message: DelegationMessageWire): void {
     const session = this.ensureSession(id);
     const key = delegationKey(message.run_id, message.delegate);
+    const stored = { seq: this.nextSeq(), message } satisfies StoredDelegationMessage;
     const existing = session.delegationsById.get(key);
     if (existing !== undefined) {
-      existing.messages.push(message);
+      existing.messages.push(stored);
       return;
     }
 
     const delegation = {
       id: key,
       trace: { run_id: message.run_id, delegate: message.delegate, status: "started" },
-      messages: [message],
+      messages: [stored],
       source: "event"
     } satisfies DelegationView;
     session.delegations.push(delegation);
@@ -883,6 +996,11 @@ export class SessionStore {
   private nextId(prefix: string): string {
     this.sequence += 1;
     return `${prefix}:${this.sequence}`;
+  }
+
+  private nextSeq(): number {
+    this.itemSeq += 1;
+    return this.itemSeq;
   }
 
   private notify(): void {

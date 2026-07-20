@@ -124,6 +124,75 @@ describe("App", () => {
     await act(async () => rendered.root.unmount());
   });
 
+  it("opens the delegate sub-thread in the right rail and collapses the rail", async () => {
+    const transport = new ScriptedTransport();
+    const rendered = await renderApp(<App transport={transport} storage={new MemoryStorage()} />);
+
+    await waitFor(() => rendered.container.textContent?.includes("Inspect README") === true);
+    await click(getButton(rendered.container, "Inspect README"));
+    await waitFor(() => rendered.container.textContent?.includes("The README is short.") === true);
+
+    await act(async () => {
+      transport.emit({ type: "run_started", id: sessionId, run_id: "run-live" });
+      transport.emit({
+        type: "delegation_started",
+        id: sessionId,
+        trace: { run_id: "run-live", delegate: "researcher", status: "started", task: "research" }
+      });
+      transport.emit({
+        type: "delegation_message",
+        id: sessionId,
+        message: { run_id: "run-live", delegate: "researcher", text: "scanning repo" }
+      });
+      transport.emit({
+        type: "interaction_requested",
+        id: sessionId,
+        request_id: "req-research",
+        kind: { kind: "question", prompt: "Continue research?" },
+        origin: { delegate: "researcher", depth: 1 }
+      });
+    });
+
+    // The inline delegation card opens the drill-down panel in the right rail.
+    await click(getButton(rendered.container, "researcher"));
+    await waitFor(
+      () =>
+        rendered.container.querySelector('[aria-label="Delegate researcher sub-thread"]') !== null
+    );
+    const panel = rendered.container.querySelector(
+      '[aria-label="Delegate researcher sub-thread"]'
+    ) as HTMLElement;
+    expect(panel.textContent).toContain("scanning repo");
+    expect(panel.textContent).toContain("Continue research?");
+    expect(panel.textContent).toContain("[from researcher@depth1]");
+
+    // Responding inside the panel goes through the same interaction channel.
+    await change(getComposer(panel), "go ahead");
+    await click(getButton(panel, "Submit answer"));
+    expect(transport.sent.at(-1)).toMatchObject({
+      type: "respond_interaction",
+      session_id: sessionId,
+      request_id: "req-research",
+      response: { kind: "answer", text: "go ahead" }
+    });
+
+    // The panel close button returns to the delegates list.
+    await click(getByLabel(rendered.container, "Close researcher sub-thread"));
+    expect(
+      rendered.container.querySelector('[aria-label="Delegate researcher sub-thread"]')
+    ).toBeNull();
+
+    // The header toggle collapses and re-expands the whole right rail.
+    const rail = getByLabel(rendered.container, "Session progress rail");
+    expect(rail.className).toContain("xl:flex");
+    await click(getByLabel(rendered.container, "Collapse right rail"));
+    expect(rail.className).not.toContain("xl:flex");
+    await click(getByLabel(rendered.container, "Expand right rail"));
+    expect(rail.className).toContain("xl:flex");
+
+    await act(async () => rendered.root.unmount());
+  });
+
   it("routes Sources and Config placeholders from the sidebar", async () => {
     const rendered = await renderApp(
       <App transport={new ScriptedTransport()} storage={new MemoryStorage()} />

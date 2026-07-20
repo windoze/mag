@@ -1,48 +1,83 @@
-# Claude Execution Plan
+# 当前任务计划（2026-07-21）
 
-本文件记录本次调用的可审计执行计划、关键决策和进度更新。不会记录私有逐步思维链，但会记录足够的事实依据、约束和执行步骤，便于检查进展。
+## 任务：W4-1 delegation 可视化
 
-## 当前约束
+来源：TODO.md 首个未完成任务（W3 全部 [DONE]，W4-1 为下一个）。
 
-- `TODO.md` 是任务顺序、完成状态和验收要求的唯一权威来源。
-- 只完成第一个标题未带 `[DONE]` 的任务，然后停止。
-- 若发现阻塞当前任务的缺陷、规格不匹配或未排期失败测试，必须修复或在 `TODO.md` 中加入最小必要前置任务后提交并停止。
-- 完成任务后必须更新 `TODO.md`，运行必要验证，并提交 Git commit。
-- `PLAN.md` 只在阶段级计划、依赖或完成标准变化时更新。
+### 要求（TODO.md 原文要点）
 
-## 当前任务：W3-R — W3 review
+- `DelegationCard`（内联：delegate 名/状态/usage）
+- 右栏 delegate 子线程视图（origin.delegate 匹配的事件汇聚；工具卡/交互卡带
+  `[from <delegate>@depth<n>]` 徽标）
+- 右栏可折叠
+- `@mag/client` store 补 delegation 分组 selector
 
-`TODO.md` 中第一个未完成任务是 **W3-R [TODO] W3 review**（W3-1..W3-4 均已完成并提交）。
+### 验证
 
-- **实现要求**：对照 `docs/WEB.md` §5/§6 检查：
-  1. 依赖方向（app→ui/client→protocol 单向）
-  2. 组件不碰 transport
-  3. store 合并逻辑无竞态
-  4. token 不进 URL query/日志
-  5. Storybook 覆盖度
-  发现问题直接修复并补测试。
-- **验证条件**：`pnpm -r test`/`pnpm -r build` 绿 + 默认验证序列（cargo fmt --check、clippy -D warnings、cargo test --workspace、cargo doc）；完成记录列出 review 结论。
+- vitest fixture（含两级 delegate 事件流）断言分组与徽标
+- Storybook 新增视觉态
+- `pnpm -r test` / `pnpm -r build` 绿
+- 默认验证序列（fmt/clippy；Rust 若无改动则复用上次全量结果）
 
-## 执行计划
+### 执行步骤
 
-1. 读取 `docs/WEB.md` §5/§6 相关章节作为 review 规格依据。
-2. 用 `git log` 定位 W3-1..W3-4 的提交，通读 W3 diff。
-3. 并行派发 review 子代理分块核查：
-   - 依赖方向 + token 纪律（package.json、import 图、URL/日志）
-   - `@mag/client` SessionStore 合并逻辑竞态 + transport
-   - `@mag/ui` 组件纯度 + Storybook 覆盖度（对照 §5.2/§5.4/§6.3）
-4. 对发现的问题直接修复并补测试；确认无问题则在完成记录写明结论。
-5. 运行验证序列：pnpm format/lint、`pnpm -r test`、`pnpm -r build`、cargo fmt --check、clippy、cargo test --workspace、cargo doc。
-6. 将 `TODO.md` 中 W3-R 标记 `[DONE]` 并写完成记录（逐项列出 review 结论）。
-7. 提交 git commit 并停止。
+1. 探查现状：
+   - `ui/packages/client/src/`：store 中 delegation 现状（W3-2 已有 delegation 分组、
+     `delegation run/delegate key`）、selectors、origin 字段来源（wire Event 的
+     origin 字段形态）。
+   - `ui/packages/ui/src/`：ThreadView 中 delegation 卡现状（W3-3/W3-R 已有基础
+     delegation 卡 + 无回调时静态 div）、InteractionCard origin 徽标、ToolCallCard。
+   - `ui/apps/web/src/`：右栏现状（W3-4 已有 run 摘要 + delegation drill-down 插槽）。
+2. `@mag/client`：补 delegation 分组 selector（按 run/delegate 聚合其来源事件：
+   消息/工具/交互，支持两级 delegate 嵌套）。
+3. `@mag/ui`：
+   - `DelegationCard` 补 usage 展示（若缺）。
+   - ToolCallCard/InteractionCard/消息项支持 `[from <delegate>@depth<n>]` origin 徽标
+     （InteractionCard 已有 origin 徽标，核对 ToolCallCard 与消息项）。
+   - 子线程视图组件（纯 props：事件/消息列表 + 标题 + 折叠）。
+4. app-web：右栏接入 delegation drill-down（点 delegation 卡 → 右栏显示该 delegate
+   子线程），右栏可折叠。
+5. 测试：vitest 两级 delegate fixture 断言分组与徽标；Storybook 新增视觉态。
+6. 验证序列：pnpm format:write → pnpm format → pnpm lint → pnpm -r test →
+   pnpm -r build → build-storybook；cargo fmt --check + clippy（Rust 未改则全量测试
+   复用上次结果并注明）。
+7. TODO.md 标记 W4-1 [DONE] + 完成记录，提交 git。
 
-## 进度日志
+### 现状探查结论（2026-07-21）
 
-- 已创建本执行计划文件，下一步读取 `docs/WEB.md` §5/§6 并定位 W3 提交。
-- 已确认首个未完成任务为 W3-R（W3 review），W3 提交为 `351683f`/`7ab09f1`/`4c78c96`/`0fe4985`；已读 `docs/WEB.md` §5/§6 作为规格依据。
-- 已并行派发 3 个 review 子代理：①依赖方向+token 纪律（全 PASS）；②`@mag/client` store/transport（发现 history-replace 竞态、若干测试缺口）；③`@mag/ui`+app-web 壳（发现 null reason 渲染 bug、死 ComposerMode、死 delegation 点击、测试缺口）。
-- 已修复全部发现问题：store 事件缓冲+重放消除 history-replace 竞态；修复第二个 interaction_requested 丢 runId 的 store bug；InteractionCard null reason 判空；删除死 `ComposerMode.awaiting_interaction` 与死 `completedRunIds`；无回调 delegation 卡改静态渲染；selector 返回拷贝。
-- 已补测试：client 6 个新用例（SSE CRLF/多行/分片、竞态回归、多 pending 队列、跨会话隔离、工具四终态、sessionOrder 去重）；ui 4 个新用例（approval deny/cancel、permission approve/cancel、null reason、resolved 只读）。
-- 审批「+ always」查证：wire `ApprovalDecisionWire` 无 always 变体，mag-acp `map.rs:415` 明确记录无持久 always 为既有拍板——记为 spec 文本偏差，随 F-R 复核，未新增任务。
-- 验证全绿：`pnpm format/lint`、`pnpm -r test`（25 测试）、`pnpm -r build`、`build-storybook`、`cargo fmt --check`、`cargo clippy -D warnings`；Rust 零改动，workspace test/doc 复用 W3-4 全绿结果。
-- 已将 `TODO.md` 中 W3-R 标记 `[DONE]` 并写入逐项 review 结论。下一步提交并停止。
+- wire 上 delegate 活动的可见面：`delegation_message`（文本）、`interaction_requested`
+  带 `origin{delegate,depth}`、`delegation_*` 生命周期 trace（无 depth 字段）。工具事件
+  无 origin——工具卡徽标渲染已就绪（ToolCallCard.origin prop），但 wire 不产生工具归因，
+  完成记录中记为偏差（D5 origin 本就只定义在交互上，docs/CLI.md §3.3）。
+- 现状：`@mag/ui` ThreadView 内联 delegation 卡（含 usage）、InteractionCard/ToolCallCard
+  origin 徽标均已存在；app-web 右栏是「Delegate drill-down lands in W4」占位；
+  ThreadView.onOpenDelegation 未接线；`@mag/client` 无分组 selector。
+
+### 实施设计
+
+- `@mag/client`：`InteractionView` 加 `seq`；`DelegationView.messages` 改为
+  `StoredDelegationMessage{seq,message}`；新增 `selectDelegationGroups(sessionId)` 按
+  delegate 名分组（delegation trace + 其 messages + origin.delegate 匹配的交互，按 seq
+  交错排序；depth 取匹配交互的最大 origin.depth；无 trace 的 origin delegate 合成组）。
+- `@mag/ui`：抽出公开 `DelegationCard`（ThreadView 复用）；新增 `DelegateThreadPanel`
+  （右栏子线程：头 delegate/status/usage/close，items=消息+交互卡带徽标）；Storybook 两
+  组件新故事；`DelegateThreadPanel` 渲染/回调测试。
+- app-web：右栏 Delegates 列表 + drill-down 面板接线（thread 卡 onOpen → 选中）；右栏
+  可折叠（header 切换按钮）；壳级测试。
+
+### 进展日志
+
+- [x] 读取 TODO.md，确认首个未完成任务为 W4-1。
+- [x] 现状探查
+- [x] client selector（`selectDelegationGroups`，seq 交错排序，16 测试绿）
+- [x] ui 组件 + Storybook（`DelegationCard` 抽出 + `DelegateThreadPanel`，12 测试绿，storybook 构建绿）
+- [x] app-web 右栏（Delegates 列表 + drill-down + 折叠切换，4 测试绿）
+- [x] 测试与验证：pnpm format/lint/test/build、build-storybook、cargo fmt --check、clippy 全绿；
+  Rust 零改动，workspace 测试/doc 复用 W3-4 结果按规则跳过
+- [x] TODO.md 完成记录 + commit
+
+## 任务完成（2026-07-21）
+
+W4-1 已标记 [DONE] 并提交。记录在案的偏差：wire 工具事件无 origin，delegate 内部工具调用无法
+归因（D5 origin 只覆盖交互），ToolCallCard 徽标渲染已就绪待 wire 扩展。下一任务：W4-2
+pivot/cancel 完备 + run 状态。

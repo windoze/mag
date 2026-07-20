@@ -1,5 +1,12 @@
 export { Button, type ButtonProps } from "./components/Button";
 export { Composer, type ComposerMode, type ComposerProps } from "./components/Composer";
+export { DelegationCard, type DelegationCardProps } from "./components/DelegationCard";
+export {
+  DelegateThreadPanel,
+  type DelegateThreadItemView,
+  type DelegateThreadMessageView,
+  type DelegateThreadPanelProps
+} from "./components/DelegateThreadPanel";
 export { InteractionCard, type InteractionCardProps } from "./components/InteractionCard";
 export { Markdown, type MarkdownProps } from "./components/Markdown";
 export { OriginBadge, type OriginBadgeProps } from "./components/OriginBadge";

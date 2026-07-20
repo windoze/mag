@@ -1,14 +1,14 @@
-import { Bot, GitBranch, User } from "lucide-react";
+import { Bot, User } from "lucide-react";
 import type * as React from "react";
 
 import { cn } from "../lib/utils";
 
+import { DelegationCard } from "./DelegationCard";
 import { InteractionCard } from "./InteractionCard";
 import { Markdown } from "./Markdown";
 import { OriginBadge } from "./OriginBadge";
 import { ToolCallCard } from "./ToolCallCard";
 import type {
-  DelegationItemView,
   InteractionResponseView,
   RunErrorKindView,
   ThreadItemView,
@@ -75,7 +75,7 @@ export function ThreadView({
             );
           case "delegation":
             return (
-              <DelegationInlineCard
+              <DelegationCard
                 delegation={item.delegation}
                 key={item.delegation.id}
                 onOpen={onOpenDelegation}
@@ -152,53 +152,6 @@ function Avatar({ icon }: { readonly icon: React.ReactNode }): React.JSX.Element
   );
 }
 
-function DelegationInlineCard({
-  delegation,
-  onOpen
-}: {
-  readonly delegation: DelegationItemView;
-  readonly onOpen?: (delegationId: string) => void;
-}): React.JSX.Element {
-  const body = (
-    <>
-      <GitBranch className="mt-0.5 h-4 w-4 text-muted-foreground" />
-      <div className="min-w-0 flex-1 space-y-1">
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="font-medium">{delegation.delegate}</span>
-          <span className={delegationStatusClass(delegation.status)}>{delegation.status}</span>
-        </div>
-        {delegation.task !== undefined ? (
-          <p className="text-sm text-muted-foreground">Task: {delegation.task}</p>
-        ) : null}
-        {delegation.output !== undefined ? <p className="text-sm">{delegation.output}</p> : null}
-        {delegation.message !== undefined ? (
-          <p className="text-sm text-muted-foreground">{delegation.message}</p>
-        ) : null}
-        {delegation.usage !== undefined ? (
-          <p className="text-xs text-muted-foreground">Usage: {formatUsage(delegation.usage)}</p>
-        ) : null}
-      </div>
-    </>
-  );
-  const cardClass =
-    "flex w-full items-start gap-3 rounded-xl border border-border bg-card p-4 text-left shadow-sm";
-
-  // Renders as a button only when a drill-down handler is wired; without one
-  // the card is static so it does not advertise a dead affordance.
-  if (onOpen === undefined) {
-    return <div className={cardClass}>{body}</div>;
-  }
-  return (
-    <button
-      className={cn(cardClass, "transition hover:border-primary/40")}
-      type="button"
-      onClick={() => onOpen(delegation.id)}
-    >
-      {body}
-    </button>
-  );
-}
-
 function SystemNotice({
   text,
   tone
@@ -237,22 +190,4 @@ function runErrorTone(kind: RunErrorKindView): "danger" | "muted" {
 function runErrorText(kind: RunErrorKindView, message: string): string {
   const label = kind.replaceAll("_", " ");
   return `${label}: ${message}`;
-}
-
-function delegationStatusClass(status: DelegationItemView["status"]): string {
-  return cn(
-    "rounded-full px-2 py-0.5 text-[11px] font-semibold",
-    status === "started" && "bg-primary/10 text-primary",
-    status === "finished" && "bg-success/10 text-success",
-    status === "failed" && "bg-destructive/10 text-destructive"
-  );
-}
-
-function formatUsage(usage: NonNullable<DelegationItemView["usage"]>): string {
-  if (usage.total_tokens !== undefined) {
-    return `${usage.total_tokens} tokens`;
-  }
-  const input = usage.input_tokens ?? 0;
-  const output = usage.output_tokens ?? 0;
-  return `${input + output} tokens`;
 }

@@ -215,7 +215,7 @@ describe("@mag/client", () => {
     ]);
     expect(
       session.delegations.find((delegation) => delegation.trace.delegate === "researcher")
-        ?.messages[0]?.text
+        ?.messages[0]?.message.text
     ).toBe("context found");
     expect(session.pendingInteractions.map((interaction) => interaction.requestId)).toEqual([
       "request-live"
@@ -233,6 +233,134 @@ describe("@mag/client", () => {
       status: "responded",
       response: { kind: "answer", text: "yes" }
     });
+  });
+
+  it("groups two-level delegation messages and origin-attributed interactions per delegate", () => {
+    const store = new SessionStore(new ScriptedTransport());
+    const events = [
+      { type: "run_started", id: sessionId, run_id: "run-live" },
+      {
+        type: "delegation_started",
+        id: sessionId,
+        trace: { run_id: "run-live", delegate: "researcher", status: "started", task: "research" }
+      },
+      {
+        type: "delegation_message",
+        id: sessionId,
+        message: { run_id: "run-live", delegate: "researcher", text: "scanning repo" }
+      },
+      {
+        type: "interaction_requested",
+        id: sessionId,
+        request_id: "req-research",
+        kind: { kind: "question", prompt: "Continue research?" },
+        origin: { delegate: "researcher", depth: 1 }
+      },
+      {
+        type: "delegation_started",
+        id: sessionId,
+        trace: { run_id: "run-live", delegate: "reviewer", status: "started", task: "review" }
+      },
+      {
+        type: "delegation_message",
+        id: sessionId,
+        message: { run_id: "run-live", delegate: "reviewer", text: "reviewing diff" }
+      },
+      {
+        type: "interaction_requested",
+        id: sessionId,
+        request_id: "req-review",
+        kind: {
+          kind: "approval",
+          call_id: "tool-review",
+          requirement: { type: "require_approval", reason: "nested approval" }
+        },
+        origin: { delegate: "reviewer", depth: 2 }
+      },
+      {
+        type: "interaction_requested",
+        id: sessionId,
+        request_id: "req-root",
+        kind: { kind: "question", prompt: "Root question?" },
+        origin: { depth: 0 }
+      },
+      {
+        type: "delegation_finished",
+        id: sessionId,
+        trace: {
+          run_id: "run-live",
+          delegate: "researcher",
+          status: "finished",
+          task: "research",
+          output: "done",
+          usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 }
+        }
+      }
+    ] satisfies Event[];
+    events.forEach((event) => store.applyEvent(event));
+
+    const groups = store.selectDelegationGroups(sessionId);
+    expect(groups.map((group) => group.delegate)).toEqual(["researcher", "reviewer"]);
+
+    const researcher = groups[0];
+    expect(researcher.depth).toBe(1);
+    expect(researcher.delegations.map((delegation) => delegation.trace.status)).toEqual([
+      "finished"
+    ]);
+    expect(researcher.delegations[0]?.trace.usage).toEqual({
+      input_tokens: 10,
+      output_tokens: 5,
+      total_tokens: 15
+    });
+    expect(
+      researcher.items.map((item) =>
+        item.type === "message"
+          ? `message:${item.text}`
+          : `interaction:${item.interaction.requestId}`
+      )
+    ).toEqual(["message:scanning repo", "interaction:req-research"]);
+
+    const reviewer = groups[1];
+    expect(reviewer.depth).toBe(2);
+    expect(
+      reviewer.items.map((item) =>
+        item.type === "message"
+          ? `message:${item.text}`
+          : `interaction:${item.interaction.requestId}`
+      )
+    ).toEqual(["message:reviewing diff", "interaction:req-review"]);
+
+    // Root-originated interactions are never attributed to a delegate group.
+    expect(
+      groups.flatMap((group) =>
+        group.items.flatMap((item) =>
+          item.type === "interaction" ? [item.interaction.requestId] : []
+        )
+      )
+    ).not.toContain("req-root");
+  });
+
+  it("synthesizes a group for a delegate that only surfaced through an interaction origin", () => {
+    const store = new SessionStore(new ScriptedTransport());
+    store.applyEvent({
+      type: "interaction_requested",
+      id: sessionId,
+      request_id: "req-ghost",
+      kind: { kind: "question", prompt: "Ghost?" },
+      origin: { delegate: "ghost", depth: 3 }
+    });
+
+    const groups = store.selectDelegationGroups(sessionId);
+    expect(groups).toHaveLength(1);
+    expect(groups[0]).toMatchObject({ delegate: "ghost", depth: 3, delegations: [] });
+    expect(groups[0]?.items).toHaveLength(1);
+  });
+
+  it("returns no delegation groups for unknown or delegation-free sessions", () => {
+    const store = new SessionStore(new ScriptedTransport());
+    expect(store.selectDelegationGroups("missing")).toEqual([]);
+    store.applyEvent({ type: "run_started", id: sessionId, run_id: "run-live" });
+    expect(store.selectDelegationGroups(sessionId)).toEqual([]);
   });
 
   it("deduplicates history and incremental terminal tool traces by call id", () => {

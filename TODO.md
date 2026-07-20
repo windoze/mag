@@ -475,7 +475,7 @@ CI 承载（引入 CI 时列为第一批）；⑥tool 输出为 agent-lib Conten
 
 目标：CLI 已验证的全部能力在 web UI 完备呈现。
 
-### W4-1 [TODO] delegation 可视化
+### W4-1 [DONE] delegation 可视化
 
 - **上下文**：`docs/WEB.md` §5.2/§5.3（origin 归因兑现）。
 - **实现要求**：`DelegationCard`（内联：delegate 名/状态/usage）；右栏 delegate 子线程视图
@@ -483,6 +483,36 @@ CI 承载（引入 CI 时列为第一批）；⑥tool 输出为 agent-lib Conten
   折叠；`@mag/client` store 补 delegation 分组 selector。
 - **验证条件**：vitest fixture（含两级 delegate 事件流）断言分组与徽标；Storybook 新增视觉态；
   `pnpm -r test`/`pnpm -r build` 绿。
+
+完成记录（2026-07-21）：
+
+- `@mag/client`：`InteractionView` 新增 `seq` 到达序号，`DelegationView.messages` 改为带 `seq` 的
+  `StoredDelegationMessage` 包装；新增 `selectDelegationGroups(sessionId)` delegation 分组 selector
+  ——按 delegate 名聚合全部生命周期 trace、`delegation_message` 与 `origin.delegate` 匹配的交互卡，
+  按 `seq` 交错还原到达顺序，`depth` 取匹配交互的最大 `origin.depth`；仅经 interaction origin 出现
+  （无 `delegation_*` trace）的 delegate 合成空 trace 组；root 交互（无 delegate）不进任何组。
+- `@mag/ui`：内联 delegation 卡抽出为公开 `DelegationCard`（delegate 名/状态/usage，ThreadView
+  复用）；新增 `DelegateThreadPanel` 右栏子线程视图——头部 delegate/status/usage/关闭，主体按到达
+  顺序渲染 delegation 消息与交互卡，消息行与交互卡均带 `[from <delegate>@depth<n>]` OriginBadge；
+  空态文案；面板内交互提交回调透传。
+- app-web：右栏新增 Delegates 列表（状态/条目数/depth/pending 计数）与 drill-down 面板接线——
+  thread 内 DelegationCard `onOpenDelegation` 与右栏列表项均选中对应 delegate 组；面板内交互响应
+  走既有 `respond_interaction` 通道；会话切换或组消失自动清除选中；ShellHeader 新增右栏折叠/展开
+  切换（`⟨ rail`/`rail ⟩`）；移除「Delegate drill-down lands in W4」占位。
+- 测试：`@mag/client` 新增两级 delegate（researcher@depth1 + reviewer@depth2）事件流分组/顺序/
+  usage/depth 断言、孤儿 origin 合成组、空组边界共 3 个用例；`@mag/ui` 新增
+  `DelegateThreadPanel` 头部徽标/到达顺序/提交与关闭回调 3 个用例；app-web 新增壳级用例——
+  内联卡点开子线程、徽标 `[from researcher@depth1]`、面板内应答提交、关闭面板、右栏折叠/展开。
+- Storybook：新增 `Core/DelegationCard`（started/finished+usage/failed/可点 drill-down）与
+  `Core/DelegateThreadPanel`（空态/含审批交互活动/嵌套 delegate depth2 已决态）视觉态。
+- 记录在案的偏差（不阻塞）：wire 工具事件（`tool_started/finished`）无 origin 字段，delegate 内部
+  工具调用不在 root 事件流上归因——D5 origin 本就只定义在交互上（`docs/CLI.md` §3.3）；子线程汇聚
+  delegation 消息 + origin 交互卡，ToolCallCard 的 origin 徽标渲染已就绪，待 wire 扩展即可用。
+- 验证通过：`pnpm format:write`、`pnpm format`、`pnpm lint`、`pnpm -r test`（protocol 门禁 +
+  client 16 + ui 12 + app-web 4 全绿）、`pnpm -r build`、`build-storybook`、
+  `cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`。Rust 源码本轮零改动
+  （git status 实证），`cargo test --workspace` 与 `cargo doc` 复用 W3-4（`0fe4985`）全绿结果，
+  按规则跳过重跑。
 
 ### W4-2 [TODO] pivot/cancel 完备 + run 状态
 
