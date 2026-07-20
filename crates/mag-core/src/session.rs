@@ -41,7 +41,7 @@ use crate::{
     assembly::{ApprovalOverrides, SessionBinding},
     driver::{PivotQueue, SessionDriver, TurnOutcome},
     engine::{
-        ConfigApplyState,
+        ConfigApplyState, PendingConfigApply,
         approval::{AskFrontendDecider, IpcApproval},
     },
     persistence::Persistence,
@@ -88,16 +88,12 @@ enum SessionCommand {
         /// Channel used to acknowledge delivery or report a failure.
         reply: oneshot::Sender<Result<(), ServiceError>>,
     },
-    /// Ask the actor to apply the current configuration snapshot when the
+    /// Ask the actor to apply the captured configuration snapshot when the
     /// agent is at rest (`docs/CLI.md` §4.4): immediately when idle, or at the
     /// next run terminal — the run-completion path re-checks the shared
-    /// generation counter, so a command that arrives mid-run is deferred
-    /// rather than lost. Carries the generation the request was sent for, so
-    /// an actor whose thread started after the bump still honors it.
-    ApplyConfig {
-        /// Apply-request generation this command was sent for.
-        generation: u64,
-    },
+    /// pending apply target, so a command that arrives mid-run is deferred
+    /// rather than lost.
+    ApplyConfig(PendingConfigApply),
 }
 
 /// Lifecycle state of a session actor's driver.
@@ -138,6 +134,8 @@ struct SessionActor {
     /// Shared config-apply plumbing (`docs/CLI.md` §4.4); `None` when the
     /// engine has no configuration backend.
     config_apply: Option<ConfigApplyState>,
+    /// Newest apply request received while a run was in flight.
+    pending_apply: Option<PendingConfigApply>,
     /// Generation of the last config apply this actor performed. Starts at the
     /// generation current when the actor spawns: a freshly created session is
     /// assembled from the current snapshot through the session ↔ agent binding
@@ -179,6 +177,7 @@ impl SessionActor {
             run_done_tx,
             run_done_rx,
             config_apply,
+            pending_apply: None,
             applied_generation,
         }
     }
@@ -190,17 +189,26 @@ impl SessionActor {
     /// is in flight because the run advances on a separate `spawn_local` task, so
     /// this loop is always free to service the channel.
     async fn run(mut self, mut commands: mpsc::UnboundedReceiver<SessionCommand>) {
+        let mut commands_open = true;
         loop {
             // Replay a deferred command as soon as the driver is idle again.
-            if let Some(command) = self.take_idle_deferred() {
+            if commands_open && let Some(command) = self.take_idle_deferred() {
                 self.handle(command);
                 continue;
             }
 
             tokio::select! {
-                maybe_command = commands.recv() => match maybe_command {
+                maybe_command = commands.recv(), if commands_open => match maybe_command {
                     Some(command) => self.handle(command),
-                    None => break,
+                    None => {
+                        commands_open = false;
+                        if let Some(cancel) = &self.cancel {
+                            cancel.cancel();
+                        }
+                        if !matches!(self.state, DriverState::Running) {
+                            break;
+                        }
+                    }
                 },
                 Some((driver, outcome)) = self.run_done_rx.recv() => {
                     // A pivot that raced the run's end — queued after the
@@ -222,7 +230,11 @@ impl SessionActor {
                     // deferred command starts the next run (`docs/CLI.md`
                     // §4.4: the actor checks between runs).
                     self.apply_pending_config();
+                    if !commands_open {
+                        break;
+                    }
                 }
+                else => break,
             }
         }
         if let DriverState::Idle(driver) = &mut self.state {
@@ -274,52 +286,52 @@ impl SessionActor {
             } => {
                 let _ = reply.send(self.approval.respond(request_id, response));
             }
-            SessionCommand::ApplyConfig { generation } => self.apply_config_for(generation),
+            SessionCommand::ApplyConfig(apply) => self.apply_config_for(apply),
         }
     }
 
-    /// Applies the current configuration snapshot when the shared generation
-    /// moved past this actor's last apply and the driver is at rest
-    /// (`docs/CLI.md` §4.4, decision D2).
+    /// Applies a captured configuration snapshot that arrived while the driver
+    /// was busy once the driver is at rest (`docs/CLI.md` §4.4, decision D2).
     ///
-    /// A no-op when no apply is owed (the generation did not move), when the
-    /// engine has no configuration backend, or when a run is in flight — in
-    /// the running case the run-completion path re-checks the generation at
-    /// the turn boundary, so the apply is deferred rather than lost
-    /// (agent-lib only admits reconfiguration between runs).
+    /// A no-op when no apply is owed. The stored target is the exact snapshot
+    /// captured by the explicit apply request, not whatever the config service
+    /// happens to hold when the run later finishes.
     fn apply_pending_config(&mut self) {
-        let pending = self
-            .config_apply
-            .as_ref()
-            .map_or(self.applied_generation, ConfigApplyState::pending);
-        self.apply_config_for(pending);
+        if let Some(apply) = self.pending_apply.take() {
+            self.apply_config_for(apply);
+        }
     }
 
-    /// Lands the current configuration snapshot on the idle driver when
-    /// `generation` is newer than this actor's last apply (`docs/CLI.md`
-    /// §4.4, decision D2).
+    /// Lands one captured configuration snapshot on the idle driver when its
+    /// generation is newer than this actor's last apply (`docs/CLI.md` §4.4,
+    /// decision D2).
     ///
     /// A no-op when the generation was already applied, when the engine has
     /// no configuration backend, or when a run is in flight — in the running
-    /// case the run-completion path re-checks the pending generation at the
-    /// turn boundary, so the apply is deferred rather than lost (agent-lib
-    /// only admits reconfiguration between runs).
-    fn apply_config_for(&mut self, generation: u64) {
-        if generation <= self.applied_generation {
+    /// case the captured target is stored and applied at the turn boundary, so
+    /// later config reloads cannot alter this request's target snapshot.
+    fn apply_config_for(&mut self, apply: PendingConfigApply) {
+        if apply.generation() <= self.applied_generation {
             return;
         }
-        let Some(config_apply) = &self.config_apply else {
+        if self.config_apply.is_none() {
             return;
-        };
+        }
         let DriverState::Idle(driver) = &mut self.state else {
+            if self
+                .pending_apply
+                .as_ref()
+                .is_none_or(|pending| apply.generation() > pending.generation())
+            {
+                self.pending_apply = Some(apply);
+            }
             return;
         };
-        let snapshot = config_apply.service().current();
-        driver.apply_config(self.session_id, &snapshot);
+        driver.apply_config(self.session_id, apply.snapshot());
         // The generation is marked applied even when individual items were
         // rejected: a rejection is permanent for this snapshot (warned and
         // skipped inside the driver), never a retryable failure.
-        self.applied_generation = generation;
+        self.applied_generation = apply.generation();
     }
 
     /// Starts a run for `text`, deferring or rejecting when a run cannot start.
@@ -556,12 +568,15 @@ impl SessionManager {
         let overrides = snapshot
             .as_deref()
             .map_or_else(ApprovalOverrides::default, ApprovalOverrides::from_snapshot);
-        // Read the apply generation synchronously *before* the handle is
-        // registered: a bump racing the spawn either lands before this read
-        // (the new session counts as up-to-date and never sees the command)
-        // or after it (the `ApplyConfig` command carries the newer
-        // generation and the actor applies it despite the stale baseline).
-        let applied_generation = config_apply.as_ref().map_or(0, ConfigApplyState::pending);
+        // Read the pending apply synchronously before the handle is registered:
+        // a session assembled from the current snapshot counts as up-to-date for
+        // that generation. After registration we re-check to close the race with
+        // an apply request that lands between this read and handle insertion.
+        let applied_generation = config_apply
+            .as_ref()
+            .and_then(ConfigApplyState::pending)
+            .map_or(0, |apply| apply.generation());
+        let commands_tx_for_race = commands_tx.clone();
         let thread = thread::Builder::new()
             .name(format!("mag-session-{session_id}"))
             .spawn(move || {
@@ -589,23 +604,30 @@ impl SessionManager {
                 thread,
             },
         );
+        if let Some(apply) = self
+            .config_apply
+            .as_ref()
+            .and_then(ConfigApplyState::pending)
+            .filter(|apply| apply.generation() > applied_generation)
+        {
+            let _ = commands_tx_for_race.send(SessionCommand::ApplyConfig(apply));
+        }
     }
 
-    /// Asks every live session actor to apply the current configuration
+    /// Asks every live session actor to apply the captured configuration
     /// snapshot at its next opportunity (`docs/CLI.md` §4.4).
     ///
-    /// The engine bumps the shared generation before calling this and hands
-    /// the new generation over; an idle actor applies immediately when it
-    /// services the command, while an actor with a run in flight applies at
-    /// the run's turn boundary instead (reconfiguration mid-turn is
-    /// impossible on agent-lib's admission rules). Actors that already
-    /// applied this generation no-op. A dead actor's send failure is
-    /// ignored — the session is being torn down.
-    pub(crate) fn apply_config(&self, generation: u64) {
+    /// The engine captures the snapshot and generation before calling this; an
+    /// idle actor applies immediately when it services the command, while an
+    /// actor with a run in flight stores the same target for the run's turn
+    /// boundary instead (reconfiguration mid-turn is impossible on agent-lib's
+    /// admission rules). Actors that already applied this generation no-op. A
+    /// dead actor's send failure is ignored — the session is being torn down.
+    pub(crate) fn apply_config(&self, apply: PendingConfigApply) {
         for sender in lock_recovering(&self.handles).values() {
             let _ = sender
                 .commands
-                .send(SessionCommand::ApplyConfig { generation });
+                .send(SessionCommand::ApplyConfig(apply.clone()));
         }
     }
 

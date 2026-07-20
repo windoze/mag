@@ -1405,10 +1405,63 @@ GUI/web/CLI 无需感知多个会话通道。
 
 ---
 
-## F-R [TODO] 全计划 review
+## F-R [DONE] 全计划 review
 
 - **实现要求**：全部里程碑完成后，对整轮改动做一次完整 review（可分子代理分块）：对照 `docs/CLI.md`
   全节（含决策 D1–D6）逐条核对；重点：冻结契约只加不改、配置系统 DTO↔DO 与快照隔离、pivot/cancel 竞态、
   delegate restore 完备性、external ACP 生命周期、依赖边界、离线测试纪律、rustdoc 完整性。发现的问题直接
   修复并补测试。
 - **验证条件**：默认验证序列全过（含整个 workspace）；完成记录列出 review 发现与修复清单。
+
+  **完成记录**（2026-07-20）：
+  - review 范围：对照 `docs/CLI.md` 全节与决策 D1-D6，复核 M1-M6 当前实现、测试与文档；并行分块审查
+    mag-service 契约、mag-config/ConfigService、mag-core runtime（pivot/cancel/apply/delegate/external ACP/
+    restore）、mag-cli/bin/test 纪律。已确认 M1-R/M3-R/M6-R 记录过的设计取舍继续以 TODO 为准：例如
+    `Pivot*` 不携带 text、`ConfigChanged` 只携带 revision、配置 API 采用 M3-4 指定的 `ConfigDto` + 全局
+    `apply_config()` 形态，`Command` wire 仍不扩展 config/pivot 命令。
+  - 发现与修复（12 项，均已补测试或纳入现有 e2e）：
+    1. **新增可选 service 能力在 Rust trait 层非向后兼容**：`pivot_message` 与四个 config 方法原为必需方法。
+       修复为默认返回 `ServiceError::Unsupported{operation}`，现有实现仍覆盖真实能力；`mag-service` 既有
+       object-safe 测试继续覆盖。
+    2. **`InteractionOrigin::is_root()` 判定过宽**：`delegate=None, depth>0` 会误判 root。修复为同时要求
+       `depth == 0`，补边界断言。
+    3. **secret 解析错误回显裸 secret**：`api_key = "sk-..."` 被拒绝时错误消息包含原文。修复 `SecretRef`
+       string DSL 错误不打印输入值，补测试断言错误不含 `sk-ant-real-secret-value`。
+    4. **`IpcApproval::respond` 先移除 pending 再校验**：错误 family response 会丢 pending，等待方可能走默认
+       取消/默认选择。修复为先借用 pending 校验，成功后才 remove/send；补
+       `invalid_response_keeps_pending_interaction_retryable`。
+    5. **`apply_config` running 队列绑定的是未来 current**：apply 后、turn 结束前若 reload/update，新配置会被
+       未显式 apply 地落到会话。修复 `ConfigApplyState` 保存 `PendingConfigApply{generation, Arc<ConfigSnapshot>}`，
+       actor running 时保存捕获快照，turn 边界应用该快照；同时补 spawn 注册竞态二次检查。测试增强
+       `apply_config_during_run_lands_at_the_turn_boundary`：apply rev1 后再 update rev2，下一 turn 仍使用 rev1。
+    6. **`apply_config` 未覆盖 `agents.*.system_prompt`**：配置 system prompt 以前只在新建会话时生效。修复为
+       `SessionDriver` 保存 config-controlled system prompt 目标，并在每个 turn 开始前排队
+       `SetSystemPromptOverlay`；初始/restore/apply 都走同一 mutable overlay 目标，可替换也可清空，不把新 prompt
+       追加到旧 base。补 `apply_config_replaces_and_clears_system_prompt` 与 driver 投影断言。
+    7. **driver 快速 cancel 分类错误**：`stream_with_cancel` 建流前若 cancel 命中，可能报 failed/Other。修复早退
+       错误路径优先检查 cancel token，发 `RunError{Cancelled}`、`TurnCompletion::Cancelled` 与 cancelled pivot drop
+       reason。
+    8. **stream 无 `Done` 的终态不一致**：事件发 `RunError`，但 `TurnOutcome`/turn-complete 仍算 completed。修复为
+       无 terminal `Done` 直接建模为 `TurnOutcome::Failed{Other}`。
+    9. **删除/关闭 running session 可能丢 external ACP cleanup**：命令通道关闭时 actor 原先立即退出，running driver
+       不归还则无法 cleanup external sessions。修复 actor shutdown：通道关闭后先 cancel active run，等待 run_done 归还
+       driver，再执行 `cleanup_external_sessions` 后退出。
+    10. **CLI `/new [agent]` 未实现**：`/new reviewer` 原报 usage。修复为 0/1 参数，参数写入
+        `SessionConfig.provider` 作为当前 mag-core session→agent binding 名；更新 help 文案，补
+        `slash_new_with_agent_passes_the_agent_binding`。
+    11. **CLI 交互/渲染边界缺陷**：Question/Choice 的 Ctrl-C/EOF 原伪造成空答案或 `Choice{0}`；快速排入多个
+        interaction 会重复打印当前 prompt；`RenderState` 全局 `streamed_text` 会被多会话事件互相污染。修复为
+        Question/Choice 取消转 `cancel(session)` 并丢弃该 session 队列、prompt 只在激活新项时打印、渲染状态按
+        `SessionId` 分桶；补 Question/Choice cancel、prompt 去重、跨 session 渲染 e2e。
+    12. **测试/IO 稳定性问题**：bin subprocess smoke 无统一超时且早退进程写 stdin 可能 BrokenPipe；`save_atomic`
+        临时文件名同进程内不唯一。修复 bin helper 10s 超时+kill+BrokenPipe 容忍；`save_atomic` 临时文件名加入
+        单调 counter 并用 `create_new(true)` 防并发覆盖。
+  - 复核结论：冻结 service 契约保持只加不改（新增 trait 方法现在也有默认 Unsupported）；DTO↔DO roundtrip、secret
+    引用安全、ConfigService update/reload 失败保持旧快照、apply 捕获快照与 turn 边界语义均有测试；pivot/cancel 竞态
+    覆盖 queued/applied/dropped/cancelled；local 与 external ACP 委派生命周期、restore 重注册和 CLI 渲染均有离线 e2e；
+    `mag-cli` normal 依赖仍仅为 `futures`/`mag-service`/`rustyline`/`tokio`，无 mag-core/agent-lib/mag-config 直接依赖。
+  - 门禁结果：1) `cargo fmt --all -- --check` ✅ 2) 聚焦测试 ✅：`cargo test -p mag-cli`（14 passed）、
+    `cargo test -p mag-config`（40 passed）、`cargo test -p mag-service`（19 passed）、`cargo test -p mag-core approval`
+    （23 passed）、`cargo test -p mag-core config_apply`（7 passed）、`cargo test -p mag-core driver`（16 passed）、
+    `cargo test -p mag --test cli`（8 passed）3) `cargo clippy --all-targets -- -D warnings` ✅
+    4) `cargo test --workspace` ✅（全绿，1 ignored 为既有 zed 联调测试）5) `cargo doc --no-deps --workspace` ✅。

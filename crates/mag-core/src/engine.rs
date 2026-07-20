@@ -5,7 +5,7 @@ use std::{
     fmt,
     path::Path,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -441,8 +441,8 @@ impl MagService for Engine {
         // idle sessions apply immediately when they service the command;
         // sessions with a run in flight apply at the run's turn boundary
         // (`docs/CLI.md` §4.4/§4.5).
-        let generation = config_apply.bump();
-        self.inner.manager.apply_config(generation);
+        let apply = config_apply.bump();
+        self.inner.manager.apply_config(apply);
         Ok(())
     }
 }
@@ -515,17 +515,37 @@ impl EngineInner {
 /// Shared config-apply plumbing between the engine and its session actors
 /// (`docs/CLI.md` §4.4, decision D2).
 ///
-/// `apply_config` bumps `generation` (the *pending* marker); each session
-/// actor tracks the generation it last applied and lands the current snapshot
-/// on its agent as soon as it observes a newer generation while at rest —
-/// immediately when idle (the actor services the `ApplyConfig` command), or
-/// at the next run terminal when a run is in flight (the run-completion path
-/// re-checks the generation, which is how the apply rides the turn-complete
-/// boundary of §4.5).
+/// `apply_config` captures the current snapshot and bumps `generation` (the
+/// *pending* marker); each session actor tracks the generation it last applied
+/// and lands that captured snapshot on its agent as soon as it observes a newer
+/// generation while at rest — immediately when idle (the actor services the
+/// `ApplyConfig` command), or at the next run terminal when a run is in flight.
+/// Capturing the snapshot at request time prevents a later reload/update from
+/// silently changing what an already-requested apply will land.
 #[derive(Clone, Debug)]
 pub(crate) struct ConfigApplyState {
     service: Arc<ConfigService>,
-    generation: Arc<AtomicU64>,
+    pending: Arc<StdMutex<Option<PendingConfigApply>>>,
+}
+
+/// One explicit config-apply request captured at the time the interface called
+/// [`MagService::apply_config`](mag_service::MagService::apply_config).
+#[derive(Clone, Debug)]
+pub(crate) struct PendingConfigApply {
+    generation: u64,
+    snapshot: Arc<ConfigSnapshot>,
+}
+
+impl PendingConfigApply {
+    /// Monotonic apply generation for ordering per-session application.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Snapshot captured when the apply request was made.
+    pub(crate) fn snapshot(&self) -> &Arc<ConfigSnapshot> {
+        &self.snapshot
+    }
 }
 
 impl ConfigApplyState {
@@ -533,7 +553,7 @@ impl ConfigApplyState {
     pub(crate) fn new(service: Arc<ConfigService>) -> Self {
         Self {
             service,
-            generation: Arc::new(AtomicU64::new(0)),
+            pending: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -542,14 +562,29 @@ impl ConfigApplyState {
         &self.service
     }
 
-    /// Marks a new apply request pending, returning its generation.
-    pub(crate) fn bump(&self) -> u64 {
-        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+    /// Marks a new apply request pending and captures the current snapshot.
+    pub(crate) fn bump(&self) -> PendingConfigApply {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let generation = pending
+            .as_ref()
+            .map_or(1, |apply| apply.generation.saturating_add(1));
+        let apply = PendingConfigApply {
+            generation,
+            snapshot: self.service.current(),
+        };
+        *pending = Some(apply.clone());
+        apply
     }
 
-    /// The generation of the newest apply request (0 = none ever requested).
-    pub(crate) fn pending(&self) -> u64 {
-        self.generation.load(Ordering::SeqCst)
+    /// The newest apply request, when any has been made.
+    pub(crate) fn pending(&self) -> Option<PendingConfigApply> {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -3029,6 +3064,13 @@ model = "model-b"
 tools = ["read_file"]
 "#;
 
+    /// Config whose `agents.default` also carries a mutable system prompt.
+    const CONFIG_MODEL_B_SYSTEM: &str = r#"
+[agents.default]
+model = "model-b"
+system_prompt = "old system"
+"#;
+
     fn session_config(model: &str) -> SessionConfig {
         SessionConfig {
             provider: "fake".to_owned(),
@@ -3217,6 +3259,15 @@ tools = ["read_file"]
         engine.apply_config().await.expect("apply config mid-run");
         assert_eq!(fake.stream_requests().len(), 1);
 
+        // A later update without another apply must not change the already
+        // queued apply target for this running session.
+        let mut dto = engine.get_config().await.expect("get config");
+        dto.agents.get_mut("default").expect("default agent").model = Some("model-d".to_owned());
+        engine
+            .update_config(dto)
+            .await
+            .expect("update config again");
+
         gate.open();
         wait_run_finished(&mut events, session).await;
 
@@ -3227,10 +3278,63 @@ tools = ["read_file"]
         wait_run_finished(&mut events, session).await;
 
         // The reconfigure happened after the first run's terminal (it is only
-        // admitted at rest): the second run's request carries the new model.
+        // admitted at rest): the second run's request carries the model captured
+        // by the explicit apply, not the later unapplied update.
         let requests = fake.stream_requests();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[1].model, "model-c");
+    }
+
+    #[tokio::test]
+    async fn apply_config_replaces_and_clears_system_prompt() {
+        let (_dir, engine, fake) = engine_with_config(
+            CONFIG_MODEL_B_SYSTEM,
+            vec![
+                StreamScript::Complete(text_stream_with_usage(&["one"], usage(1, 1))),
+                StreamScript::Complete(text_stream_with_usage(&["two"], usage(1, 1))),
+            ],
+        );
+        let session = engine
+            .create_session(session_config("fake-chat"))
+            .await
+            .expect("create session");
+        let mut events = engine.subscribe(Some(session));
+
+        let mut dto = engine.get_config().await.expect("get config");
+        dto.agents
+            .get_mut("default")
+            .expect("default agent")
+            .system_prompt = Some("new system".to_owned());
+        engine.update_config(dto).await.expect("update config");
+        engine.apply_config().await.expect("apply config");
+
+        engine
+            .send_message(session, UserInput::text("one"))
+            .await
+            .expect("first send");
+        wait_run_finished(&mut events, session).await;
+
+        let mut dto = engine.get_config().await.expect("get config");
+        dto.agents
+            .get_mut("default")
+            .expect("default agent")
+            .system_prompt = None;
+        engine
+            .update_config(dto)
+            .await
+            .expect("clear system config");
+        engine.apply_config().await.expect("apply clear");
+
+        engine
+            .send_message(session, UserInput::text("two"))
+            .await
+            .expect("second send");
+        wait_run_finished(&mut events, session).await;
+
+        let requests = fake.stream_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].system.as_deref(), Some("new system"));
+        assert_eq!(requests[1].system, None);
     }
 
     /// M3-5 (c): a panicking listener is isolated — later listeners still

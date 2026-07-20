@@ -207,6 +207,9 @@ pub(crate) struct SessionDriver {
     /// The `agents.<name>` entry this session is bound to; `apply_config`
     /// reconfigurations read that entry (`docs/CLI.md` §4.4).
     agent_name: String,
+    /// Config-controlled system prompt target, queued as a mutable overlay at
+    /// the next turn start so it can be replaced or cleared by `apply_config`.
+    system_prompt: Option<String>,
     /// Registry-backed external ACP handlers owned by this session. Completed
     /// external sessions stay live for reuse until the host explicitly sweeps
     /// them; the session actor calls [`cleanup_external_sessions`] before drop.
@@ -273,9 +276,6 @@ impl SessionDriver {
             .max_tokens(DEFAULT_MAX_TOKENS)
             .max_steps(DEFAULT_MAX_STEPS)
             .interaction_handler(approval as Arc<dyn InteractionHandler>);
-        if let Some(system) = binding.system_prompt() {
-            builder = builder.system(system.to_owned());
-        }
         if let Some(cwd) = &config.cwd {
             builder = builder.worktree(WorktreeRef::new(cwd.clone()));
         }
@@ -304,6 +304,7 @@ impl SessionDriver {
             tools,
             turn_complete,
             agent_name: binding.agent_name().to_owned(),
+            system_prompt: binding.system_prompt().map(str::to_owned),
             #[cfg(feature = "external-acp")]
             external_handlers,
             run_counter: AtomicU64::new(1),
@@ -386,6 +387,7 @@ impl SessionDriver {
             tools,
             turn_complete,
             agent_name: binding.agent_name().to_owned(),
+            system_prompt: binding.system_prompt().map(str::to_owned),
             #[cfg(feature = "external-acp")]
             external_handlers,
             run_counter: AtomicU64::new(1),
@@ -457,20 +459,38 @@ impl SessionDriver {
         // Cloned up front so the early-error path below can fire the
         // turn-complete hook without touching the mutably borrowed agent.
         let turn_complete = self.turn_complete.clone();
+        self.queue_system_prompt_overlay(session_id);
         let mut stream = match self.agent.stream_with_cancel(text, cancel.clone()).await {
             Ok(stream) => stream,
             Err(error) => {
-                drop_pivots(session_id, pivots, events, PIVOT_DROP_RUN_FAILED);
-                let _ = events.emit(Event::RunError {
-                    id: session_id,
-                    message: error.to_string(),
-                    kind: error_kind(&error),
-                });
-                turn_complete.notify(&TurnSummary::new(session_id, TurnCompletion::Failed));
-                return TurnOutcome::Failed {
-                    kind: error_kind(&error),
-                    message: error.to_string(),
+                let outcome = if cancel.is_cancelled() {
+                    TurnOutcome::Cancelled
+                } else {
+                    TurnOutcome::Failed {
+                        kind: error_kind(&error),
+                        message: error.to_string(),
+                    }
                 };
+                drop_pivots(session_id, pivots, events, outcome.pivot_drop_reason());
+                let terminal = match &outcome {
+                    TurnOutcome::Cancelled => Event::RunError {
+                        id: session_id,
+                        message: "run cancelled".to_owned(),
+                        kind: RunErrorKind::Cancelled,
+                    },
+                    TurnOutcome::Failed { kind, message } => Event::RunError {
+                        id: session_id,
+                        message: message.clone(),
+                        kind: *kind,
+                    },
+                    TurnOutcome::Completed => unreachable!("early stream error cannot complete"),
+                };
+                let _ = events.emit(terminal);
+                turn_complete.notify(&TurnSummary::new(
+                    session_id,
+                    TurnCompletion::from(&outcome),
+                ));
+                return outcome;
             }
         };
 
@@ -499,7 +519,15 @@ impl SessionDriver {
                     };
                 }
                 None if cancel.is_cancelled() => break TurnOutcome::Cancelled,
-                None => break TurnOutcome::Completed,
+                None => {
+                    if final_output.is_some() {
+                        break TurnOutcome::Completed;
+                    }
+                    break TurnOutcome::Failed {
+                        kind: RunErrorKind::Other,
+                        message: "agent stream ended without a terminal `Done` event".to_owned(),
+                    };
+                }
             }
         };
 
@@ -513,21 +541,15 @@ impl SessionDriver {
         drop_pivots(session_id, pivots, events, outcome.pivot_drop_reason());
 
         let terminal = match &outcome {
-            TurnOutcome::Completed => match final_output {
-                Some(output) => {
-                    // Persist the committed snapshot before announcing completion.
-                    self.persist_committed_snapshot(session_id, store);
-                    Event::RunFinished {
-                        id: session_id,
-                        output,
-                    }
-                }
-                None => Event::RunError {
+            TurnOutcome::Completed => {
+                let output = final_output.expect("completed turn has terminal output");
+                // Persist the committed snapshot before announcing completion.
+                self.persist_committed_snapshot(session_id, store);
+                Event::RunFinished {
                     id: session_id,
-                    message: "agent stream ended without a terminal `Done` event".to_owned(),
-                    kind: RunErrorKind::Other,
-                },
-            },
+                    output,
+                }
+            }
             TurnOutcome::Failed { kind, message } => Event::RunError {
                 id: session_id,
                 message: message.clone(),
@@ -578,6 +600,11 @@ impl SessionDriver {
     ///   leaves the current surface untouched; an explicit `tools = []` clears
     ///   the surface (an empty replacement set passes facade admission — its
     ///   backing check is vacuous).
+    /// - `system_prompt` → this driver's config-controlled overlay target. The
+    ///   target is queued as [`ReconfigRequest::SetSystemPromptOverlay`] right
+    ///   before the next turn starts instead of being stored in the agent's
+    ///   immutable base prompt, so apply can replace or clear it without
+    ///   appending to stale text.
     ///
     /// Out of scope on the current agent-lib reconfigure surface (documented
     /// for M3-R): the approval policy is baked into the agent at build time
@@ -586,6 +613,9 @@ impl SessionDriver {
     /// mid-session; per-run `budget` is likewise build-time only (and
     /// `session` defaults only affect new sessions per decision D2).
     pub(crate) fn apply_config(&mut self, session_id: SessionId, snapshot: &ConfigSnapshot) {
+        if let Some(agent_config) = snapshot.agent(&self.agent_name) {
+            self.system_prompt = agent_config.system_prompt().map(str::to_owned);
+        }
         let requests = self.reconfig_requests(session_id, snapshot);
         self.apply_reconfig_items(session_id, requests);
     }
@@ -613,6 +643,27 @@ impl SessionDriver {
                     "config apply: reconfigure item rejected; keeping the previous value"
                 );
             }
+        }
+    }
+
+    /// Queues the config-controlled system prompt overlay for the next turn
+    /// start when it differs from the agent's current overlay.
+    fn queue_system_prompt_overlay(&mut self, session_id: SessionId) {
+        if self.agent.state().system_prompt_overlay() == self.system_prompt.as_deref() {
+            return;
+        }
+        if let Err(error) = self
+            .agent
+            .reconfigure(ReconfigRequest::SetSystemPromptOverlay {
+                system_prompt: self.system_prompt.clone(),
+                expected_version: self.agent.state().system_prompt_overlay_version(),
+            })
+        {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %error,
+                "config apply: system prompt overlay rejected; keeping the previous value"
+            );
         }
     }
 
@@ -1749,10 +1800,11 @@ mod tests {
     }
 
     /// `apply_config` projects the snapshot's `agents.default` entry onto the
-    /// agent: a changed model becomes `SetModel`, and the enabled tool list
-    /// becomes a filtered `ReplaceToolSet` (`docs/CLI.md` §4.4). Queued
-    /// reconfigurations apply at the next turn start (agent-lib turn-boundary
-    /// semantics), so the effect is observed on the next run's request.
+    /// agent: a changed model becomes `SetModel`, the configured system prompt
+    /// becomes `SetSystemPromptOverlay`, and the enabled tool list becomes a
+    /// filtered `ReplaceToolSet` (`docs/CLI.md` §4.4). Queued reconfigurations
+    /// apply at the next turn start (agent-lib turn-boundary semantics), so the
+    /// effect is observed on the next run's request.
     #[test]
     fn apply_config_projects_model_and_tool_subset_from_snapshot() {
         driver_test_runtime().block_on(async {
@@ -1765,6 +1817,7 @@ mod tests {
                 r#"
 [agents.default]
 model = "model-b"
+system_prompt = "apply system"
 tools = ["read_file", "shell"]
 "#,
             )
@@ -1777,6 +1830,7 @@ tools = ["read_file", "shell"]
             let requests = client.stream_requests();
             assert_eq!(requests.len(), 1);
             assert_eq!(requests[0].model, "model-b");
+            assert_eq!(requests[0].system.as_deref(), Some("apply system"));
             let names: Vec<&str> = requests[0]
                 .tools
                 .iter()

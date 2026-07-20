@@ -81,16 +81,16 @@ impl FromStr for SecretRef {
     /// `"keyring:entry-name"`.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let (kind, name) = s.split_once(':').ok_or_else(|| {
-            format!("invalid secret reference {s:?}: expected \"env:<NAME>\" or \"keyring:<NAME>\"")
+            "invalid secret reference: expected \"env:<NAME>\" or \"keyring:<NAME>\"".to_owned()
         })?;
         if name.trim().is_empty() {
-            return Err(format!("invalid secret reference {s:?}: empty {kind} name"));
+            return Err(format!("invalid secret reference: empty {kind} name"));
         }
         match kind {
             "env" => Ok(Self::Env(name.to_string())),
             "keyring" => Ok(Self::Keyring(name.to_string())),
             other => Err(format!(
-                "invalid secret reference {s:?}: unknown kind {other:?} \
+                "invalid secret reference: unknown kind {other:?} \
                  (expected \"env\" or \"keyring\")"
             )),
         }

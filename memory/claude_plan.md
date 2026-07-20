@@ -3,24 +3,24 @@
 ## 范围
 - 按 `TODO.md` 的顺序选择第一个标题未以 `[DONE]` 开头的任务。
 - 本次只完成该一个任务；完成后更新记录、提交 Git，然后停止。
-- `TODO.md` 是任务细节和完成状态的唯一权威来源；仅当阶段级计划发生变化时更新 `PLAN.md`。
+- `TODO.md` 是任务细节、依赖、验证要求和完成状态的唯一权威来源。
+- 仅当阶段级计划、依赖结构或完成标准变化时更新 `PLAN.md`。
 
 ## 步骤
-1. 读取 `TODO.md`，识别第一个未完成任务及其验证要求、依赖和完成记录格式。
-2. 查看最近提交信息，若其明确提到与当前任务直接相关的未完成问题，将其纳入当前任务或作为前置项记录到 `TODO.md`。
-3. 根据当前任务读取相关代码、测试和文档，避免无关历史问题扫查。
-4. 以最小正确改动实现任务；如果发现当前任务被具体缺陷或规格不匹配阻塞，优先修复该问题，或在 `TODO.md` 中插入最小前置任务并停止。
-5. 按要求运行格式化、lint 和相关测试；若观察到未排期的失败测试，修复或在 `TODO.md` 中排期，且不将当前任务标记为完成。
-6. 完成后更新 `TODO.md`：在任务标题前加 `[DONE]`，并填写完成记录、验证结果和关键改动。
-7. 检查 Git 状态和差异，提交所有与本次任务相关的更改；如是恢复前一次未完成任务，则按要求纳入当前未提交文件。
-8. 提交后停止，不继续处理下一项任务。
+1. 读取 `TODO.md`，识别第一个未完成任务及其要求。
+2. 查看最近提交信息；若最新提交明确提到与当前任务直接相关的未完成问题，将其纳入当前任务或在 `TODO.md` 中加入前置任务。
+3. 只围绕当前任务读取相关代码、测试和文档，不做开放式历史问题扫查。
+4. 以最小正确改动实现任务；若发现当前任务被具体规格缺口或缺陷阻塞，先修复该阻塞，或在 `TODO.md` 插入最小前置任务并停止。
+5. 先运行格式化，再运行 lint，最后运行相关或完整测试；任何未排期失败测试都必须修复或排期，不能忽略。
+6. 完成后更新 `TODO.md`：在任务标题前加 `[DONE]`，并写入完成记录和验证结果。
+7. 检查 Git 状态、差异和最近提交，提交本次任务相关变更。
+8. 提交后停止，不继续执行下一项任务。
 
 ## 进度记录
-- 已写入初始执行计划，下一步读取 `TODO.md` 识别首个未完成任务。
-- 已识别首个未完成任务：`M6-R [TODO] M6 review`。最近提交 `[M6-5] Wire mag CLI binary e2e` 是该任务直接前置，不需要新增前置任务。
-- M6-R 执行计划：读取 `docs/CLI.md` §0 与 M6 相关实现/测试；逐项核对流式对话、工具权限、通用交互、多 agent 编排（含 external ACP）、协作、持久化恢复、cancel、pivot、配置动态生效；检查 `mag-cli` 依赖边界；如发现缺口，直接修复并补测试；随后按默认验证序列执行并更新 `TODO.md` 完成记录，最后提交。
-- review 已发现并修复第一批缺口：后台会话 interaction 不再丢失、`Delegation*`/tool 事件有 CLI 摘要渲染、Permission 交互纳入 scripted e2e。已运行 `cargo fmt --all` 与 `cargo test -p mag-cli`，10 个 mag-cli 测试通过。
-- 已补强真实 Engine+CLI e2e：`/config apply` 后下一轮使用新 model、跨 Engine 持久化恢复后上下文包含重启前历史、pivot 文本进入后续 LLM request、local/external delegation 生命周期在 CLI 输出可见。已运行 `cargo test -p mag --test engine_cli`，4 个测试通过。
-- 依赖边界检查：`cargo tree -p mag-cli -e normal --depth 1` 显示 direct normal 依赖仅为 futures/mag-service/rustyline/tokio；完整 tree 无 mag-core/agent-lib，mag-config 仅经 mag-service 契约传递出现。
-- 默认验证序列已通过：`cargo fmt --all -- --check`、`cargo test -p mag-cli`、`cargo test -p mag --test engine_cli`、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`、`cargo doc --no-deps --workspace`。
-- `TODO.md` 已将 `M6-R` 标记为 `[DONE]`，并记录 review 发现/修复、§0 验证清单结论、依赖边界与门禁结果。下一步检查 git 状态/diff 后提交。
+- 已写入本次调用的初始计划，下一步读取 `TODO.md` 识别首个未完成任务。
+- 已识别首个未完成任务：`F-R [TODO] 全计划 review`。最近提交 `[M6-R] Review CLI milestone` 是该任务的直接前置，未发现需要先插入的新前置任务。
+- F-R 执行计划：对照 `docs/CLI.md` 全节与决策 D1-D6 审查 M1-M6 当前实现；重点核对契约只加不改、配置 DTO↔DO/快照隔离、pivot/cancel 竞态、delegate restore、external ACP 生命周期、依赖边界、离线测试纪律与 rustdoc 完整性。若发现问题，直接修复并补测试；随后按默认验证序列执行，更新 `TODO.md` 完成记录，提交后停止。
+- 已完成并行只读审查，返回的需核实问题包括：配置 apply 绑定快照与 system prompt 生效、持久化恢复钉住配置、interaction 错误应答/取消语义、CLI 多会话渲染状态、`/new [agent]`、delete in-flight external cleanup、快速 cancel 分类、bin 测试超时，以及若干契约/诊断细节。下一步逐项核实并修复确认为当前规格缺口的问题。
+- 已修复并补测第一批确认缺口：CLI `/new [agent]`、prompt 去重、Question/Choice 取消、每 session 渲染状态；`IpcApproval` 无效应答保留 pending；secret 解析错误不回显裸值；`InteractionOrigin::is_root()` 严格判定；新增 service 能力默认返回 `Unsupported`；`apply_config` 捕获调用时快照并修 spawn 竞态；配置 system prompt 通过 mutable overlay 初始化/替换/清空；driver 快速 cancel 和无 `Done` 终态分类；会话关闭时 running driver 先 cancel 再 cleanup；bin subprocess 测试增加超时和 BrokenPipe 容忍。下一步运行 `cargo fmt` 和聚焦测试。
+- 验证已通过：`cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`、`cargo doc --no-deps --workspace`。聚焦测试也已通过：`cargo test -p mag-cli`、`cargo test -p mag-config`、`cargo test -p mag-service`、`cargo test -p mag-core approval`、`cargo test -p mag-core config_apply`、`cargo test -p mag-core driver`、`cargo test -p mag --test cli`。下一步更新 `TODO.md` 的 F-R 完成记录。
+- `TODO.md` 已将 `F-R` 标记为 `[DONE]` 并写入完成记录。下一步检查 git 状态/diff/log，确认变更后提交。

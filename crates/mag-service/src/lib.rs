@@ -548,7 +548,7 @@ impl InteractionOrigin {
     /// own agent rather than by a delegate.
     #[must_use]
     pub fn is_root(&self) -> bool {
-        self.delegate.is_none()
+        self.delegate.is_none() && self.depth == 0
     }
 }
 
@@ -1080,6 +1080,15 @@ mod tests {
         let decoded = serde_json::from_value::<InteractionOrigin>(json!({ "depth": 0 }))
             .expect("serialized root origin");
         assert_eq!(decoded, InteractionOrigin::default());
+
+        let invalid_root = InteractionOrigin {
+            delegate: None,
+            depth: 1,
+        };
+        assert!(
+            !invalid_root.is_root(),
+            "root attribution requires delegate=None and depth=0"
+        );
     }
 
     #[test]

@@ -62,6 +62,7 @@ struct ScriptedService {
     reload_config_calls: Arc<Mutex<usize>>,
     apply_config_calls: Arc<Mutex<usize>>,
     create_count: Arc<Mutex<usize>>,
+    create_configs: Arc<Mutex<Vec<SessionConfig>>>,
 }
 
 impl ScriptedService {
@@ -82,6 +83,7 @@ impl ScriptedService {
             reload_config_calls: Arc::new(Mutex::new(0)),
             apply_config_calls: Arc::new(Mutex::new(0)),
             create_count: Arc::new(Mutex::new(0)),
+            create_configs: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -131,6 +133,10 @@ impl ScriptedService {
 
     fn apply_config_calls(&self) -> Arc<Mutex<usize>> {
         Arc::clone(&self.apply_config_calls)
+    }
+
+    fn create_configs(&self) -> Arc<Mutex<Vec<SessionConfig>>> {
+        Arc::clone(&self.create_configs)
     }
 
     fn emit_interaction_script(&self, id: SessionId) {
@@ -269,7 +275,8 @@ fn scripted_session_config(provider: &str, model: &str) -> SessionConfig {
 
 #[async_trait]
 impl MagService for ScriptedService {
-    async fn create_session(&self, _config: SessionConfig) -> Result<SessionId, ServiceError> {
+    async fn create_session(&self, config: SessionConfig) -> Result<SessionId, ServiceError> {
+        self.create_configs.lock().expect("lock").push(config);
         let mut count = self.create_count.lock().expect("lock");
         *count += 1;
         let id = if *count == 1 { SESSION_A } else { SESSION_B };
@@ -605,6 +612,21 @@ async fn slash_new_creates_and_switches_to_a_new_session() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slash_new_with_agent_passes_the_agent_binding() {
+    let service = Arc::new(ScriptedService::new());
+    let create_configs = service.create_configs();
+
+    let output = drive("/new reviewer\n/quit\n", service).await;
+
+    assert!(output.contains(SESSION_A), "{output}");
+    assert!(output.contains(SESSION_B), "{output}");
+    let create_configs = create_configs.lock().expect("lock").clone();
+    assert_eq!(create_configs.len(), 2);
+    assert_eq!(create_configs[0].provider, "openai");
+    assert_eq!(create_configs[1].provider, "reviewer");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn background_session_interaction_is_answered_after_resume() {
     let service = Arc::new(ScriptedService::new());
     let replies = service.replies();
@@ -738,6 +760,13 @@ async fn prompt_coordinator_answers_queued_interactions_in_order() {
     result.expect("CLI run must succeed");
 
     let replies = replies.lock().expect("lock").clone();
+    assert_eq!(
+        output
+            .matches("[from researcher@depth1] [approval]")
+            .count(),
+        1,
+        "the active approval prompt is printed once before it is answered: {output}"
+    );
     assert_eq!(replies.len(), 4);
     assert_eq!(
         replies[0].session_id,
@@ -782,6 +811,130 @@ async fn prompt_coordinator_answers_queued_interactions_in_order() {
             decision: PermissionDecisionWire::Approve,
         }
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctrl_c_on_question_cancels_the_run_without_answering() {
+    let service = Arc::new(ScriptedService::new());
+    let replies = service.replies();
+    let cancels = service.cancels();
+    let (mut stdin_writer, mut stdout_reader, run) = spawn_cli(service);
+    let mut output = String::new();
+
+    stdin_writer
+        .write_all(b"interact\n")
+        .await
+        .expect("send prompt-triggering input");
+    read_until(
+        &mut stdout_reader,
+        &mut output,
+        "[from researcher@depth1] [approval]",
+    )
+    .await;
+    stdin_writer.write_all(b"y\n").await.expect("approve");
+    read_until(
+        &mut stdout_reader,
+        &mut output,
+        "[question] What should I say?",
+    )
+    .await;
+    stdin_writer
+        .write_all("\u{3}\n".as_bytes())
+        .await
+        .expect("interrupt question");
+    read_until(&mut stdout_reader, &mut output, "[cancel requested").await;
+    read_until(&mut stdout_reader, &mut output, "[error cancelled]").await;
+    stdin_writer.write_all(b"/quit\n").await.expect("quit CLI");
+    stdin_writer.shutdown().await.expect("close scripted stdin");
+
+    let result = tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("CLI run must not hang")
+        .expect("CLI task must join");
+    result.expect("CLI run must succeed");
+
+    let replies = replies.lock().expect("lock").clone();
+    assert!(replies.iter().any(|reply| {
+        reply.request_id == RequestId::parse_str(REQ_APPROVAL).unwrap()
+            && matches!(
+                &reply.response,
+                InteractionResponseWire::Approval {
+                    decision,
+                    ..
+                } if *decision == ApprovalDecisionWire::Approve
+            )
+    }));
+    assert!(
+        !replies
+            .iter()
+            .any(|reply| reply.request_id == RequestId::parse_str(REQ_QUESTION).unwrap()),
+        "question cancellation must not send an empty answer: {replies:?}"
+    );
+    let cancels = cancels.lock().expect("lock").clone();
+    assert_eq!(cancels, vec![SessionId::parse_str(SESSION_A).unwrap()]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctrl_c_on_choice_cancels_the_run_without_selecting_default() {
+    let service = Arc::new(ScriptedService::new());
+    let replies = service.replies();
+    let cancels = service.cancels();
+    let (mut stdin_writer, mut stdout_reader, run) = spawn_cli(service);
+    let mut output = String::new();
+
+    stdin_writer
+        .write_all(b"interact\n")
+        .await
+        .expect("send prompt-triggering input");
+    read_until(
+        &mut stdout_reader,
+        &mut output,
+        "[from researcher@depth1] [approval]",
+    )
+    .await;
+    stdin_writer.write_all(b"y\n").await.expect("approve");
+    read_until(
+        &mut stdout_reader,
+        &mut output,
+        "[question] What should I say?",
+    )
+    .await;
+    stdin_writer
+        .write_all(b"hello before choice\n")
+        .await
+        .expect("answer question");
+    read_until(&mut stdout_reader, &mut output, "[choice] Pick a path").await;
+    stdin_writer
+        .write_all("\u{3}\n".as_bytes())
+        .await
+        .expect("interrupt choice");
+    read_until(&mut stdout_reader, &mut output, "[cancel requested").await;
+    read_until(&mut stdout_reader, &mut output, "[error cancelled]").await;
+    stdin_writer.write_all(b"/quit\n").await.expect("quit CLI");
+    stdin_writer.shutdown().await.expect("close scripted stdin");
+
+    let result = tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("CLI run must not hang")
+        .expect("CLI task must join");
+    result.expect("CLI run must succeed");
+
+    let replies = replies.lock().expect("lock").clone();
+    assert!(replies.iter().any(|reply| {
+        reply.request_id == RequestId::parse_str(REQ_QUESTION).unwrap()
+            && reply.response
+                == InteractionResponseWire::Answer {
+                    text: "hello before choice".to_owned(),
+                }
+    }));
+    assert!(
+        !replies
+            .iter()
+            .any(|reply| reply.request_id == RequestId::parse_str(REQ_CHOICE).unwrap()),
+        "choice cancellation must not send a default choice: {replies:?}"
+    );
+    let cancels = cancels.lock().expect("lock").clone();
+    assert_eq!(cancels, vec![SessionId::parse_str(SESSION_A).unwrap()]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -891,6 +1044,59 @@ async fn ctrl_c_during_an_in_flight_run_cancels_the_current_session() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rendering_tracks_streamed_text_per_session() {
+    let service = Arc::new(ScriptedService::new());
+    let (mut stdin_writer, mut stdout_reader, run) = spawn_cli(service.clone());
+    let mut output = String::new();
+    let session_a = SessionId::parse_str(SESSION_A).unwrap();
+    let session_b = SessionId::parse_str(SESSION_B).unwrap();
+    let run_a = RunId::parse_str(RUN_A).unwrap();
+    let run_b = RunId::parse_str(RUN_B).unwrap();
+
+    read_until(&mut stdout_reader, &mut output, SESSION_A).await;
+    let _ = service.events.send(ServiceEvent::RunStarted {
+        id: session_a,
+        run_id: run_a,
+    });
+    let _ = service.events.send(ServiceEvent::RunStarted {
+        id: session_b,
+        run_id: run_b,
+    });
+    let _ = service.events.send(ServiceEvent::TextDelta {
+        id: session_b,
+        text: "B streamed".to_owned(),
+    });
+    let _ = service.events.send(ServiceEvent::RunFinished {
+        id: session_a,
+        output: RunOutput {
+            text: "A final only".to_owned(),
+            usage: None,
+        },
+    });
+    let _ = service.events.send(ServiceEvent::RunFinished {
+        id: session_b,
+        output: RunOutput {
+            text: "B streamed".to_owned(),
+            usage: None,
+        },
+    });
+
+    read_until(&mut stdout_reader, &mut output, "A final only").await;
+    read_until(&mut stdout_reader, &mut output, "[finished]").await;
+    stdin_writer.write_all(b"/quit\n").await.expect("quit CLI");
+    stdin_writer.shutdown().await.expect("close scripted stdin");
+
+    let result = tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("CLI run must not hang")
+        .expect("CLI task must join");
+    result.expect("CLI run must succeed");
+
+    assert_eq!(output.matches("A final only").count(), 1, "{output}");
+    assert_eq!(output.matches("B streamed").count(), 1, "{output}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slash_commands_call_the_matching_service_methods() {
     let service = Arc::new(ScriptedService::new());
     let resumes = service.resumes();
@@ -936,7 +1142,10 @@ async fn slash_commands_call_the_matching_service_methods() {
         output.contains("- local-coder name=Local Coder kind=local_agent available=false"),
         "{output}"
     );
-    assert!(output.contains("commands: /new, /sessions"), "{output}");
+    assert!(
+        output.contains("commands: /new [agent], /sessions"),
+        "{output}"
+    );
 
     assert_eq!(*list_sessions_calls.lock().expect("lock"), 1);
     assert_eq!(*list_sources_calls.lock().expect("lock"), 1);

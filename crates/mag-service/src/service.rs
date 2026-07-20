@@ -114,7 +114,11 @@ pub trait MagService: Send + Sync {
     /// [`ServiceError::NotPivotable`] when the session has no in-progress run,
     /// [`ServiceError::Unsupported`] when the implementation does not support
     /// pivoting, or another [`ServiceError`] on delivery failure.
-    async fn pivot_message(&self, id: SessionId, input: UserInput) -> Result<(), ServiceError>;
+    async fn pivot_message(&self, _id: SessionId, _input: UserInput) -> Result<(), ServiceError> {
+        Err(ServiceError::Unsupported {
+            operation: "pivot_message".to_owned(),
+        })
+    }
 
     // —— Approval / interaction round-trips ——
 
@@ -176,7 +180,11 @@ pub trait MagService: Send + Sync {
     /// Returns [`ServiceError::Unsupported`] when the implementation has no
     /// configuration backend, or [`ServiceError::Config`] when the current
     /// snapshot cannot be projected.
-    async fn get_config(&self) -> Result<ConfigDto, ServiceError>;
+    async fn get_config(&self) -> Result<ConfigDto, ServiceError> {
+        Err(ServiceError::Unsupported {
+            operation: "get_config".to_owned(),
+        })
+    }
 
     /// Replaces the runtime configuration with `config` (`docs/CLI.md` §4.3).
     ///
@@ -195,7 +203,11 @@ pub trait MagService: Send + Sync {
     /// write-through fails, [`ServiceError::Unsupported`] when the
     /// implementation has no configuration backend, or another
     /// [`ServiceError`] on backend failure.
-    async fn update_config(&self, config: ConfigDto) -> Result<(), ServiceError>;
+    async fn update_config(&self, _config: ConfigDto) -> Result<(), ServiceError> {
+        Err(ServiceError::Unsupported {
+            operation: "update_config".to_owned(),
+        })
+    }
 
     /// Re-reads the configuration file and swaps in a fresh snapshot
     /// (`docs/CLI.md` §4.3).
@@ -213,7 +225,11 @@ pub trait MagService: Send + Sync {
     /// Returns [`ServiceError::Config`] when the file cannot be read or
     /// validated, [`ServiceError::Unsupported`] when the implementation has no
     /// configuration backend, or another [`ServiceError`] on backend failure.
-    async fn reload_config(&self) -> Result<(), ServiceError>;
+    async fn reload_config(&self) -> Result<(), ServiceError> {
+        Err(ServiceError::Unsupported {
+            operation: "reload_config".to_owned(),
+        })
+    }
 
     /// Requests that the current configuration snapshot be applied to live
     /// sessions (`docs/CLI.md` §4.4, decision D2).
@@ -229,7 +245,11 @@ pub trait MagService: Send + Sync {
     /// Returns [`ServiceError::Unsupported`] when the implementation has no
     /// configuration backend (or no turn-complete mechanism), or another
     /// [`ServiceError`] on backend failure.
-    async fn apply_config(&self) -> Result<(), ServiceError>;
+    async fn apply_config(&self) -> Result<(), ServiceError> {
+        Err(ServiceError::Unsupported {
+            operation: "apply_config".to_owned(),
+        })
+    }
 }
 
 /// Neutral user input supplied to [`MagService::send_message`].

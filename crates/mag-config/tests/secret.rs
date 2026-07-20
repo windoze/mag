@@ -39,6 +39,10 @@ fn plain_secret_values_are_rejected() {
     // reference — secrets can never be inlined by accident.
     let err = parse_api_key(r#""sk-ant-real-secret-value""#).unwrap_err();
     assert!(err.contains("invalid secret reference"), "got: {err}");
+    assert!(
+        !err.contains("sk-ant-real-secret-value"),
+        "error must not echo the rejected secret: {err}"
+    );
 }
 
 #[test]

@@ -10,6 +10,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{ConfigDto, ConfigError};
 
@@ -52,7 +53,7 @@ impl ConfigDto {
     /// Atomically writes the DTO as TOML to `path`.
     ///
     /// The document is first written to a sibling temp file
-    /// (`<name>.tmp-<pid>`), fsynced, then renamed over the target, so
+    /// (`<name>.tmp-<pid>-<counter>`), fsynced, then renamed over the target, so
     /// concurrent readers and file watchers see either the old or the new
     /// file, never a truncated one. Parent directories are created if
     /// missing.
@@ -70,14 +71,19 @@ impl ConfigDto {
         }
 
         let file_name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+        static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
         let tmp: PathBuf = path.with_file_name(format!(
-            ".{}.tmp-{}",
+            ".{}.tmp-{}-{}",
             file_name.as_deref().unwrap_or("config"),
-            std::process::id()
+            std::process::id(),
+            TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
 
         let write_result = (|| {
-            let mut file = fs::File::create(&tmp)?;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
             use std::io::Write as _;
             file.write_all(text.as_bytes())?;
             file.sync_all()?;

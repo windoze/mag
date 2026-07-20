@@ -8,12 +8,15 @@
 
 use std::{
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, ErrorKind, Write},
     path::PathBuf,
     process::{Child, Command, Output, Stdio},
     sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+const CHILD_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Unique temp directory per test, removed on drop (same pattern as the
 /// `TempConfigDir` helpers in mag-core).
@@ -97,11 +100,42 @@ fn run_cli_with_env(
 
     {
         let mut stdin = child.stdin.take().expect("piped stdin");
-        stdin.write_all(input.as_bytes()).expect("write CLI stdin");
-        stdin.flush().expect("flush CLI stdin");
+        write_child_stdin(&mut stdin, input.as_bytes(), "CLI stdin");
     }
 
-    child.wait_with_output().expect("wait for mag CLI")
+    wait_with_timeout(child, "mag CLI")
+}
+
+fn write_child_stdin(stdin: &mut impl Write, bytes: &[u8], context: &str) {
+    match stdin.write_all(bytes) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::BrokenPipe => return,
+        Err(error) => panic!("write {context}: {error}"),
+    }
+    match stdin.flush() {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::BrokenPipe => {}
+        Err(error) => panic!("flush {context}: {error}"),
+    }
+}
+
+fn wait_with_timeout(mut child: Child, context: &str) -> Output {
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().expect("collect child output"),
+            Ok(None) => {}
+            Err(error) => panic!("wait for {context}: {error}"),
+        }
+        if start.elapsed() >= CHILD_TIMEOUT {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .expect("collect timed-out child output");
+            panic!("{context} timed out after {CHILD_TIMEOUT:?}: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// Extracts the first `[session <id>]` line printed by the CLI.

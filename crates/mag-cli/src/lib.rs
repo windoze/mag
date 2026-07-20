@@ -265,8 +265,14 @@ impl PromptCoordinator {
         let Some(active) = self.active.clone() else {
             return Ok(false);
         };
-        let response = cancellation_response(&active.kind);
-        self.respond(service, output, response).await?;
+        if let Some(response) = cancellation_response(&active.kind) {
+            self.respond(service, output, response).await?;
+        } else {
+            self.active = None;
+            self.queue
+                .retain(|interaction| interaction.session_id != active.session_id);
+            cancel_session_for_interaction(service, output, active.session_id).await?;
+        }
         Ok(true)
     }
 
@@ -278,6 +284,7 @@ impl PromptCoordinator {
     where
         W: AsyncWrite + Send + Unpin + 'static,
     {
+        let mut cancelled_sessions = HashSet::new();
         while self.active.is_some() || !self.queue.is_empty() {
             if self.active.is_none() {
                 self.active = self.queue.pop_front();
@@ -285,13 +292,16 @@ impl PromptCoordinator {
             let Some(active) = self.active.take() else {
                 continue;
             };
-            service
-                .respond_interaction(
-                    active.session_id,
-                    active.request_id,
-                    cancellation_response(&active.kind),
-                )
-                .await?;
+            if cancelled_sessions.contains(&active.session_id) {
+                continue;
+            }
+            if let Some(response) = cancellation_response(&active.kind) {
+                service
+                    .respond_interaction(active.session_id, active.request_id, response)
+                    .await?;
+            } else if cancelled_sessions.insert(active.session_id) {
+                service.cancel(active.session_id).await?;
+            }
         }
         Ok(())
     }
@@ -330,9 +340,9 @@ impl PromptCoordinator {
                 .position(|interaction| interaction.session_id == current_session)
         {
             self.active = self.queue.remove(position);
-        }
-        if let Some(active) = &self.active {
-            write_interaction_prompt(output, active).await?;
+            if let Some(active) = &self.active {
+                write_interaction_prompt(output, active).await?;
+            }
         }
         Ok(())
     }
@@ -522,11 +532,16 @@ where
     match command {
         "/quit" => Ok(LineOutcome::Quit),
         "/new" => {
+            let agent = parts.next();
             if parts.next().is_some() {
-                write_line(output, "[error] usage: /new\n").await?;
+                write_line(output, "[error] usage: /new [agent]\n").await?;
                 return Ok(LineOutcome::Continue);
             }
-            match service.create_session(opts.session.clone()).await {
+            let mut config = opts.session.clone();
+            if let Some(agent) = agent {
+                config.provider = agent.to_owned();
+            }
+            match service.create_session(config).await {
                 Ok(new_session) => {
                     *session_id = new_session;
                     write_line(output, &format!("[session {new_session}]\n")).await?;
@@ -628,7 +643,7 @@ where
             }
             write_line(
                 output,
-                "commands: /new, /sessions, /resume <id>, /delete <id>, /cancel, /sources, /config <show|reload|apply>, /help, /quit\n",
+                "commands: /new [agent], /sessions, /resume <id>, /delete <id>, /cancel, /sources, /config <show|reload|apply>, /help, /quit\n",
             )
             .await?;
             Ok(LineOutcome::Continue)
@@ -786,6 +801,19 @@ where
         Ok(()) => write_line(output, &format!("[cancel requested {session_id}]\n")).await?,
         Err(error) => write_line(output, &format!("[error] {error}\n")).await?,
     }
+    Ok(())
+}
+
+async fn cancel_session_for_interaction<W>(
+    service: &Arc<dyn MagService>,
+    output: &SharedOutput<W>,
+    session_id: SessionId,
+) -> Result<(), CliError>
+where
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    service.cancel(session_id).await?;
+    write_line(output, &format!("[cancel requested {session_id}]\n")).await?;
     Ok(())
 }
 
@@ -1009,7 +1037,7 @@ async fn render_events<S, W>(
 
 #[derive(Default)]
 struct RenderState {
-    streamed_text: bool,
+    streamed_text: HashMap<SessionId, bool>,
 }
 
 async fn render_event<W>(
@@ -1021,15 +1049,16 @@ where
     W: AsyncWrite + Send + Unpin + 'static,
 {
     match event {
-        ServiceEvent::RunStarted { .. } => {
-            state.streamed_text = false;
+        ServiceEvent::RunStarted { id, .. } => {
+            state.streamed_text.insert(id, false);
         }
-        ServiceEvent::TextDelta { text, .. } => {
-            state.streamed_text = true;
+        ServiceEvent::TextDelta { id, text } => {
+            state.streamed_text.insert(id, true);
             write_line(output, &text).await?;
         }
-        ServiceEvent::RunFinished { output: run, .. } => {
-            if !state.streamed_text && !run.text.is_empty() {
+        ServiceEvent::RunFinished { id, output: run } => {
+            let streamed_text = state.streamed_text.remove(&id).unwrap_or(false);
+            if !streamed_text && !run.text.is_empty() {
                 write_line(output, &run.text).await?;
             }
             let mut line = "\n[finished".to_owned();
@@ -1041,15 +1070,14 @@ where
             }
             line.push_str("]\n");
             write_line(output, &line).await?;
-            state.streamed_text = false;
         }
-        ServiceEvent::RunError { message, kind, .. } => {
+        ServiceEvent::RunError { id, message, kind } => {
+            state.streamed_text.remove(&id);
             write_line(
                 output,
                 &format!("\n[error {}] {message}\n", run_error_kind(&kind)),
             )
             .await?;
-            state.streamed_text = false;
         }
         ServiceEvent::ToolStarted { id, trace } => {
             write_line(output, &render_tool_trace("started", id, &trace)).await?;
@@ -1256,22 +1284,19 @@ fn permission_response_from_line(
     })
 }
 
-fn cancellation_response(kind: &InteractionKindWire) -> InteractionResponseWire {
+fn cancellation_response(kind: &InteractionKindWire) -> Option<InteractionResponseWire> {
     match kind {
         InteractionKindWire::Approval { call_id, .. } => {
-            approval_response(call_id, ApprovalDecisionWire::Cancel)
+            Some(approval_response(call_id, ApprovalDecisionWire::Cancel))
         }
-        InteractionKindWire::Question { .. } => InteractionResponseWire::Answer {
-            text: String::new(),
-        },
-        InteractionKindWire::Choice { .. } => InteractionResponseWire::Choice { index: 0 },
-        InteractionKindWire::Permission { action_id, .. } => InteractionResponseWire::Permission {
-            action_id: action_id.to_owned(),
-            decision: PermissionDecisionWire::Cancel,
-        },
-        _ => InteractionResponseWire::Answer {
-            text: String::new(),
-        },
+        InteractionKindWire::Question { .. } | InteractionKindWire::Choice { .. } => None,
+        InteractionKindWire::Permission { action_id, .. } => {
+            Some(InteractionResponseWire::Permission {
+                action_id: action_id.to_owned(),
+                decision: PermissionDecisionWire::Cancel,
+            })
+        }
+        _ => None,
     }
 }
 

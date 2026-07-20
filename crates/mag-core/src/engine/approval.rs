@@ -195,18 +195,24 @@ impl IpcApproval {
         request_id: RequestId,
         response: InteractionResponseWire,
     ) -> Result<(), ServiceError> {
-        let pending = lock_recovering(&self.pending).remove(&request_id);
-        let Some(pending) = pending else {
-            return Err(ServiceError::InteractionNotFound { request_id });
-        };
+        let (pending, core) = {
+            let mut pending = lock_recovering(&self.pending);
+            let Some(entry) = pending.get(&request_id) else {
+                return Err(ServiceError::InteractionNotFound { request_id });
+            };
 
-        let core = interaction_response_from_wire(&pending.interaction, &response)?;
-        pending
-            .interaction
-            .accepts_response(&core)
-            .map_err(|error| ServiceError::Backend {
-                message: format!("invalid interaction response: {error}"),
-            })?;
+            let core = interaction_response_from_wire(&entry.interaction, &response)?;
+            entry
+                .interaction
+                .accepts_response(&core)
+                .map_err(|error| ServiceError::Backend {
+                    message: format!("invalid interaction response: {error}"),
+                })?;
+            let entry = pending
+                .remove(&request_id)
+                .expect("pending entry exists after validation");
+            (entry, core)
+        };
         pending
             .responder
             .send(core)
@@ -995,6 +1001,54 @@ mod tests {
         )
         .expect_err("family mismatch must be rejected");
         assert!(matches!(error, ServiceError::Backend { .. }));
+    }
+
+    #[tokio::test]
+    async fn invalid_response_keeps_pending_interaction_retryable() {
+        let events = EventBus::new();
+        let ipc = IpcApproval::new(session_id(), events.clone(), Arc::new(AskFrontendDecider));
+        let mut subscriber = events.subscribe();
+        let interaction =
+            Interaction::question(StepId::new(Uuid::from_u128(9)), "How now?".to_owned());
+        let ctx = run_ctx();
+        let mut fulfilled = Box::pin(ipc.fulfill(&interaction, &ctx));
+
+        let request_id = loop {
+            assert!(
+                futures::poll!(fulfilled.as_mut()).is_pending(),
+                "fulfill resolved before the interface responded"
+            );
+            if let Poll::Ready(Some(Event::InteractionRequested { request_id, .. })) =
+                futures::poll!(subscriber.next())
+            {
+                break request_id;
+            }
+            tokio::task::yield_now().await;
+        };
+
+        assert!(matches!(
+            ipc.respond(request_id, InteractionResponseWire::Choice { index: 0 }),
+            Err(ServiceError::Backend { .. })
+        ));
+        assert!(
+            futures::poll!(fulfilled.as_mut()).is_pending(),
+            "invalid response must not drop the pending waiter"
+        );
+
+        ipc.respond(
+            request_id,
+            InteractionResponseWire::Answer {
+                text: "retry answer".to_owned(),
+            },
+        )
+        .expect("retry with matching answer");
+
+        match fulfilled.await {
+            RequirementResult::Interaction(InteractionResponse::Answer(answer)) => {
+                assert_eq!(answer, "retry answer");
+            }
+            other => panic!("expected answer interaction result, got {other:?}"),
+        }
     }
 
     #[test]
