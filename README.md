@@ -16,9 +16,9 @@ workspace skeleton for the engine and its direct support crates.
   the non-default `os-keyring` feature so tests never touch a real keyring), the
   `SourceRegistry` that projects hosted LLM sources to an agent-lib
   `ProviderConfig`, and a reserved slot for future local-agent integration.
-- `ui/packages/protocol`: generated TypeScript bindings for mag service wire
-  types. Regenerate them from Rust with `cargo test -p mag-service --features
-  ts-export export_ts`.
+- `ui/`: pnpm frontend workspace for shared web/desktop UI infrastructure:
+  generated protocol types, the client package, React UI package, and Vite web
+  shell.
 
 The web UI and additional transport crates are landing incrementally; the
 protocol package is the first shared frontend artifact.
@@ -44,6 +44,17 @@ Regenerate and check protocol TypeScript bindings with:
 cargo test -p mag-service --features ts-export export_ts
 git diff --exit-code -- ui/packages/protocol/src
 ```
+
+Install and validate the frontend workspace with:
+
+```sh
+cd ui
+pnpm install
+pnpm -r build
+pnpm -r test
+```
+
+If `pnpm` is not installed globally, use `npx --yes pnpm@10.14.0 <command>`.
 
 ## Usage
 

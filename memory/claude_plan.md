@@ -1,17 +1,34 @@
-# Execution Plan
+# 执行计划
 
-1. Read `TODO.md` and identify the first task whose title is not prefixed with `[DONE]`.
-2. Review that task's details, dependencies, validation requirements, and the latest commit only if it directly mentions unfinished work relevant to the selected task.
-3. Inspect the minimal code, tests, and docs needed for the selected task; avoid broad historical triage.
-4. Implement the task as written, or add the minimum prerequisite task to `TODO.md` and stop if a concrete blocker makes correct execution impossible.
-5. Run validation in the required order: formatting first, linting next, then the relevant/full test suite unless only documentation changed since the last successful full run.
-6. Update `TODO.md` by adding `[DONE]` to the completed task title and refreshing its completion record. Update `PLAN.md` only if phase-level sequencing or completion criteria changed.
-7. Inspect git status/diff/log, commit all intended changes with a task-scoped message, then stop without starting the next task.
+说明：本文件记录可审计的执行计划与进度，不包含私有推理链。
 
-Progress:
-- Started this invocation and refreshed the public execution plan before implementation work.
-- Identified the first incomplete task as `W2-4 bin mag --web + 协议级 e2e`; scope is limited to CLI web startup wiring and protocol-level offline e2e validation.
-- Implemented the bin-side web wiring: `mag --web` flags, mode validation, token URL printing, and a `mag-web` listener handoff that lets the bin print the actual bound address.
-- Added the protocol-level web e2e test using a real `Engine`, scripted fake LLM, loopback HTTP/SSE clients, tool approval, pivot, cancel, history, config, and sources routes; entered validation starting with `cargo fmt --all`.
-- Validation passed: `cargo fmt --all`, `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, focused `cargo test -p mag --bin mag`, `cargo test -p mag --test web_e2e`, `cargo test -p mag-web`, full `cargo test --workspace`, and `cargo doc --no-deps --workspace`.
-- Marked `W2-4` complete in `TODO.md` with completion details; only documentation/progress files changed after validation, so the prior green validation remains applicable.
+## 当前目标
+
+根据 `TODO.md` 的顺序完成首个未完成任务：`W3-1 [TODO] ui/ monorepo 脚手架`，验证后更新任务记录并提交一次 Git commit，然后停止。
+
+## 初始步骤
+
+1. 读取 `TODO.md`，仅识别第一个未完成任务，不做开放式历史问题扫描。
+2. 查看最近提交信息；只有当其明确提到与当前任务直接相关的未完成问题时，才纳入当前任务或作为前置任务记录到 `TODO.md`。
+3. 读取当前任务涉及的相关代码、测试和文档，确认任务要求、依赖和验证命令。
+
+## 执行步骤
+
+1. 按任务要求做最小且完整的实现，不通过缩小范围或绕过规格来完成。
+2. 若发现阻塞当前任务的规格缺口、实现边界或失败测试，优先修复；若无法在当前任务内正确完成，则在 `TODO.md` 中插入最小前置任务并停止。
+3. 使用小而聚焦的补丁修改代码、测试和文档；必要时更新本计划文件记录关键进展。
+4. 先运行格式化，再运行 lint，再运行任务要求的相关测试；如果代码发生变化且需要全量验证，则运行完整测试套件。
+5. 若所有验证通过，将当前任务标题加上 `[DONE]`，填写完成记录。
+6. 检查 Git 状态、diff 和最近提交，提交本次任务相关所有未提交变更。
+7. 完成一个任务后停止，不继续处理下一个任务。
+
+## 进度记录
+
+- 已写入初始执行计划，下一步读取 `TODO.md` 识别第一个未完成任务。
+- 已读取 `TODO.md`，确认当前任务为 `W3-1`；后续只处理该任务，不进入 `W3-2`。
+- 最近提交为 `W2-R` review，通过，不包含直接阻塞 `W3-1` 的未完成事项。
+- 本机无全局 `pnpm`/`corepack`，但有 `npm`；验证阶段将使用 `npx --yes pnpm@10.14.0 ...` 执行 pnpm 命令，避免修改全局环境。
+- 已补齐 `ui/` pnpm workspace 根配置、`@mag/client`/`@mag/ui`/`@mag/app-web` 骨架、Storybook/Tailwind/shadcn 配置和 README。
+- 前端验证已通过：`npx --yes pnpm@10.14.0 install`、`format`、`lint`、`-r build`、`-r test`。当前进入 Rust 默认验证序列。
+- Rust 默认验证已通过：`cargo fmt --all`、`cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`、`cargo doc --no-deps --workspace`。
+- 已将 `TODO.md` 中 `W3-1` 标记为 `[DONE]` 并填写完成记录；下一步检查 diff/status 后提交。

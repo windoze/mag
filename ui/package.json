@@ -1,0 +1,26 @@
+{
+  "name": "mag-ui-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.14.0",
+  "scripts": {
+    "build": "pnpm -r build",
+    "dev": "pnpm --filter @mag/app-web dev",
+    "format": "prettier --check .",
+    "format:write": "prettier --write .",
+    "lint": "eslint .",
+    "protocol:check": "pnpm protocol:generate && git diff --exit-code -- packages/protocol/src packages/protocol/test",
+    "protocol:generate": "cargo test -p mag-service --features ts-export export_ts",
+    "test": "pnpm -r test"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.32.0",
+    "@types/node": "^24.0.0",
+    "eslint": "^9.32.0",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.6.2",
+    "typescript": "^5.9.2",
+    "typescript-eslint": "^8.38.0"
+  }
+}

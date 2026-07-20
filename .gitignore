@@ -1,1 +1,8 @@
 /target/
+/ui/node_modules/
+/ui/**/node_modules/
+/ui/**/coverage/
+/ui/**/dist/*
+!/ui/apps/web/dist/.gitkeep
+/ui/**/storybook-static/
+/ui/**/*.tsbuildinfo

@@ -328,7 +328,7 @@ CI 承载（引入 CI 时列为第一批）；⑥tool 输出为 agent-lib Conten
 目标：`ui/` monorepo 立起来，`@mag/client` 状态层 + `@mag/ui` 核心组件 + app-web 壳打通
 「会话列表 + 流式对话 + 审批交互」闭环。
 
-### W3-1 [TODO] `ui/` monorepo 脚手架
+### W3-1 [DONE] `ui/` monorepo 脚手架
 
 - **上下文**：`docs/WEB.md` §6.1；栈 Q2 拍板（React+TS+Vite+Tailwind+shadcn+vitest+Storybook）。
 - **实现要求**：pnpm workspace（`ui/pnpm-workspace.yaml`）：`packages/protocol`（接入 W1-4 生成物）、
@@ -336,6 +336,16 @@ CI 承载（引入 CI 时列为第一批）；⑥tool 输出为 agent-lib Conten
   配置；各包 `package.json` 依赖方向符合硬约束；`pnpm install` + 各包空 build/test 绿；
   Storybook 骨架在 `@mag/ui`；根 README 简记开发命令（dev/build/test/协议再生成）。
 - **验证条件**：`pnpm -r build`、`pnpm -r test` 绿；默认验证序列（cargo 部分不受影响）全过。
+
+完成记录（2026-07-21）：
+
+- 新增 `ui/` pnpm workspace 根配置：`package.json`、`pnpm-workspace.yaml`、统一 strict `tsconfig.base.json`、ESLint flat config、Prettier 配置与忽略规则；`pnpm-lock.yaml` 已生成，`esbuild` build script 已通过 pnpm v10 allowlist 批准。
+- 现有 `@mag/protocol` 接入统一 tsconfig，继续复用 W1-4 生成物；`test` 同时跑 `tsc --noEmit` 与 vitest 空测试门禁。
+- 新增 `@mag/client` 骨架包，依赖方向为 `@mag/client -> @mag/protocol`，仅包含 package marker 与 smoke test，未提前实现 W3-2 的 transport/store。
+- 新增 `@mag/ui` 骨架包：React 19 + Tailwind token + shadcn `components.json` + 基础 `Button` primitive + Storybook 配置和 story；组件包不依赖 transport/client/protocol。
+- 新增 `@mag/app-web` Vite 壳：仅依赖 `@mag/ui` + `@mag/client`（以及 React runtime），不直接依赖 `@mag/protocol`；构建产物继续输出到 `ui/apps/web/dist/`，并保留 W2 debug 静态资源目录约定。
+- 文档更新：新增 `ui/README.md`，并在根 `README.md` 补充 frontend install/build/test 与 protocol regeneration 命令；`.gitignore` 忽略 node_modules、dist 产物、coverage、Storybook 输出和 tsbuildinfo 缓存。
+- 验证通过：`npx --yes pnpm@10.14.0 install`、`npx --yes pnpm@10.14.0 format`、`npx --yes pnpm@10.14.0 lint`、`npx --yes pnpm@10.14.0 -r build`、`npx --yes pnpm@10.14.0 -r test`、`npx --yes pnpm@10.14.0 --filter @mag/ui build-storybook`、`cargo fmt --all`、`cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`、`cargo doc --no-deps --workspace`。
 
 ### W3-2 [TODO] `@mag/client`：ITransport + HttpSseTransport + SessionStore
 
