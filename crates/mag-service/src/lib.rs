@@ -154,6 +154,13 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<MessageAttachment>,
     },
+    /// Inject a pivot message into a session's active run.
+    PivotMessage {
+        /// Session receiving the pivot message.
+        session_id: SessionId,
+        /// User-visible pivot text payload.
+        text: String,
+    },
     /// Cancel the active run for a session.
     CancelRun {
         /// Session whose active run should be cancelled.
@@ -172,6 +179,17 @@ pub enum Command {
     ListSources,
     /// Probe local coding-agent binaries and capabilities.
     ProbeLocalAgents,
+    /// Return the current runtime configuration DTO.
+    GetConfig,
+    /// Replace the runtime configuration DTO.
+    UpdateConfig {
+        /// Configuration DTO to validate and apply to the runtime config store.
+        config: ConfigDto,
+    },
+    /// Reload the runtime configuration from its backing source.
+    ReloadConfig,
+    /// Apply the current runtime configuration to live sessions at turn boundaries.
+    ApplyConfig,
 }
 
 /// Events emitted by the transport-neutral engine.
@@ -929,6 +947,13 @@ mod tests {
                 "send_message",
             ),
             (
+                Command::PivotMessage {
+                    session_id: session_id(),
+                    text: "steer this run".to_owned(),
+                },
+                "pivot_message",
+            ),
+            (
                 Command::CancelRun {
                     session_id: session_id(),
                 },
@@ -944,6 +969,15 @@ mod tests {
             ),
             (Command::ListSources, "list_sources"),
             (Command::ProbeLocalAgents, "probe_local_agents"),
+            (Command::GetConfig, "get_config"),
+            (
+                Command::UpdateConfig {
+                    config: ConfigDto::default(),
+                },
+                "update_config",
+            ),
+            (Command::ReloadConfig, "reload_config"),
+            (Command::ApplyConfig, "apply_config"),
         ];
 
         for (command, expected_tag) in cases {

@@ -72,7 +72,7 @@
 
 目标：补齐 web 所需的契约面（只加不改），并打通 Rust→TS 类型生成管线。
 
-### W1-1 [TODO] mag-service：Command 补 pivot/配置变体 + `ServiceError::kind`
+### W1-1 [DONE] mag-service：Command 补 pivot/配置变体 + `ServiceError::kind`
 
 - **上下文**：`docs/WEB.md` §3 P1/P2。M1/M3 加了 trait 方法与 Event 变体，wire `Command` 未同步。
 - **实现要求**：
@@ -85,6 +85,13 @@
   - mag-core Engine 若消费 Command（dispatcher 路径）需同步处理新变体——检查既有 Command 消费点
     并补齐；无消费点则在完成记录说明。
 - **验证条件**：`cargo test -p mag-service`；默认验证序列全过。
+
+完成记录（2026-07-21）：
+
+- `Command` 新增 `pivot_message`、`get_config`、`update_config`、`reload_config`、`apply_config` wire 变体，并补 roundtrip/tag 稳定性测试。
+- `ServiceError::kind()` 返回与 serde tag 一致的 snake_case kind，覆盖全部 7 个错误变体。
+- 已检查 `Command` 消费点：仓内无 `mag_service::Command` dispatcher 消费点；搜索命中均为 `mag-core` 内部 `SessionCommand` 或标准库 `Command`，无需同步处理。
+- 验证通过：`cargo fmt --all`、`cargo test -p mag-service`、`cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --workspace`、`cargo doc --no-deps --workspace`。
 
 ### W1-2 [TODO] `get_session_history` + `HistoryEntry`（决策 D5，Q1 拍板）
 

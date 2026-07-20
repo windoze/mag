@@ -570,6 +570,22 @@ pub enum ServiceError {
     },
 }
 
+impl ServiceError {
+    /// Returns the stable snake_case error kind used by REST error projection.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::SessionNotFound { .. } => "session_not_found",
+            Self::InteractionNotFound { .. } => "interaction_not_found",
+            Self::InvalidInput { .. } => "invalid_input",
+            Self::NotPivotable { .. } => "not_pivotable",
+            Self::Unsupported { .. } => "unsupported",
+            Self::Config { .. } => "config",
+            Self::Backend { .. } => "backend",
+        }
+    }
+}
+
 impl fmt::Display for ServiceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1072,6 +1088,40 @@ mod tests {
                 attachments: Vec::new(),
             },
         );
+    }
+
+    #[test]
+    fn service_error_kind_matches_stable_tags_for_all_variants() {
+        let cases = vec![
+            ServiceError::SessionNotFound { id: session_id() },
+            ServiceError::InteractionNotFound {
+                request_id: RequestId::new(uuid(2)),
+            },
+            ServiceError::InvalidInput {
+                message: "empty message".to_owned(),
+            },
+            ServiceError::NotPivotable {
+                id: session_id(),
+                reason: "no in-progress run".to_owned(),
+            },
+            ServiceError::Unsupported {
+                operation: "pivot_message".to_owned(),
+            },
+            ServiceError::Config {
+                message: "invalid config".to_owned(),
+            },
+            ServiceError::Backend {
+                message: "store unavailable".to_owned(),
+            },
+        ];
+
+        for error in cases {
+            let json = serde_json::to_value(&error).expect("serialize error");
+            assert_eq!(
+                json.get("type"),
+                Some(&Value::String(error.kind().to_owned()))
+            );
+        }
     }
 
     #[test]
