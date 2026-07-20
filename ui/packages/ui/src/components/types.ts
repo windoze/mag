@@ -216,3 +216,19 @@ export interface SidebarSessionView {
   /** Optional provider/model subtitle. */
   readonly subtitle?: string;
 }
+
+/** Source row consumed by `SourcesView`. */
+export interface SourceView {
+  /** Stable source key used by configuration. */
+  readonly id: string;
+  /** Human-readable source name. */
+  readonly name: string;
+  /** Source family label (e.g. `llm_provider`, `local_agent`). */
+  readonly kind: string;
+  /** Whether the source is currently usable. */
+  readonly available: boolean;
+  /** Optional version string reported by the source. */
+  readonly version?: string;
+  /** Capability labels reported by the source. */
+  readonly capabilities: readonly string[];
+}

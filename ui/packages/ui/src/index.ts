@@ -1,5 +1,10 @@
 export { Button, type ButtonProps } from "./components/Button";
 export { Composer, type ComposerMode, type ComposerProps } from "./components/Composer";
+export {
+  ConfigEditor,
+  type ConfigEditorMode,
+  type ConfigEditorProps
+} from "./components/ConfigEditor";
 export { DelegationCard, type DelegationCardProps } from "./components/DelegationCard";
 export {
   DelegateThreadPanel,
@@ -11,6 +16,7 @@ export { InteractionCard, type InteractionCardProps } from "./components/Interac
 export { Markdown, type MarkdownProps } from "./components/Markdown";
 export { OriginBadge, type OriginBadgeProps } from "./components/OriginBadge";
 export { SessionSidebar, type SessionSidebarProps } from "./components/SessionSidebar";
+export { SourcesView, type SourcesViewProps } from "./components/SourcesView";
 export { ThreadView, type ThreadViewProps } from "./components/ThreadView";
 export { ToolCallCard, type ToolCallCardProps } from "./components/ToolCallCard";
 export type {
@@ -32,6 +38,7 @@ export type {
   RunErrorNoticeView,
   SessionStatusView,
   SidebarSessionView,
+  SourceView,
   ThreadItemView,
   ThreadMessageView,
   ToolCallItemView,

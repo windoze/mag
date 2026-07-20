@@ -235,17 +235,73 @@ describe("App", () => {
     await act(async () => rendered.root.unmount());
   });
 
-  it("routes Sources and Config placeholders from the sidebar", async () => {
-    const rendered = await renderApp(
-      <App transport={new ScriptedTransport()} storage={new MemoryStorage()} />
+  it("routes Sources and Config pages from the sidebar", async () => {
+    const transport = new ScriptedTransport();
+    const rendered = await renderApp(<App transport={transport} storage={new MemoryStorage()} />);
+
+    await waitFor(() => rendered.container.textContent?.includes("Inspect README") === true);
+
+    await click(getButton(rendered.container, "Sources"));
+    await waitFor(() => transport.sent.some((command) => command.type === "list_sources"));
+    await waitFor(() => rendered.container.textContent?.includes("Claude Code") === true);
+
+    await click(getButton(rendered.container, "Config"));
+    await waitFor(() => transport.sent.some((command) => command.type === "get_config"));
+    await waitFor(
+      () =>
+        rendered.container.querySelector("textarea")?.value.includes("[providers.anthropic]") ===
+        true
     );
+
+    await act(async () => rendered.root.unmount());
+  });
+
+  it("loads, edits, saves, reloads, and applies the config from the Config page", async () => {
+    const transport = new ScriptedTransport();
+    const rendered = await renderApp(<App transport={transport} storage={new MemoryStorage()} />);
+
+    await waitFor(() => rendered.container.textContent?.includes("Inspect README") === true);
+    await click(getButton(rendered.container, "Config"));
+    await waitFor(
+      () =>
+        rendered.container.querySelector("textarea")?.value.includes("[providers.anthropic]") ===
+        true
+    );
+    expect(transport.sent.map((command) => command.type)).toContain("get_config");
+
+    const textarea = rendered.container.querySelector("textarea") as HTMLTextAreaElement;
+    await change(textarea, '[session]\nrouting = "model_routed"\n');
+    await click(getButton(rendered.container, "Save"));
+    await waitFor(() => transport.sent.some((command) => command.type === "update_config"));
+    expect(transport.sent.find((command) => command.type === "update_config")).toMatchObject({
+      type: "update_config",
+      config: { session: { routing: "model_routed" } }
+    });
+
+    transport.sent.length = 0;
+    await click(getButton(rendered.container, "Reload"));
+    await waitFor(() => transport.sent.some((command) => command.type === "get_config"));
+    expect(transport.sent.map((command) => command.type)).toEqual(["reload_config", "get_config"]);
+
+    await click(getButton(rendered.container, "Apply"));
+    expect(transport.sent.at(-1)).toMatchObject({ type: "apply_config" });
+
+    await act(async () => rendered.root.unmount());
+  });
+
+  it("renders the sources table and probes local agents", async () => {
+    const transport = new ScriptedTransport();
+    const rendered = await renderApp(<App transport={transport} storage={new MemoryStorage()} />);
 
     await waitFor(() => rendered.container.textContent?.includes("Inspect README") === true);
     await click(getButton(rendered.container, "Sources"));
-    expect(rendered.container.textContent).toContain("Sources management lands in W4");
+    await waitFor(() => rendered.container.textContent?.includes("Claude Code") === true);
+    expect(rendered.container.textContent).toContain("unavailable");
 
-    await click(getButton(rendered.container, "Config"));
-    expect(rendered.container.textContent).toContain("The text ConfigEditor lands in W4");
+    await click(getButton(rendered.container, "Probe"));
+    await waitFor(() => transport.sent.some((command) => command.type === "probe_local_agents"));
+    await waitFor(() => rendered.container.textContent?.includes("Gemini CLI") === true);
+    expect(rendered.container.textContent).not.toContain("Claude Code");
 
     await act(async () => rendered.root.unmount());
   });
@@ -287,6 +343,42 @@ class ScriptedTransport implements ITransport {
           : [];
       case "create_session":
         return { id: "session-new", config: command.config };
+      case "get_config":
+        return {
+          providers: {
+            anthropic: { wire: "anthropic", api_key: { env: "ANTHROPIC_API_KEY" } }
+          },
+          session: { routing: "model_routed" }
+        };
+      case "list_sources":
+        return [
+          {
+            id: "claude-code",
+            name: "Claude Code",
+            kind: "local_agent",
+            available: true,
+            version: "1.2.3",
+            capabilities: ["delegate"]
+          },
+          {
+            id: "ollama",
+            name: "Ollama",
+            kind: "local_agent",
+            available: false,
+            capabilities: []
+          }
+        ];
+      case "probe_local_agents":
+        return [
+          {
+            id: "gemini-cli",
+            name: "Gemini CLI",
+            kind: "local_agent",
+            available: true,
+            version: "0.1.0",
+            capabilities: ["delegate"]
+          }
+        ];
       case "send_message":
         return { run_id: "run-fallback" };
       case "pivot_message":

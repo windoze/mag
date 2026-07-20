@@ -33,6 +33,9 @@ import {
   type ShellStorage
 } from "./token";
 
+import { ConfigPage } from "./ConfigPage";
+import { SourcesPage } from "./SourcesPage";
+
 const DEFAULT_SESSION_CONFIG = {
   provider: "openai",
   model: "gpt-5-codex",
@@ -232,18 +235,15 @@ export function App(props: AppProps = {}): React.JSX.Element {
         <StatusMessage error={error} notice={notice} onDismissNotice={() => setNotice(undefined)} />
         <div className="min-h-0 flex-1 overflow-y-auto bg-muted/30">
           {route.page === "sources" ? (
-            <PlaceholderPage
-              actionLabel="Back to chat"
-              description="Sources management lands in W4. This route is wired now so the shell navigation is stable."
-              title="Sources"
-              onAction={() => setRoute({ page: "session", sessionId: activeSessionId })}
+            <SourcesPage
+              sources={snapshot.sources}
+              store={store}
+              onBack={() => setRoute({ page: "session", sessionId: activeSessionId })}
             />
           ) : route.page === "config" ? (
-            <PlaceholderPage
-              actionLabel="Back to chat"
-              description="The text ConfigEditor lands in W4. Token-authenticated routing is already available."
-              title="Config"
-              onAction={() => setRoute({ page: "session", sessionId: activeSessionId })}
+            <ConfigPage
+              store={store}
+              onBack={() => setRoute({ page: "session", sessionId: activeSessionId })}
             />
           ) : (
             <ThreadView
@@ -494,31 +494,6 @@ function StatusMessage({
           </Button>
         </div>
       ) : null}
-    </div>
-  );
-}
-
-function PlaceholderPage({
-  actionLabel,
-  description,
-  onAction,
-  title
-}: {
-  readonly actionLabel: string;
-  readonly description: string;
-  readonly onAction: () => void;
-  readonly title: string;
-}): React.JSX.Element {
-  return (
-    <div className="flex min-h-full items-center justify-center p-6">
-      <section className="max-w-lg rounded-2xl border border-dashed border-border bg-card p-6 text-center shadow-sm">
-        <p className="text-xs font-semibold uppercase tracking-wide text-primary">route ready</p>
-        <h2 className="mt-2 text-2xl font-semibold">{title}</h2>
-        <p className="mt-3 text-sm text-muted-foreground">{description}</p>
-        <Button className="mt-5" type="button" variant="outline" onClick={onAction}>
-          {actionLabel}
-        </Button>
-      </section>
     </div>
   );
 }

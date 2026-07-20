@@ -545,7 +545,7 @@ CI 承载（引入 CI 时列为第一批）；⑥tool 输出为 agent-lib Conten
   零改动（git status 实证），`cargo test --workspace` 与 `cargo doc` 复用 W3-4（`0fe4985`）
   全绿结果，按规则跳过重跑。
 
-### W4-3 [TODO] ConfigEditor（文本形态）+ Sources 页
+### W4-3 [DONE] ConfigEditor（文本形态）+ Sources 页
 
 - **上下文**：`docs/WEB.md` §5.5（Q5 拍板：文本形态先行，图形化以后）。
 - **实现要求**：`ConfigEditor` 组件：`GET /api/config` → TOML 文本展示/编辑（代码编辑器 textarea，
@@ -554,6 +554,32 @@ CI 承载（引入 CI 时列为第一批）；⑥tool 输出为 agent-lib Conten
   表格 + Probe 按钮 + `local_agents_probed` 刷新。
 - **验证条件**：vitest（mock transport 断言 PUT 载荷与按钮行为）；Storybook 新增态；
   `pnpm -r test`/`pnpm -r build` 绿。
+
+完成记录（2026-07-21）：
+
+- `@mag/client` 新增 `config.ts`：`configDtoToToml`（深剥 `undefined`/`null` 后经 `smol-toml`
+  stringify，空 DTO → 空文本）与 `tomlToConfigDto`（空文本 → `{}`，非法 TOML 抛明确 Error）；
+  新增 `smol-toml` 依赖（仅 install 用网，测试离线）。`SessionStore` 新增
+  `getConfigText`/`saveConfigText`（TOML 非法时不发任何命令）/`reloadConfig`/`applyConfig`/
+  `refreshSources`/`probeSources`（probe 返回的新列表直接替换并与 `local_agents_probed`
+  事件幂等）。secret 引用以 `{env=...}`/`{keyring=...}` 内联表原样进出，不物化。
+- `@mag/ui` 新增纯 props+回调组件 `ConfigEditor`（等宽 textarea 编辑、Save/Reload/Apply、
+  Apply 旁 D2 生效时机文案、text/graph mode 插槽——graph 为「后续版本」占位且禁止编辑、
+  `role="alert"` 错误行、busy 禁用）与 `SourcesView`（Name/Kind/Status 徽标/Version/
+  Capabilities 表格、Probe busy 态、空态）；`SourceView` 为 ui 本地视图类型，零 `@mag/*`
+  依赖保持。Storybook 新增 ConfigEditor 五态与 SourcesView 三态。
+- app-web 新增 `ConfigPage.tsx`（进页 `getConfigText` 装载 TOML；Save/Reload（reload 后重新
+  拉取文本）/Apply 接线；解析错误就地显示）与 `SourcesPage.tsx`（进页 `refreshSources`，
+  Probe → `probeSources`），替换 App.tsx 两个 `PlaceholderPage`（占位组件删除），Back 回会话
+  路由；`config_changed` toast 复用 W3-4 既有逻辑。
+- 测试：client 新增 12 例（TOML round-trip/null 剥除/空与非法输入/store 六方法命令与载荷断言）；
+  ui 新增 10 例（编辑回调、三按钮、graph 占位禁编辑、busy 禁用、表格渲染/Probe/空态）；app-web
+  新增 2 例 + 改写 1 例（Config 装载/编辑/保存 PUT 载荷/Reload/Apply；Sources 表格 + Probe）。
+- 验证通过：`pnpm format:write`+`pnpm format`、`pnpm lint`、`pnpm -r test`（protocol 门禁 +
+  client 29 + ui 28 + app-web 7，共 64 全绿）、`pnpm -r build`、`build-storybook`、
+  `cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`。Rust 源码本轮
+  零改动（git status 实证），`cargo test --workspace` 与 `cargo doc` 复用 W3-4（`0fe4985`）
+  全绿结果，按规则跳过重跑。
 
 ### W4-R [TODO] W4 review
 

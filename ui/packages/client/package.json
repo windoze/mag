@@ -14,7 +14,8 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@mag/protocol": "workspace:*"
+    "@mag/protocol": "workspace:*",
+    "smol-toml": "^1.3.1"
   },
   "devDependencies": {
     "typescript": "^5.9.2",

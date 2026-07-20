@@ -1,5 +1,6 @@
 import type {
   Command,
+  ConfigDto,
   DelegationMessageWire,
   DelegationStatusWire,
   DelegationTrace,
@@ -22,6 +23,8 @@ import type {
 } from "@mag/protocol";
 
 import type { ITransport } from "./transport";
+
+import { configDtoToToml, tomlToConfigDto } from "./config";
 
 /** Connection state of the live event stream. */
 export type ConnectionStatus = "idle" | "connecting" | "connected" | "disconnected";
@@ -421,6 +424,48 @@ export class SessionStore {
     this.syncSessionInfos(sessions);
     this.notify();
     return sessions;
+  }
+
+  /** Fetches the runtime config and serializes it as TOML text for the ConfigEditor. */
+  async getConfigText(): Promise<string> {
+    const dto = (await this.transport.send({ type: "get_config" })) as ConfigDto;
+    return configDtoToToml(dto);
+  }
+
+  /** Parses ConfigEditor TOML text and sends it as the new runtime config. */
+  async saveConfigText(text: string): Promise<void> {
+    const config = tomlToConfigDto(text);
+    await this.transport.send({ type: "update_config", config });
+  }
+
+  /** Asks the server to reload the runtime config from its sources. */
+  async reloadConfig(): Promise<void> {
+    await this.transport.send({ type: "reload_config" });
+  }
+
+  /** Asks the server to apply the staged config to running sessions. */
+  async applyConfig(): Promise<void> {
+    await this.transport.send({ type: "apply_config" });
+  }
+
+  /** Sends `list_sources` and replaces the store's source list. */
+  async refreshSources(): Promise<readonly SourceInfo[]> {
+    const sources = (await this.transport.send({ type: "list_sources" })) as SourceInfo[];
+    this.sources = [...sources];
+    this.notify();
+    return sources;
+  }
+
+  /**
+   * Sends `probe_local_agents` and replaces the store's source list with the
+   * fresh result. The server also broadcasts `local_agents_probed`; replacing
+   * here is idempotent with that event.
+   */
+  async probeSources(): Promise<readonly SourceInfo[]> {
+    const sources = (await this.transport.send({ type: "probe_local_agents" })) as SourceInfo[];
+    this.sources = [...sources];
+    this.notify();
+    return sources;
   }
 
   /** Marks a session as open and replaces its thread with authoritative history. */
