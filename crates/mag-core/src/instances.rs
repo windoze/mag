@@ -6,11 +6,14 @@
 //! they are never persisted and never enter the restore path
 //! (`docs/dyn-agents.md` §5.2).
 //!
-//! This module is the state skeleton only; the `agent` / `agent_result` /
-//! `agent_cancel` tool handlers and the instance drive tasks land here in
-//! M3-3/M3-4, and the completion-notification drain is wired into the driver
-//! in M3-6. The registry deliberately holds no session/driver state — those
-//! layers only ever inject parameters (`TODO.md` dependency-boundary rule).
+//! The registry deliberately holds no session/driver state — those layers only
+//! ever inject parameters (`TODO.md` dependency-boundary rule). The `agent`
+//! spawn tool, the local-instance drive task, and the origin interaction
+//! router live in the [`spawn`] submodule (M3-3); `agent_result` /
+//! `agent_cancel` land in M3-4, and the completion-notification drain is wired
+//! into the driver in M3-6.
+
+mod spawn;
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -66,7 +69,11 @@ pub(crate) struct Instance {
     pub id: String,
     /// Name of the definition this instance was spawned from.
     pub agent_type: String,
-    /// Nesting depth (0 = spawned by the root supervisor).
+    /// Nesting depth: `1` for a direct child of the session's root supervisor
+    /// (which is itself depth `0`), matching the wire
+    /// [`Event::AgentInstanceStarted`](mag_service::Event::AgentInstanceStarted)
+    /// field and the interaction-origin attribution of the `agent` tool's
+    /// origin router (M3-3).
     pub depth: u32,
     status: Mutex<InstanceStatus>,
     cancel: CancelHandle,
@@ -108,6 +115,8 @@ impl Instance {
     /// its `Notified` future *before* re-checking [`status`](Self::status),
     /// otherwise a transition landing between the check and the wait is
     /// missed.
+    // Consumed by M3-4's `agent_result`; only tests await it until then.
+    #[allow(dead_code)]
     pub(crate) fn done(&self) -> &Notify {
         &self.done
     }
@@ -155,6 +164,9 @@ struct RegistryInner {
 
 impl AgentInstanceRegistry {
     /// Creates an empty registry.
+    // Constructed by the session wiring in M3-5; only tests build one until
+    // then.
+    #[allow(dead_code)]
     pub(crate) fn new() -> Self {
         Self::default()
     }
@@ -194,6 +206,9 @@ impl AgentInstanceRegistry {
     }
 
     /// Returns all registered instances ordered by id.
+    // Consumed by M3-4's `agent_result`/`agent_cancel` error paths; only tests
+    // call it until then.
+    #[allow(dead_code)]
     pub(crate) fn list(&self) -> Vec<Arc<Instance>> {
         self.inner
             .instances
@@ -230,6 +245,8 @@ impl AgentInstanceRegistry {
     ///
     /// Returns the status after the call, or `None` for an unknown id
     /// (`agent_cancel` then errors with `list()` attached, M3-4).
+    // Consumed by M3-4's `agent_cancel`; only tests call it until then.
+    #[allow(dead_code)]
     pub(crate) fn cancel(&self, id: &str) -> Option<InstanceStatus> {
         let instance = self.get(id)?;
         if instance.transition(InstanceStatus::Cancelled) {
@@ -241,6 +258,8 @@ impl AgentInstanceRegistry {
 
     /// Cancels every still-running instance (session end / supervisor-run
     /// cancel cascade, M3-5). Already-terminal instances are left untouched.
+    // Consumed by the M3-5 cancel cascade; only tests call it until then.
+    #[allow(dead_code)]
     pub(crate) fn cancel_all(&self) {
         let candidates: Vec<Arc<Instance>> = self
             .list()
@@ -256,6 +275,8 @@ impl AgentInstanceRegistry {
     }
 
     /// Drains all pending completion notifications (M3-6 consumer).
+    // Consumed by the M3-6 notification drain; only tests call it until then.
+    #[allow(dead_code)]
     pub(crate) fn drain_notifications(&self) -> Vec<String> {
         self.inner
             .notifications
@@ -309,7 +330,7 @@ mod tests {
 
     fn spawn_instance(registry: &AgentInstanceRegistry, agent_type: &str) -> Arc<Instance> {
         let id = registry.next_id(agent_type);
-        registry.register(Instance::new(id, agent_type.to_owned(), 0))
+        registry.register(Instance::new(id, agent_type.to_owned(), 1))
     }
 
     #[test]
@@ -331,7 +352,7 @@ mod tests {
         let found = registry.get("explorer-1").expect("registered instance");
         assert!(Arc::ptr_eq(&found, &first));
         assert_eq!(found.agent_type, "explorer");
-        assert_eq!(found.depth, 0);
+        assert_eq!(found.depth, 1);
         assert_eq!(found.status(), InstanceStatus::Running);
 
         let listed = registry.list();
@@ -536,7 +557,7 @@ mod tests {
                 let mut ids = Vec::new();
                 for _ in 0..10 {
                     let id = registry.next_id("explorer");
-                    registry.register(Instance::new(id.clone(), "explorer".to_owned(), 0));
+                    registry.register(Instance::new(id.clone(), "explorer".to_owned(), 1));
                     ids.push(id);
                     tokio::task::yield_now().await;
                 }

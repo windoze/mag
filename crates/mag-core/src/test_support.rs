@@ -6,6 +6,7 @@
 
 use std::{
     collections::VecDeque,
+    fmt,
     sync::{Arc, Mutex},
 };
 
@@ -14,7 +15,8 @@ use agent_lib::{
         ANTHROPIC_DEFAULT_CAPABILITY, Capability, ChatRequest, ClientError, LlmClient, Response,
     },
     model::{
-        message::Role,
+        content::ContentBlock,
+        message::{Message, Role},
         normalized::{Normalized, StopReason},
         usage::Usage,
     },
@@ -93,9 +95,18 @@ impl StreamGate {
 }
 
 /// Offline scripted [`LlmClient`] fixture.
+///
+/// Scripts are consumed FIFO from one shared queue by default. When several
+/// agents share the client — a supervisor and the child instances it spawns
+/// through the `agent` tool (`docs/dyn-agents.md` §5) — their requests
+/// interleave in an order the test does not control, so a flat FIFO queue is
+/// not expressible. [`FakeLlmClient::scripted_routes`] instead matches each
+/// request to a [`RequestRoute`] by content (system prompt marker, user text),
+/// keeping per-agent script queues deterministic.
 #[derive(Debug)]
 pub(crate) struct FakeLlmClient {
     scripts: Mutex<VecDeque<StreamScript>>,
+    routes: Mutex<Vec<RequestRoute>>,
     chat_requests: Mutex<Vec<ChatRequest>>,
     stream_requests: Mutex<Vec<ChatRequest>>,
 }
@@ -113,6 +124,18 @@ impl FakeLlmClient {
     pub(crate) fn scripted_streams(scripts: Vec<StreamScript>) -> Arc<Self> {
         Arc::new(Self {
             scripts: Mutex::new(scripts.into()),
+            routes: Mutex::new(Vec::new()),
+            chat_requests: Mutex::new(Vec::new()),
+            stream_requests: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Creates a fake client that routes every request to a script queue by
+    /// content (see [`RequestRoute`]).
+    pub(crate) fn scripted_routes(routes: Vec<RequestRoute>) -> Arc<Self> {
+        Arc::new(Self {
+            scripts: Mutex::new(VecDeque::new()),
+            routes: Mutex::new(routes),
             chat_requests: Mutex::new(Vec::new()),
             stream_requests: Mutex::new(Vec::new()),
         })
@@ -139,13 +162,110 @@ impl FakeLlmClient {
             .clone()
     }
 
-    fn pop_script(&self) -> Result<StreamScript, ClientError> {
+    fn pop_script(&self, request: &ChatRequest) -> Result<StreamScript, ClientError> {
+        let mut routes = self.routes.lock().expect("fake llm routes lock");
+        if !routes.is_empty() {
+            for route in routes.iter_mut() {
+                if (route.matches)(request) {
+                    return route.scripts.pop_front().ok_or_else(|| {
+                        ClientError::Other("fake LLM route scripts exhausted".to_owned())
+                    });
+                }
+            }
+            return Err(ClientError::Other(
+                "no fake LLM route matched the request".to_owned(),
+            ));
+        }
+        drop(routes);
         self.scripts
             .lock()
             .expect("fake llm script lock")
             .pop_front()
             .ok_or_else(|| ClientError::Other("fake LLM script exhausted".to_owned()))
     }
+}
+
+/// A content-keyed script route of a [`FakeLlmClient`].
+///
+/// Routes are evaluated in order; the first route whose matcher accepts the
+/// request supplies its next script. This lets one fake client interleave a
+/// supervisor's and its spawned child instances' requests deterministically:
+/// route the children by their layered system prompt (or opening task brief)
+/// and keep a final [`RequestRoute::any`] catch-all for the supervisor.
+pub(crate) struct RequestRoute {
+    matches: Box<dyn Fn(&ChatRequest) -> bool + Send + Sync>,
+    scripts: VecDeque<StreamScript>,
+}
+
+impl fmt::Debug for RequestRoute {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RequestRoute")
+            .field("pending_scripts", &self.scripts.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl RequestRoute {
+    /// Creates a route from an arbitrary request predicate.
+    pub(crate) fn new(
+        matches: impl Fn(&ChatRequest) -> bool + Send + Sync + 'static,
+        scripts: Vec<StreamScript>,
+    ) -> Self {
+        Self {
+            matches: Box::new(matches),
+            scripts: scripts.into(),
+        }
+    }
+
+    /// A catch-all route; useful as the last route for the supervisor's own
+    /// requests once the children are routed by content.
+    pub(crate) fn any(scripts: Vec<StreamScript>) -> Self {
+        Self::new(|_| true, scripts)
+    }
+
+    /// Routes requests whose system prompt contains `marker` — the subagent
+    /// skeleton distinctly marks a spawned child's requests
+    /// (`docs/dyn-agents.md` §4).
+    pub(crate) fn system_contains(marker: &str, scripts: Vec<StreamScript>) -> Self {
+        let marker = marker.to_owned();
+        Self::new(
+            move |request| {
+                request
+                    .system
+                    .as_deref()
+                    .is_some_and(|system| system.contains(&marker))
+            },
+            scripts,
+        )
+    }
+
+    /// Routes requests carrying any user message whose text contains
+    /// `marker` — a spawned child's opening user message is its task brief
+    /// (`docs/dyn-agents.md` §5.1).
+    pub(crate) fn user_text_contains(marker: &str, scripts: Vec<StreamScript>) -> Self {
+        let marker = marker.to_owned();
+        Self::new(
+            move |request| {
+                request.messages.iter().any(|message| {
+                    message.role == Role::User && message_text(message).contains(&marker)
+                })
+            },
+            scripts,
+        )
+    }
+}
+
+/// Concatenates the text blocks of one message (for [`RequestRoute`] matchers).
+fn message_text(message: &Message) -> String {
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 #[async_trait]
@@ -158,8 +278,8 @@ impl LlmClient for FakeLlmClient {
         self.chat_requests
             .lock()
             .expect("chat requests lock")
-            .push(request);
-        let events = self.pop_script()?.events();
+            .push(request.clone());
+        let events = self.pop_script(&request)?.events();
         collect(stream::iter(events.into_iter().map(Ok::<_, ClientError>)))
             .await
             .map_err(collect_error_to_client_error)
@@ -173,8 +293,8 @@ impl LlmClient for FakeLlmClient {
         self.stream_requests
             .lock()
             .expect("stream requests lock")
-            .push(request);
-        match self.pop_script()? {
+            .push(request.clone());
+        match self.pop_script(&request)? {
             StreamScript::Complete(events) => {
                 Ok(stream::iter(events.into_iter().map(Ok::<_, ClientError>)).boxed())
             }
@@ -325,15 +445,16 @@ fn collect_error_to_client_error(error: CollectError<ClientError>) -> ClientErro
 #[cfg(test)]
 mod tests {
     use agent_lib::{
-        client::{ChatRequest, LlmClient},
+        client::{ChatRequest, ClientError, LlmClient},
         model::{
             content::ContentBlock,
+            message::{Message, Role},
             normalized::{Normalized, StopReason},
         },
     };
     use serde_json::{Map, json};
 
-    use super::FakeLlmClient;
+    use super::{FakeLlmClient, RequestRoute, StreamScript, text_stream_with_usage};
 
     fn request() -> ChatRequest {
         ChatRequest {
@@ -369,5 +490,87 @@ mod tests {
         );
         assert_eq!(client.chat_requests().len(), 1);
         assert!(client.stream_requests().is_empty());
+    }
+
+    fn routed_client() -> std::sync::Arc<FakeLlmClient> {
+        FakeLlmClient::scripted_routes(vec![
+            RequestRoute::system_contains(
+                "SUBAGENT",
+                vec![StreamScript::Complete(text_stream_with_usage(
+                    &["child"],
+                    Default::default(),
+                ))],
+            ),
+            RequestRoute::user_text_contains(
+                "brief",
+                vec![StreamScript::Complete(text_stream_with_usage(
+                    &["briefed"],
+                    Default::default(),
+                ))],
+            ),
+            RequestRoute::any(vec![StreamScript::Complete(text_stream_with_usage(
+                &["supervisor"],
+                Default::default(),
+            ))]),
+        ])
+    }
+
+    fn text_of(response: &agent_lib::client::Response) -> &str {
+        match &response.message.content[0] {
+            ContentBlock::Text { text, .. } => text,
+            other => panic!("expected a text block, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn routes_match_by_system_marker_then_user_text_then_fallback() {
+        let client = routed_client();
+
+        let mut child_request = request();
+        child_request.system = Some("prefix SUBAGENT suffix".to_owned());
+        let response = client.chat(child_request).await.expect("child response");
+        assert_eq!(text_of(&response), "child");
+
+        let mut brief_request = request();
+        brief_request.messages.push(Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "the brief".to_owned(),
+                extra: Map::new(),
+            }],
+        });
+        let response = client.chat(brief_request).await.expect("brief response");
+        assert_eq!(text_of(&response), "briefed");
+
+        let response = client.chat(request()).await.expect("fallback response");
+        assert_eq!(text_of(&response), "supervisor");
+    }
+
+    #[tokio::test]
+    async fn exhausted_route_and_unmatched_request_error() {
+        let client = FakeLlmClient::scripted_routes(vec![RequestRoute::system_contains(
+            "SUBAGENT",
+            Vec::new(),
+        )]);
+
+        let mut child_request = request();
+        child_request.system = Some("SUBAGENT".to_owned());
+        let error = client
+            .chat(child_request)
+            .await
+            .expect_err("an empty route queue errors");
+        assert!(
+            matches!(&error, ClientError::Other(message) if message.contains("exhausted")),
+            "unexpected error: {error}"
+        );
+
+        let error = client
+            .chat(request())
+            .await
+            .expect_err("no route matches a request without the marker");
+        assert!(
+            matches!(&error, ClientError::Other(message) if message.contains("no fake LLM route")),
+            "unexpected error: {error}"
+        );
     }
 }

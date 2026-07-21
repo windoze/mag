@@ -263,8 +263,9 @@ impl SessionDriver {
         binding: &SessionBinding,
         overrides: &ApprovalOverrides,
     ) -> Result<Self, FacadeError> {
-        let user_interaction = Arc::new(IpcUserInteractionBridge::new(Arc::clone(&approval)))
-            as Arc<dyn UserInteractionBridge>;
+        let user_interaction = Arc::new(IpcUserInteractionBridge::new(
+            approval.clone() as Arc<dyn InteractionHandler>
+        )) as Arc<dyn UserInteractionBridge>;
         let (facade_tools, policy) = tool_surface(&tools, binding, overrides, user_interaction);
         let mut builder = Agent::builder()
             .client(client)
@@ -367,8 +368,9 @@ impl SessionDriver {
         binding: &SessionBinding,
         overrides: &ApprovalOverrides,
     ) -> Result<Self, FacadeError> {
-        let user_interaction = Arc::new(IpcUserInteractionBridge::new(Arc::clone(&approval)))
-            as Arc<dyn UserInteractionBridge>;
+        let user_interaction = Arc::new(IpcUserInteractionBridge::new(
+            approval.clone() as Arc<dyn InteractionHandler>
+        )) as Arc<dyn UserInteractionBridge>;
         let (facade_tools, policy) = tool_surface(&tools, binding, overrides, user_interaction);
         let mut builder = Agent::restore()
             .snapshot(snapshot)
@@ -1031,24 +1033,25 @@ fn map_wire_event(
 ///
 /// Assembly order:
 ///
-/// 1. The whole-agent default tier comes from `overrides` (the `[approval]`
-///    section; `allow` matches agent-lib's own default).
-/// 2. When `binding` constrains the tool surface (the bound `agents.<name>`
-///    entry's enabled tool list), only those plugins are projected; a bound
-///    name with no registered plugin is warned about and skipped.
-/// 3. Each projected plugin declaring a [`permission`](ToolPlugin::permission)
-///    is gated behind [`ApprovalPolicy::ask_tool`] so it pauses through the
-///    injected [`IpcApproval`](crate::engine::approval::IpcApproval), while a
+/// 1. The plugins are projected through [`project_tool_plugins`] (shared with
+///    the instance spawn path, `docs/dyn-agents.md` §7): the whole-agent
+///    default tier comes from `overrides` (the `[approval]` section; `allow`
+///    matches agent-lib's own default), the bound `agents.<name>` entry's
+///    enabled tool list narrows the projection when set, and each projected
+///    plugin declaring a [`permission`](ToolPlugin::permission) is gated behind
+///    [`ApprovalPolicy::ask_tool`] so it pauses through the injected
+///    [`IpcApproval`](crate::engine::approval::IpcApproval), while a
 ///    permission-free plugin stays on the policy default tier (`docs/DESIGN.md`
 ///    §3.2/§3.3). This includes read-only tools and `ask_user`, whose own
 ///    interaction is emitted by its handler rather than by the approval policy.
-/// 4. Every projected plugin receives the session's user-interaction bridge;
+///    Every projected plugin receives the session's user-interaction bridge;
 ///    `ask_user` consumes it to emit `Question` / `Choice` through the same
-///    `IpcApproval` path (`docs/CLI.md` §5 P6 / D6), while other tools ignore it.
-/// 5. Every registered local or external delegate start tool (`ask_<name>`) is
+///    `IpcApproval` path (`docs/CLI.md` §5 P6 / D6), while other tools ignore
+///    it.
+/// 2. Every registered local or external delegate start tool (`ask_<name>`) is
 ///    made an approval point by default (`docs/CLI.md` §5 P7 / TODO M4-3), so
 ///    starting a delegation goes through the root session's `IpcApproval`.
-/// 6. `overrides`' per-tool tiers (`[tools.<name>].approval`) replace the
+/// 3. `overrides`' per-tool tiers (`[tools.<name>].approval`) replace the
 ///    derived tier for their tool, including explicit `ask_<name>` allow/deny
 ///    overrides.
 ///
@@ -1064,10 +1067,43 @@ fn tool_surface(
     overrides: &ApprovalOverrides,
     user_interaction: Arc<dyn UserInteractionBridge>,
 ) -> (Vec<Tool>, ApprovalPolicy) {
-    let mut policy = base_policy(overrides.default_tier());
+    let (facade_tools, policy) = project_tool_plugins(
+        tools,
+        binding.tools(),
+        overrides.default_tier(),
+        user_interaction,
+    );
+    let policy = apply_delegate_start_tiers(policy, binding);
+    let policy = apply_per_tool_tiers(policy, overrides);
+    (facade_tools, policy)
+}
+
+/// Projects registry plugins into facade tools and their base approval policy,
+/// shared by the supervisor's [`tool_surface`] and the dynamic-instance spawn
+/// path (`docs/dyn-agents.md` §7, TODO M3-3).
+///
+/// - `allowed` narrows the projection to the named plugins (the supervisor's
+///   bound `agents.<name>` tool list, or an agent definition's `tools`
+///   allowlist); `None` projects every registered plugin. A named tool with no
+///   registered plugin is warned about and skipped.
+/// - The policy starts from the `default_tier` whole-agent tier and gates each
+///   projected plugin declaring a [`permission`](ToolPlugin::permission)
+///   behind `ask`.
+///
+/// Per-tool `[tools.<name>]` tiers are deliberately **not** applied here:
+/// callers layer them on after any further derived tiers (the supervisor
+/// applies delegate-start tiers first so an explicit `[tools.ask_<name>]`
+/// entry keeps the final say; the instance path applies them directly).
+pub(crate) fn project_tool_plugins(
+    tools: &ToolRegistry,
+    allowed: Option<&[String]>,
+    default_tier: ApprovalPolicyKind,
+    user_interaction: Arc<dyn UserInteractionBridge>,
+) -> (Vec<Tool>, ApprovalPolicy) {
+    let mut policy = base_policy(default_tier);
     let mut facade_tools = Vec::new();
     for plugin in tools.plugins() {
-        if let Some(allowed) = binding.tools()
+        if let Some(allowed) = allowed
             && !allowed.iter().any(|name| name == plugin.name())
         {
             continue;
@@ -1080,18 +1116,16 @@ fn tool_surface(
             Arc::clone(&user_interaction),
         ));
     }
-    if let Some(allowed) = binding.tools() {
+    if let Some(allowed) = allowed {
         for name in allowed {
             if !tools.plugins().iter().any(|p| p.name() == name) {
                 tracing::warn!(
                     tool = name.as_str(),
-                    "bound agent entry names a tool not present in the tool registry; skipped"
+                    "tool surface names a tool not present in the tool registry; skipped"
                 );
             }
         }
     }
-    policy = apply_delegate_start_tiers(policy, binding);
-    policy = apply_per_tool_tiers(policy, overrides);
     (facade_tools, policy)
 }
 
@@ -1263,8 +1297,9 @@ fn delegate_start_tool_name(name: &str) -> String {
 }
 
 /// Applies the configured `[tools.<name>].approval` tiers on top of `policy`
-/// (shared by the main agent's [`tool_surface`] and each delegate worker).
-fn apply_per_tool_tiers(
+/// (shared by the main agent's [`tool_surface`], each delegate worker, and the
+/// dynamic-instance spawn path of `docs/dyn-agents.md` §7).
+pub(crate) fn apply_per_tool_tiers(
     mut policy: ApprovalPolicy,
     overrides: &ApprovalOverrides,
 ) -> ApprovalPolicy {
@@ -1294,21 +1329,24 @@ fn base_policy(tier: ApprovalPolicyKind) -> ApprovalPolicy {
 
 /// User-interaction bridge consumed by the `ask_user` tool (`docs/CLI.md` §5 P6).
 ///
-/// The bridge deliberately reuses the session's [`IpcApproval`] instance: the
-/// same pending map, `RequestId` minting, origin handling, and
-/// `respond_interaction` wake-up path answer approvals, permissions, questions,
-/// and choices. A tool call supplies only agent-lib's [`ToolContext`], so this
-/// bridge reconstructs the minimal [`RunContext`] needed by the
-/// [`InteractionHandler`] using the tool call's run id, cancellation token, and a
-/// trace root derived from the tool call id.
-struct IpcUserInteractionBridge {
-    approval: Arc<IpcApproval>,
+/// The bridge deliberately reuses the session's interaction-answer path: the
+/// supervisor's bridge wraps its [`IpcApproval`] instance (the same pending
+/// map, `RequestId` minting, origin handling, and `respond_interaction`
+/// wake-up path answer approvals, permissions, questions, and choices), while
+/// a spawned agent instance's bridge wraps its origin router so the child's
+/// `ask_user` bubbles to the root session with the instance's attribution
+/// (`docs/dyn-agents.md` §4, M3-3). A tool call supplies only agent-lib's
+/// [`ToolContext`], so this bridge reconstructs the minimal [`RunContext`]
+/// needed by the [`InteractionHandler`] using the tool call's run id,
+/// cancellation token, and a trace root derived from the tool call id.
+pub(crate) struct IpcUserInteractionBridge {
+    handler: Arc<dyn InteractionHandler>,
 }
 
 impl IpcUserInteractionBridge {
-    /// Creates a bridge over one session's approval handler.
-    fn new(approval: Arc<IpcApproval>) -> Self {
-        Self { approval }
+    /// Creates a bridge over the handler that answers the interaction.
+    pub(crate) fn new(handler: Arc<dyn InteractionHandler>) -> Self {
+        Self { handler }
     }
 }
 
@@ -1337,7 +1375,7 @@ impl UserInteractionBridge for IpcUserInteractionBridge {
             ctx.cancel,
         );
 
-        match self.approval.fulfill(&interaction, &run_context).await {
+        match self.handler.fulfill(&interaction, &run_context).await {
             RequirementResult::Interaction(InteractionResponse::Answer(text)) => {
                 if request.options.is_some() {
                     Err(UserInteractionError::new(

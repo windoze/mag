@@ -617,7 +617,7 @@ register（`tokio::test` 多 task）。门禁全绿。
      共享句柄），调用流程 `next_id` → `Instance::new` → `register`，与 M3-3
      "register 后 spawn_local"的顺序一致。
 
-### M3-3 [TODO] mag-core：`agent` spawn 工具 + 实例驱动任务 + origin 路由 + 分层 prompt
+### M3-3 [DONE] mag-core：`agent` spawn 工具 + 实例驱动任务 + origin 路由 + 分层 prompt
 
 **目标**：实现 `agent` 工具（异步 spawn，立即返回 `{id, status}`）与 local 实例的完整驱动。
 这是本计划最核心的任务。
@@ -679,6 +679,114 @@ register（`tokio::test` 多 task）。门禁全绿。
   请求内容路由脚本的能力——允许作为本任务的配套改动）；断言 registry 终态、EventBus 收到
   Started/Finished、`agent` 工具对未知类型/超深的同步报错。
 - 门禁序列全绿。
+
+**完成记录**（2026-07-22）：
+
+- 改动：
+  - `crates/mag-core/src/instances/spawn.rs`（新，约 1300 行含测试）：`InstanceSpawnContext`
+    （Clone + 手写 Debug；registry、definitions、`Arc<dyn LlmClient>`、`supervisor_model:
+    ModelRef`、`Arc<ToolRegistry>`、`ApprovalOverrides`、`Arc<IpcApproval>`、EventBus、
+    session_id、`worktree`、depth；`child_context()` 以 depth+1 派生 child 面 ctx）；
+    `SUBAGENT_SKELETON`（§4：角色=supervisor 子代理、开场为任务简报、预算内自主完成、
+    审批经 origin 冒泡不与终端用户直接交互、**最后一条消息是给 supervisor 的报告**——
+    结论/改动/`path:line` 引用/遗留）+ `layered_system_prompt`（空 body 只用骨架）；
+    `MAX_INSTANCE_DEPTH = 8`（沿用 agent-lib `DEFAULT_MAX_DELEGATION_DEPTH` 语义：
+    深度为 8 的 spawner 被拒，最深实例 depth=8）；`DEFAULT_INSTANCE_MAX_STEPS = 16`；
+    `AGENT_TOOL_NAME = "agent"`；`agent_tools(ctx) -> Vec<Tool>`（M3-4 在此追加
+    `agent_result`/`agent_cancel`，child 面经同一函数预留）；`agent` 工具
+    （`Tool::function_with_schema`，description 内嵌 `describe_for_tool()`；schema
+    `{type?, task, description?}`；handler 同步段：未知类型报错附可用列表、depth >= 8
+    报错、`kind: acp` 报错待 M4、register + 发 `AgentInstanceStarted` +
+    `tokio::task::spawn_local` 驱动任务，立即返回 `{"id", "status":"running"}`）；
+    `OriginRouter`（`agent::InteractionHandler`：`with_origin(instance_id, depth)` +
+    `tokio::select!` cancel 包装，范式照抄 `DelegationInteractionRouter`；
+    cancelled 回退 `cancelled_interaction_result` 本地复刻——agent-lib 的对应函数
+    crate-private）；驱动任务 `drive_instance`/`drive_local`（child facade Agent：shared
+    client clone、model = def.model 或 supervisor、max_tokens 对齐 supervisor、
+    max_steps = def 或 16、child 工具面 = 投影 ∩ def.tools + `agent` 自身、审批 =
+    supervisor 策略投影 + per-tool tiers、interaction_handler = OriginRouter、child 的
+    `ask_user` 桥也经 OriginRouter 冒泡；`run_full_with_cancel(task,
+    instance.cancel_handle())`；报告 = `RunOutput.reply.text()`，即最后一个 assistant
+    文本——语义对照 agent-lib `final_turn_summary`，`run_full` 内部正是用它组装）；
+    终态 `registry.complete` 后**回读**实例权威状态发 `AgentInstanceFinished`
+    （cancel 竞态胜出时发 Cancelled，不覆盖）。
+  - `crates/mag-core/src/driver.rs`：`tool_surface` 的插件投影段抽出为
+    `pub(crate) fn project_tool_plugins`（过滤 + permission ask tiers；per-tool tiers
+    与 delegate start tiers 仍由 `tool_surface` 按原序叠加——**优先级逐字未动**：
+    delegate tiers 先、per-tool 后），供实例路径复用（M3-5 第 2 点的"抽共用函数"提前
+    落地）；`apply_per_tool_tiers` 提 pub(crate)；`IpcUserInteractionBridge` 提
+    pub(crate) 并从 `Arc<IpcApproval>` 泛化为 `Arc<dyn InteractionHandler>`（supervisor
+    仍传 IpcApproval，child 传 OriginRouter）。
+  - `crates/mag-core/src/instances.rs`：`mod spawn;`；`Instance.depth` 语义修正为
+    **1-based**（direct child = 1，见偏差 1）；模块文档更新。
+  - `crates/mag-core/src/lib.rs`：移除模块级 `#[allow(dead_code)]`（registry 核心 API
+    已被 spawn 真实消费）；少数 M3-4/5/6 才消费的 API（`Instance::done`、
+    `AgentInstanceRegistry::{new, list, cancel, cancel_all, drain_notifications}`）与
+    M3-5 接线入口 `agent_tools` 暂时挂**条目级** allow 并附注释。
+  - `crates/mag-core/src/test_support.rs`（配套改动）：`FakeLlmClient` 新增
+    `scripted_routes(Vec<RequestRoute>)`——按请求内容路由脚本（`RequestRoute::new` 任意
+    谓词 / `system_contains`（child 的骨架 system prompt 特征）/ `user_text_contains`
+    （child 开场任务简报）/ `any`（supervisor 兜底），顺序匹配、每路由独立 FIFO、未匹配
+    或路由耗尽报错）；既有 FIFO 行为零变化。
+- system prompt 设置方式：facade `AgentBuilder` **有** `.system()`（agent-lib
+  `src/facade/agent/builder.rs:182`），直接用于组装好的两层 prompt，未走 reconfigure。
+- 测试（`spawn.rs` 模块内 12 个 + test_support 2 个新路由用例，全离线，聚焦
+  `cargo test -p mag-core instances::` 21 项全绿；每个测试手工装配 supervisor facade
+  Agent + `agent` 工具，驱动在 current_thread runtime + `LocalSet` 内，!Send 纪律与
+  session actor 一致）：
+  - `spawn_returns_running_immediately_and_completes_with_report`——立即返回
+    `{"id":"general-purpose-1","status":"running"}`（从 supervisor 第二次请求的 tool
+    result 断言）、registry Completed（报告文本正确）、EventBus Started→Finished 顺序与
+    全字段（session id、depth=1、description）、child 请求断言（system=骨架+body 两层、
+    开场 user message=task、model/max_tokens 与 supervisor 对齐）；
+  - `unknown_agent_type_errors_with_available_list`（附可用列表、无实例无事件）、
+    `missing_or_invalid_arguments_error`、`depth_limit_errors_synchronously`（ctx
+    depth=8 直接构造）；
+  - `child_approval_bubbles_to_root_with_origin_and_resumes`——child 内 gated `shell`
+    暂停 → root 收 `InteractionRequested`（origin.delegate=实例 id、depth=1、非 root），
+    respond 后 child 续跑完成，且 shell 结果确实进入 child 后续请求（对照
+    `engine/approval.rs:1248` 旧测试语义）；
+  - `cancel_parked_instance_marks_it_cancelled`——审批暂停中 `registry.cancel`：句柄
+    触发、终态 Cancelled、Finished(Cancelled)、通知恰好一条（OriginRouter cancel 包装
+    生效）；
+  - `child_run_failure_marks_instance_failed`（路由耗尽 → Failed + Finished error 透传）；
+  - `child_inherits_full_surface_when_tools_unset`（None=全量+agent）、
+    `child_surface_intersects_definition_tools`（explorer 只读子集+agent）、
+    `child_surface_skips_unknown_definition_tools`（tempdir 定义 `tools: read_file,
+    ghost` → ghost 跳过）；
+  - `agent_tool_description_enumerates_definitions_and_requires_task`、
+    `layered_prompt_combines_skeleton_and_body`；
+  - test_support：`routes_match_by_system_marker_then_user_text_then_fallback`、
+    `exhausted_route_and_unmatched_request_error`。
+- 门禁结果：`cargo fmt --all -- --check` ✅；聚焦测试（instances 21、test_support 3、
+  driver 16）✅；`cargo clippy --all-targets -- -D warnings` ✅（0 warning）；
+  `cargo test --workspace` ✅（全套件 0 失败）；`cargo doc --no-deps --workspace` ✅
+  （mag-config 1 个既有 rustdoc warning，同 M3-1/M3-2 记录，与本任务无关）。
+- 偏差（均为实现形态，无语义偏差）：
+  1. `Instance.depth` 从 M3-2 注释的"0 = root supervisor 派生"修正为 **1-based**
+     （direct child = 1）：wire `Event::AgentInstanceStarted.depth` 文档（M3-1 已发布
+     的契约）与旧委派 origin depth 语义（`engine/approval.rs:1248` 测试 depth=1）
+     均为 1-based，统一避免两处 off-by-one；`InstanceSpawnContext.depth` 是 **spawner**
+     的深度（root=0），实例 depth = spawner+1，深度检查 `spawner >= 8` 与 agent-lib
+     `SubagentDepthExceeded` 语义逐字对齐。
+  2. `InstanceSpawnContext` 增加任务单字段表未列的 `worktree: WorktreeRef`（mag-tools
+     经 `ToolContext.worktree` 解析相对路径，child 必须拿到 session cwd，属"工具投影
+     所需件"）与 `session_id`（事件首字段所需，M3-1 偏差记录已预告"发布点持有 session
+     上下文"）。
+  3. `OriginRouter.parent` 类型取 `Arc<dyn InteractionHandler>`（任务单写
+     `Arc<IpcApproval>`）：照抄 `DelegationInteractionRouter` 范式，M4 external 路径
+     以 `parent_interaction: Option<Arc<dyn InteractionHandler>>` 复用同一实现。
+  4. M3-5 第 2 点的"抽共用函数"提前落地（`project_tool_plugins`）：child 工具面本任务
+     就要用，避免复制投影逻辑；`tool_surface` 的 tier 叠加顺序（delegate start tiers →
+     per-tool tiers）逐字保持。
+  5. lib.rs 模块级 allow 按任务单移除；但 `agent` 工具接进 `SessionDriver` 工具面是
+     M3-5 的事，故 `agent_tools` 与 M3-4/5/6 专用 API 挂条目级 `#[allow(dead_code)]`
+     并附注释（与 M3-2 同一手法、粒度更细）。
+  6. Cancelled 终态的 `AgentInstanceFinished` 事件 `report`/`error` 均为 `None`（wire
+     文档称 error 是"failure or cancellation detail"，取消细节由 status 自身充分表达）。
+  7. supervisor 面与 child 面的交集过滤：本任务 ctx 只持 registry 全量（`def.tools` ∩
+     session 注册表）；session binding 级的 supervisor 面收窄（`agents.<name>.tools`）
+     若要再交一层，M3-5 接线时给 ctx 加一个 supervisor 面过滤字段即可（在此记录备查）。
 
 ### M3-4 [TODO] mag-core：`agent_result` 与 `agent_cancel` 工具
 
