@@ -1542,6 +1542,26 @@ enabled = false
     }
 
     #[test]
+    fn toml_projection_out_of_range_max_steps_is_ignored() {
+        // `ResolvedAgent.budget.max_steps` is a `u64` but the definition model
+        // is `u32`: an out-of-range override warns and falls back to unset
+        // instead of silently truncating.
+        let dto = ConfigDto::parse_str("[agents.huge]\nbudget = { max_steps = 5000000000 }\n")
+            .expect("parse toml");
+        let snapshot = ConfigSnapshot::resolve(&dto, 1).expect("resolve toml");
+        let registry = AgentDefinitionRegistry::from_toml_snapshot(&snapshot, "default");
+        let huge = registry.get("huge").expect("huge");
+        assert_eq!(
+            huge.kind,
+            AgentKindDef::Local {
+                model: None,
+                tools: None,
+                max_steps: None,
+            }
+        );
+    }
+
+    #[test]
     fn toml_projection_skips_external_without_command() {
         let dto =
             ConfigDto::parse_str("[external_agents.broken]\nkind = \"acp\"\n").expect("parse toml");

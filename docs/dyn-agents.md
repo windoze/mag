@@ -105,6 +105,7 @@ env:
 | `kind` | 否 | `local`（缺省）或 `acp` |
 | `tools` | 否 | 仅 local。逗号分隔；**缺省 = 继承 supervisor 工具面**；显式给出时与 supervisor 工具面**取交集**（防提权，等价 Codex 的 sandbox 约束） |
 | `model` | 否 | 仅 local。缺省继承 supervisor 的 model；受 M4-R 限制只能选同 provider 的 model |
+| `max_steps` | 否 | 仅 local。步数预算上限；缺省用运行时默认 |
 | `command` / `env` | external 必选 / 否 | 仅 `kind: acp` |
 
 ### 3.2 定义来源与优先级

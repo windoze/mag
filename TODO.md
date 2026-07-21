@@ -385,12 +385,64 @@ markdown 定义文件解析器。
      序再加载，消除 read_dir 的平台序不确定性）；TOML 层 `[agents]` 与
      `[external_agents]` 同名时 external 胜 + warn。
 
-### M2-R [TODO] M2 review：定义模型与加载
+### M2-R [DONE] M2 review：定义模型与加载
 
 **内容**：review M2 diff——模型与设计 §3 的字段表逐项核对；优先级顺序；错误路径；serde_yml
 依赖引入是否最小（无传递依赖爆炸，`cargo tree -p mag-config` 检查）；`from_toml_snapshot` 与
 assembly 原逻辑语义等价（对照 `assembly.rs:593-626`）。
 **验证**：门禁序列全绿；问题修复并附完成记录。
+
+**完成记录**（2026-07-22）：review 范围 `git diff 90b0762..HEAD`（5 文件，+1664/-3），逐项
+结论如下；发现两处小问题，已最小修复随本 review 提交。
+
+- **检查单 1（字段表与优先级）**：`name`（缺省取 stem）/`description`（必填）/`kind`
+  （local 缺省/acp）/`tools`（仅 local，列表或逗号分隔）/`model`（仅 local）/`command`/`env`
+  （仅 acp）与 §3.1 字段表逐项一致。**发现**：`max_steps` 在 M2-1 任务规格与实现中存在但
+  §3.1 字段表缺行——已补设计文档表行（`仅 local。步数预算上限；缺省用运行时默认`）。
+  优先级 `Builtin < User < Project < Toml` 与 §3.2 一致：`DefinitionSource` 声明序 =
+  优先级且派生 `Ord`，`merge` 经 `BTreeMap::extend` 实现 over 覆盖 base，
+  `four_source_merge_priority_overrides_by_name` 四链逐级断言。
+- **检查单 2（错误路径）**：description 缺失/置空/显式 null → `MissingField`；未知字段 →
+  `UnknownField`（附已知字段清单）；frontmatter 缺失/未闭合 → `MissingFrontmatter`/
+  `UnterminatedFrontmatter`；kind 错配字段（local 上的 `command`/`env`、acp 上的
+  `tools`/`model`/`max_steps`）→ `Validation`——与字段表"仅 local"/"仅 `kind: acp`"
+  作用域及本 crate "bad config is never silent" 原则一致；空 `command: []` 视同缺失
+  （argv 至少需可执行文件）。错误信息均带 file stem + 字段名 + 期望/实际形态，可用性好。
+- **检查单 3（依赖卫生）**：serde_yml 0.0.13 为 deprecated shim 的说法**经 crates.io 核实
+  属实**（"DEPRECATED — `serde_yml` is unmaintained… a thin compatibility shim that
+  forwards every call to `noyalib`"，[crates.io/crates/serde_yml](https://crates.io/crates/serde_yml)）；
+  钉 `0.0.12` 正确（`^0.0.12` 语义上限 <0.0.13，不会被自动升级进 shim），**结论：维持
+  现状**——迁移 `noyalib`/`serde_yaml_ng` 属独立决策，不在本里程碑。`cargo tree -p
+  mag-config`：serde_yml 只带入 `indexmap`/`itoa`/`libyml`(+`anyhow`)/`memchr`/`ryu` 叶子
+  crate；`tracing` 传递仅 `pin-project-lite`/`tracing-core`/`once_cell`，与 mag-core 同款
+  日志门面，为"记 warn"所需的最小引入；无依赖爆炸，crate 依赖边界（不依赖
+  mag-core/agent-lib）保持。
+- **检查单 4（TOML 投影等价性）**：对照 `assembly.rs:593-626` 逐行核实。local 侧（排除
+  绑定项、`role`→description 兜底文案逐字一致、model、enabled 工具名集）等价；
+  `system_prompt` None→body `""`（旧 `DelegateBinding` 保持 Option，新模型 body 可空，
+  语义等价）；`max_steps` 为任务规格新增维度（旧 binding 无 budget 字段，不属回归）。
+  **偏差 1 核实**：external 空 `command` 旧逻辑确为**照抄**进 binding（无过滤），下游
+  `driver.rs:1187-1194` 仅在构建 delegate 时 warn "delegation will fail when invoked"——
+  `ask_<name>` 工具仍注册、调用时才失败；新逻辑改为投影期 skip+warn，是行为变化但属
+  fail-fast 改进，且与 M2-1 解析器"空 command 即 `MissingField`"自洽，**结论：合理，
+  记录于此**。另：`capabilities` 未进定义模型——旧 delegate 路径中它仅出现在 tracing
+  span（`driver.rs:1191`），`list_sources` 仍直读 snapshot（`engine.rs:731`）不受影响，
+  §3.1 md 格式本无此字段，符合设计。
+- **检查单 5（冲突处理）**：同目录同名按文件名字典序后者胜+warn（路径先排序，消除
+  `read_dir` 平台序不确定性，warn 文案与实际行为一致）；TOML 层 `[agents]` 与
+  `[external_agents]` 同名 external 胜+warn。两条规则均为任务单未定义项的确定性裁决，
+  有 warn，合理。
+- **检查单 6（测试质量）**：agent_def 模块 29 个测试（18 解析 + 11 注册表）与两个任务
+  验证清单一一对应；断言用 `matches!`/`contains` 而非全文比对，无脆弱断言；全部离线
+  tempdir。**发现**：M2-2 偏差 3（u64→u32 溢出 warn+视同未设）声称的行为无测试覆盖，
+  已补 `toml_projection_out_of_range_max_steps_is_ignored`（5e9 > u32::MAX →
+  max_steps=None）。
+- **修复内容**（随本 review 提交，均最小改动）：① `docs/dyn-agents.md` §3.1 字段表补
+  `max_steps` 行；② `crates/mag-config/src/agent_def.rs` 新增溢出路径测试 1 个（并对
+  新代码跑 `cargo fmt`）。其余代码零改动。
+- **门禁结果**（全部实跑）：`cargo fmt --all -- --check` ✅；`cargo clippy --all-targets --
+  -D warnings` ✅（0 warning）；`cargo test --workspace` ✅（32 套件全 ok，0 失败；
+  mag-config lib 36 含新增测试）；`cargo doc --no-deps --workspace` ✅。
 
 ---
 
