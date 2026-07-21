@@ -9,6 +9,7 @@ ts-export = ["dep:ts-rs"]
 
 [dependencies]
 serde.workspace = true
+serde_yml.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 ts-rs = { workspace = true, optional = true }

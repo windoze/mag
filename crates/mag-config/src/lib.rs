@@ -26,9 +26,10 @@
 //! # Dependency boundary (hard constraint)
 //!
 //! `mag-config` is a pure data crate: it depends only on generic crates
-//! (`serde` / `toml` / `thiserror`). It must **never** depend on `agent-lib`,
-//! `mag-core`, or `mag-service`. Contract consumers (e.g. `mag-service`
-//! config methods) depend on this crate, not the other way around.
+//! (`serde` / `serde_yml` / `toml` / `thiserror`). It must **never** depend
+//! on `agent-lib`, `mag-core`, or `mag-service`. Contract consumers (e.g.
+//! `mag-service` config methods) depend on this crate, not the other way
+//! around.
 //!
 //! # Entry points
 //!
@@ -42,13 +43,20 @@
 //!   information ([`ConfigError::Parse`]).
 //! - [`ConfigSnapshot::resolve`] / [`ConfigSnapshot::project`] — the two
 //!   halves of the DTO↔DO conversion (`docs/CLI.md` §4.2, decision D4).
+//! - [`parse_agent_md`] — markdown subagent-definition files
+//!   (`docs/dyn-agents.md` §3.1): frontmatter parsing into the unified
+//!   [`AgentDefinition`] model.
 
+mod agent_def;
 mod dto;
 mod error;
 mod io;
 mod secret;
 mod snapshot;
 
+pub use agent_def::{
+    AgentDefError, AgentDefinition, AgentKindDef, DefinitionSource, parse_agent_md,
+};
 pub use dto::{
     AgentDto, ApprovalSectionDto, BudgetDto, ConfigDto, ExternalAgentDto, ProviderDto,
     SessionDefaultsDto, ToolDto,

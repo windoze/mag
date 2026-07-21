@@ -182,7 +182,7 @@
 
 ## M2 — mag-config：AgentDefinition 模型与定义加载
 
-### M2-1 [TODO] mag-config：`AgentDefinition` 统一模型 + markdown frontmatter 解析
+### M2-1 [DONE] mag-config：`AgentDefinition` 统一模型 + markdown frontmatter 解析
 
 **目标**：新增 `crates/mag-config/src/agent_def.rs`，定义跨来源统一的 subagent 定义模型与
 markdown 定义文件解析器。
@@ -227,6 +227,55 @@ markdown 定义文件解析器。
   报错、frontmatter 缺失报错、未知字段报错、tools 两种写法、body 为空、body 保留 markdown
   结构。
 - 门禁序列全绿。
+
+**完成记录**（2026-07-22）：
+
+- 改动：
+  - 根 `Cargo.toml`：`[workspace.dependencies]` 加 `serde_yml = "0.0.12"`（附注释）；
+    `crates/mag-config/Cargo.toml` 引用；`Cargo.lock` 更新。`cargo tree -p mag-config`
+    确认无传递依赖爆炸——serde_yml 只带入 `indexmap`（与 toml 复用）/`itoa`/`libyml`
+    （+`anyhow`）/`memchr`/`ryu` 一类叶子 crate，crate 仍保持轻量。
+  - `crates/mag-config/src/agent_def.rs`（新，861 行含测试）：
+    `AgentKindDef::{Local{model,tools,max_steps}, ExternalAcp{command,env}}`、
+    `AgentDefinition{name,description,kind,body,source}`、
+    `DefinitionSource::{Builtin,User,Project,Toml}`（派生 `Ord`，声明序 = §3.2 覆盖优先级
+    低→高，M2-2 merge 可直接用）、`AgentDefError`（thiserror + `#[non_exhaustive]`，风格
+    对齐 `ConfigError`；六个变体 `MissingFrontmatter`/`UnterminatedFrontmatter`/`Yaml`/
+    `MissingField`/`UnknownField`/`Validation`，均带 file stem 便于 M2-2 记 warn 跳过）、
+    `parse_agent_md`（手写 `---` 分隔按字节偏移切分，serde_yml 只解析 frontmatter
+    mapping；未知字段手写校验并附已知字段清单；容忍 UTF-8 BOM 与 CRLF 行尾）。
+  - `crates/mag-config/src/lib.rs`：导出 `agent_def` 模块全部 pub 项；crate 文档依赖边界
+    行补 `serde_yml`，Entry points 补 `parse_agent_md`。
+- 测试（`agent_def.rs` 模块内 18 个，全离线，`cargo test -p mag-config` 25+34 全绿）——
+  TODO 清单逐项：local 全字段 `local_full_fields_parse`、local 最小字段
+  `local_minimal_fields_use_defaults`、acp `acp_definition_parses_command_and_env`、
+  name 缺省取 stem `name_defaults_to_file_stem`、description 缺失/置空
+  `missing_description_is_an_error`、frontmatter 缺失 `missing_frontmatter_is_an_error`、
+  未知字段 `unknown_field_is_an_error`、tools 两种写法
+  `tools_accept_yaml_list_or_comma_separated_string`、body 为空
+  `empty_body_after_frontmatter_is_empty_string`、body 保留 markdown 结构
+  `body_preserves_markdown_structure`；补充用例：`unterminated_frontmatter_is_an_error`、
+  `acp_without_command_is_an_error`（含 `command: []`）、`kind_mismatched_fields_are_errors`、
+  `unknown_kind_value_is_an_error`、`invalid_field_types_are_errors`、
+  `malformed_yaml_is_an_error`、`empty_or_comment_only_frontmatter_yields_all_defaults`、
+  `crlf_line_endings_parse`。
+- 门禁结果：`cargo fmt --all -- --check` ✅；`cargo test -p mag-config` ✅（lib 25 含 18
+  新测试 + 集成 34，0 失败）；`cargo clippy --all-targets -- -D warnings` ✅（workspace，
+  0 warning）；`cargo test --workspace` ✅（32 套件全 ok，0 失败）；
+  `cargo doc --no-deps --workspace` ✅。
+- 偏差（均为实现形态，无语义偏差）：
+  1. `parse_agent_md` 签名按任务单不带 `source` 参数；返回值 `source` 缺省
+     `DefinitionSource::User`，rustdoc 注明由 M2-2 的目录加载器经 pub 字段覆写（备选是
+     改签名带 source，与任务单冲突）。
+  2. 任务单只列出 description 缺失 / command（acp）缺失 / 未知字段三类报错；实现额外把
+     **kind 错配的已知字段**（local 上的 `command`/`env`，acp 上的 `tools`/`model`/
+     `max_steps`）报 `Validation` 错误而非静默丢弃，依据是 §3.1 字段表的"仅 local"/
+     "仅 `kind: acp`"作用域与本 crate "bad config is never silent" 原则；空 `command: []`
+     视同缺失（argv 至少要有可执行文件）。
+  3. `serde_yml` 钉 `0.0.12`：crates.io 上 0.0.13 已标 deprecated——整个 crate 变为转发
+     `noyalib` 的 shim，不再是 serde_yaml 血统；0.0.12 是该 fork 最后真实版本，
+     `^0.0.12` 语义上限 <0.0.13 不会被自动升级。若后续要迁移 `noyalib`/`serde_yaml_ng`
+     属独立决策，留给 M2-R 评估。
 
 ### M2-2 [TODO] mag-config：四来源发现与合并 + 内置定义 + TOML 投影
 
