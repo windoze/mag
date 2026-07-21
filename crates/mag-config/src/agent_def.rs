@@ -7,12 +7,17 @@
 //! markdown files under `.mag/agents/`, TOML configuration entries) share the
 //! one [`AgentDefinition`] model.
 //!
-//! This module implements the model and the markdown definition-file format
-//! (§3.1: YAML frontmatter + markdown body) via [`parse_agent_md`]. Registry
-//! assembly — multi-source discovery, merge priority, builtin texts, and the
-//! TOML projection — is the M2-2 follow-up.
+//! This module implements the model, the markdown definition-file format
+//! (§3.1: YAML frontmatter + markdown body) via [`parse_agent_md`], and the
+//! registry assembly (§3.2): the builtin definitions, user/project directory
+//! loading, the TOML projection, and the priority merge — all on
+//! [`AgentDefinitionRegistry`].
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+
+use crate::snapshot::{ConfigSnapshot, ExternalAgentKind};
 
 /// Fields recognized in the frontmatter mapping (`docs/dyn-agents.md` §3.1
 /// field table). Anything else is an [`AgentDefError::UnknownField`].
@@ -150,6 +155,16 @@ pub enum AgentDefError {
         field: String,
         /// What is wrong with the field.
         message: String,
+    },
+
+    /// Listing a definition directory failed. A directory that does not
+    /// exist at all is *not* an error — it yields an empty registry.
+    #[error("cannot list agent definition directory `{path}`: {source}")]
+    Io {
+        /// The directory that could not be listed.
+        path: String,
+        /// The underlying I/O error.
+        source: std::io::Error,
     },
 }
 
@@ -551,9 +566,405 @@ fn yaml_kind(value: &serde_yml::Value) -> &'static str {
     }
 }
 
+/// Body of the builtin `general-purpose` definition (§3.3): generic
+/// task-execution guidance. It deliberately says nothing about the subagent
+/// role or the report contract — that is the shared prompt skeleton's job
+/// (§4, delivered in M3-3), and duplicating it here would drift.
+const GENERAL_PURPOSE_BODY: &str = "\
+Handle the task end to end: break it into concrete steps, gather the context
+you need with the available tools, make the required changes, and check your
+own results before finishing.
+
+- Stay within the scope of the task; do not refactor, reformat, or \"improve\"
+  unrelated code.
+- Work from evidence — read files and probe with the tools instead of
+  guessing; when an assumption proves wrong, say so and adjust.
+- When something blocks completion, report the blocker plainly instead of
+  working around it silently.";
+
+/// Body of the builtin `explorer` definition (§3.3): read-only exploration
+/// guidance, with the same skeleton separation as [`GENERAL_PURPOSE_BODY`].
+const EXPLORER_BODY: &str = "\
+Explore the codebase to answer the question or to locate what the task points
+at. Your tool set is read-only: list directories, search for symbols and
+patterns, and read the relevant code.
+
+- Ground every claim in code you actually opened; never answer from memory
+  or from naming alone.
+- Cite precise locations (`path:line`) for each finding so the supervisor can
+  navigate straight to the evidence.
+- Separate what the code shows from what you infer, and flag questions you
+  could not settle with read-only access.";
+
+/// A name-keyed table of [`AgentDefinition`]s merged from the four
+/// definition sources (`docs/dyn-agents.md` §3.2).
+///
+/// Source priority on a name clash is `Builtin < User < Project < Toml` (see
+/// [`DefinitionSource`]). Assemble the table by folding
+/// [`merge`](Self::merge) from the lowest-priority source upwards:
+///
+/// ```no_run
+/// # fn assemble(
+/// #     user_dir: &std::path::Path,
+/// #     project_dir: &std::path::Path,
+/// #     snapshot: &mag_config::ConfigSnapshot,
+/// #     bound_agent: &str,
+/// # ) -> Result<mag_config::AgentDefinitionRegistry, mag_config::AgentDefError> {
+/// use mag_config::AgentDefinitionRegistry;
+/// let registry = AgentDefinitionRegistry::merge(
+///     AgentDefinitionRegistry::merge(
+///         AgentDefinitionRegistry::merge(
+///             AgentDefinitionRegistry::builtin(),
+///             AgentDefinitionRegistry::load_user_dir(user_dir)?,
+///         ),
+///         AgentDefinitionRegistry::load_project_dir(project_dir)?,
+///     ),
+///     AgentDefinitionRegistry::from_toml_snapshot(snapshot, bound_agent),
+/// );
+/// # Ok(registry)
+/// # }
+/// ```
+///
+/// The table is ordered by name, so the [`describe_for_tool`] enumeration is
+/// stable across runs.
+///
+/// [`describe_for_tool`]: Self::describe_for_tool
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AgentDefinitionRegistry {
+    defs: BTreeMap<String, AgentDefinition>,
+}
+
+impl AgentDefinitionRegistry {
+    /// The two builtin definitions (§3.3), both with
+    /// [`DefinitionSource::Builtin`]:
+    ///
+    /// - `general-purpose` — the zero-configuration fallback and the default
+    ///   for the `agent` tool's `type` parameter; inherits the supervisor's
+    ///   model, tool surface, and step budget.
+    /// - `explorer` — read-only codebase exploration, narrowed to
+    ///   `read_file`, `list_dir`, and `grep` (the read-only subset of the
+    ///   builtin tool set).
+    #[must_use]
+    pub fn builtin() -> Self {
+        let defs = [
+            AgentDefinition {
+                name: "general-purpose".to_owned(),
+                description: "General-purpose task execution; the default type when no \
+                              specialized one fits."
+                    .to_owned(),
+                kind: AgentKindDef::Local {
+                    model: None,
+                    tools: None,
+                    max_steps: None,
+                },
+                body: GENERAL_PURPOSE_BODY.to_owned(),
+                source: DefinitionSource::Builtin,
+            },
+            AgentDefinition {
+                name: "explorer".to_owned(),
+                description: "Read-only code exploration: locating files, searching code, and \
+                              answering codebase questions with precise file references."
+                    .to_owned(),
+                kind: AgentKindDef::Local {
+                    model: None,
+                    tools: Some(
+                        ["read_file", "list_dir", "grep"]
+                            .map(str::to_owned)
+                            .to_vec(),
+                    ),
+                    max_steps: None,
+                },
+                body: EXPLORER_BODY.to_owned(),
+                source: DefinitionSource::Builtin,
+            },
+        ];
+        Self {
+            defs: defs
+                .into_iter()
+                .map(|def| (def.name.clone(), def))
+                .collect(),
+        }
+    }
+
+    /// Loads user-level definitions (`*.md` files directly under `dir`,
+    /// conventionally [`default_user_agents_dir`]).
+    ///
+    /// A missing directory yields an empty registry, not an error. A file
+    /// that fails to parse is logged and skipped — one broken definition
+    /// never takes the others down with it.
+    pub fn load_user_dir(dir: &Path) -> Result<Self, AgentDefError> {
+        Self::load_dir(dir, DefinitionSource::User)
+    }
+
+    /// Loads project-level definitions (`*.md` files directly under `dir`,
+    /// conventionally [`project_agents_dir`]); same tolerance rules as
+    /// [`load_user_dir`](Self::load_user_dir).
+    pub fn load_project_dir(dir: &Path) -> Result<Self, AgentDefError> {
+        Self::load_dir(dir, DefinitionSource::Project)
+    }
+
+    /// Shared directory loader behind [`load_user_dir`](Self::load_user_dir)
+    /// and [`load_project_dir`](Self::load_project_dir); `source` overwrites
+    /// the parser's default provenance on every parsed definition.
+    fn load_dir(dir: &Path, source: DefinitionSource) -> Result<Self, AgentDefError> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => {
+                return Err(AgentDefError::Io {
+                    path: dir.display().to_string(),
+                    source: error,
+                });
+            }
+        };
+        // Collect and sort so load order — and therefore which file wins a
+        // same-directory name clash — is deterministic.
+        let mut paths: Vec<PathBuf> = entries
+            .filter_map(|entry| match entry {
+                Ok(entry) => Some(entry.path()),
+                Err(error) => {
+                    tracing::warn!(
+                        dir = %dir.display(),
+                        %error,
+                        "skipping unreadable entry in agent definition directory"
+                    );
+                    None
+                }
+            })
+            .filter(|path| path.extension().and_then(OsStr::to_str) == Some("md"))
+            .filter(|path| path.is_file())
+            .collect();
+        paths.sort();
+
+        let mut defs = BTreeMap::new();
+        for path in paths {
+            let stem = path
+                .file_stem()
+                .and_then(OsStr::to_str)
+                .unwrap_or_default()
+                .to_owned();
+            let content = match std::fs::read_to_string(&path) {
+                Ok(content) => content,
+                Err(error) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        %error,
+                        "skipping unreadable agent definition file"
+                    );
+                    continue;
+                }
+            };
+            match parse_agent_md(&stem, &content) {
+                Ok(mut def) => {
+                    def.source = source;
+                    if defs.insert(def.name.clone(), def).is_some() {
+                        tracing::warn!(
+                            path = %path.display(),
+                            "duplicate agent definition name in directory; \
+                             the alphabetically later file wins"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        %error,
+                        "skipping broken agent definition file"
+                    );
+                }
+            }
+        }
+        Ok(Self { defs })
+    }
+
+    /// Projects the TOML configuration into definitions
+    /// ([`DefinitionSource::Toml`], §3.2 source 4) — the mapping formerly
+    /// applied by mag-core's session assembly:
+    ///
+    /// - every `[agents.<name>]` entry except the session-bound
+    ///   `bound_agent` becomes a local definition: `role` (or the fallback
+    ///   `Local subagent \`<name>\``) as the description, `system_prompt`
+    ///   (or empty) as the body, `model`, the enabled tool-name set, and the
+    ///   budget's `max_steps`;
+    /// - every `[external_agents.<name>]` entry of kind `acp` becomes an
+    ///   external definition (other kinds, and entries without a spawn
+    ///   command, are logged and skipped).
+    #[must_use]
+    pub fn from_toml_snapshot(snapshot: &ConfigSnapshot, bound_agent: &str) -> Self {
+        let mut defs = BTreeMap::new();
+        // Iteration over the `BTreeMap`s keeps the projection deterministic.
+        for agent in snapshot.agents().values() {
+            if agent.name() == bound_agent {
+                continue;
+            }
+            let tools = agent.tools_list().map(|tools| {
+                tools
+                    .iter()
+                    .filter(|tool| tool.is_enabled())
+                    .map(|tool| tool.name().to_owned())
+                    .collect()
+            });
+            let max_steps = agent
+                .budget()
+                .and_then(|budget| budget.max_steps())
+                .and_then(|steps| match u32::try_from(steps) {
+                    Ok(steps) => Some(steps),
+                    Err(_) => {
+                        tracing::warn!(
+                            agent = agent.name(),
+                            steps,
+                            "agent budget max_steps exceeds the u32 range; ignoring the override"
+                        );
+                        None
+                    }
+                });
+            defs.insert(
+                agent.name().to_owned(),
+                AgentDefinition {
+                    name: agent.name().to_owned(),
+                    description: agent
+                        .role()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("Local subagent `{}`", agent.name())),
+                    kind: AgentKindDef::Local {
+                        model: agent.model().map(str::to_owned),
+                        tools,
+                        max_steps,
+                    },
+                    body: agent.system_prompt().map(str::to_owned).unwrap_or_default(),
+                    source: DefinitionSource::Toml,
+                },
+            );
+        }
+        for external in snapshot.external_agents().values() {
+            if !matches!(external.effective_kind(), ExternalAgentKind::Acp) {
+                tracing::warn!(
+                    agent = external.name(),
+                    kind = %external.effective_kind(),
+                    "skipping external agent definition of unsupported kind"
+                );
+                continue;
+            }
+            if external.command().is_empty() {
+                tracing::warn!(
+                    agent = external.name(),
+                    "skipping external agent definition without a spawn command"
+                );
+                continue;
+            }
+            let name = external.name().to_owned();
+            if defs.contains_key(&name) {
+                tracing::warn!(
+                    agent = %name,
+                    "external agent shadows a same-named local agent definition from TOML"
+                );
+            }
+            defs.insert(
+                name.clone(),
+                AgentDefinition {
+                    name,
+                    description: format!("External ACP subagent `{}`", external.name()),
+                    kind: AgentKindDef::ExternalAcp {
+                        command: external.command().to_vec(),
+                        env: external.env().cloned().unwrap_or_default(),
+                    },
+                    body: String::new(),
+                    source: DefinitionSource::Toml,
+                },
+            );
+        }
+        Self { defs }
+    }
+
+    /// Merges two registries: on a name clash the definition from `over`
+    /// replaces the one from `base`. Chained from the lowest-priority source
+    /// upwards this yields the §3.2 order `Builtin < User < Project < Toml`.
+    #[must_use]
+    pub fn merge(base: Self, over: Self) -> Self {
+        let mut defs = base.defs;
+        defs.extend(over.defs);
+        Self { defs }
+    }
+
+    /// Looks up a definition by name (the `agent` tool's `type` parameter).
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&AgentDefinition> {
+        self.defs.get(name)
+    }
+
+    /// The number of definitions in the table.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.defs.len()
+    }
+
+    /// Whether the table holds no definitions.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.defs.is_empty()
+    }
+
+    /// Enumerates every definition for the `agent` tool's description
+    /// (§5.1: the model picks a `type` from this text). One line per
+    /// definition, ordered by name; external definitions carry an `(acp)`
+    /// marker so the model can tell them apart from local ones.
+    #[must_use]
+    pub fn describe_for_tool(&self) -> String {
+        let mut lines = Vec::with_capacity(self.defs.len() + 1);
+        lines.push("Available agent types:".to_owned());
+        for def in self.defs.values() {
+            let marker = match def.kind {
+                AgentKindDef::Local { .. } => "",
+                AgentKindDef::ExternalAcp { .. } => " (acp)",
+            };
+            lines.push(format!("- {}{marker}: {}", def.name, def.description));
+        }
+        lines.join("\n")
+    }
+}
+
+/// The default user-level definition directory
+/// (`docs/dyn-agents.md` §3.2 source 2): `$XDG_CONFIG_HOME/mag/agents` when
+/// `XDG_CONFIG_HOME` is set, else `~/.config/mag/agents`; when neither
+/// variable is available the relative `mag/agents` is used. This mirrors the
+/// config-file convention (`crates/mag/src/main.rs` `default_config_path`).
+#[must_use]
+pub fn default_user_agents_dir() -> PathBuf {
+    user_agents_dir_from(
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+/// The pure core of [`default_user_agents_dir`], with the environment lookup
+/// injected so the precedence rules are testable without mutating process
+/// state. Empty values count as unset.
+fn user_agents_dir_from(xdg: Option<&OsStr>, home: Option<&OsStr>) -> PathBuf {
+    if let Some(xdg) = xdg.filter(|v| !v.is_empty()) {
+        return PathBuf::from(xdg).join("mag").join("agents");
+    }
+    if let Some(home) = home.filter(|v| !v.is_empty()) {
+        return PathBuf::from(home)
+            .join(".config")
+            .join("mag")
+            .join("agents");
+    }
+    PathBuf::from("mag").join("agents")
+}
+
+/// The project-level definition directory for a session rooted at `cwd`
+/// (`docs/dyn-agents.md` §3.2 source 3): `<cwd>/.mag/agents`.
+#[must_use]
+pub fn project_agents_dir(cwd: &Path) -> PathBuf {
+    cwd.join(".mag").join("agents")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ConfigDto;
 
     fn strings(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| (*s).to_owned()).collect()
@@ -857,5 +1268,349 @@ Task frame template.
             }
         );
         assert_eq!(def.body, "body line");
+    }
+
+    // ---- M2-2: registry assembly ----
+
+    /// The `docs/CLI.md` §4.2 example, verbatim (mirrors
+    /// `tests/roundtrip.rs`), used for the TOML projection tests.
+    const EXAMPLE_TOML: &str = r#"
+# ~/.config/mag/config.toml（DTO 的 TOML 形态）
+[providers.anthropic]
+wire = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key = { env = "ANTHROPIC_API_KEY" }     # secret 引用，不落盘
+
+[providers.local_proxy]
+wire = "openai"
+base_url = "http://127.0.0.1:8317"
+api_key = { keyring = "mag/local_proxy" }
+
+[agents.default]
+provider = "anthropic"
+model = "claude-sonnet-4-5"
+tools = ["read_file", "list_dir", "grep", "shell", "ask_user"]
+
+[agents.reviewer]
+provider = "local_proxy"
+model = "gpt-5-codex"
+tools = ["read_file", "grep"]
+
+[external_agents.peer_acp]                  # external ACP agent 来源（决策 D3）
+kind = "acp"
+command = ["peer-agent", "--acp"]           # spawn 命令行；工作目录隔离由 agent-lib 负责
+
+[tools.shell]
+approval = "ask"                            # ask | allow | deny（→ ApprovalPolicy 映射）
+
+[session]
+routing = "model_routed"
+budget = { max_tokens = 200000 }
+"#;
+
+    fn example_snapshot() -> ConfigSnapshot {
+        let dto = ConfigDto::parse_str(EXAMPLE_TOML).expect("§4.2 example must parse");
+        ConfigSnapshot::resolve(&dto, 1).expect("§4.2 example must resolve")
+    }
+
+    fn write_file(dir: &Path, name: &str, content: &str) {
+        std::fs::write(dir.join(name), content).expect("write definition file");
+    }
+
+    fn md(description: &str, extra: &str) -> String {
+        format!("---\ndescription: {description}\n{extra}---\nbody\n")
+    }
+
+    #[test]
+    fn builtin_registry_contains_general_purpose_and_explorer() {
+        let registry = AgentDefinitionRegistry::builtin();
+        assert_eq!(registry.len(), 2);
+
+        let general = registry.get("general-purpose").expect("general-purpose");
+        assert_eq!(general.source, DefinitionSource::Builtin);
+        assert!(!general.description.is_empty());
+        assert!(!general.body.is_empty());
+        // The fallback type inherits everything from the supervisor.
+        assert_eq!(
+            general.kind,
+            AgentKindDef::Local {
+                model: None,
+                tools: None,
+                max_steps: None,
+            }
+        );
+
+        let explorer = registry.get("explorer").expect("explorer");
+        assert_eq!(explorer.source, DefinitionSource::Builtin);
+        assert!(!explorer.description.is_empty());
+        assert!(!explorer.body.is_empty());
+        // The read-only subset of the builtin tool set.
+        assert_eq!(
+            explorer.kind,
+            AgentKindDef::Local {
+                model: None,
+                tools: Some(strings(&["read_file", "list_dir", "grep"])),
+                max_steps: None,
+            }
+        );
+    }
+
+    #[test]
+    fn four_source_merge_priority_overrides_by_name() {
+        // User directory: overrides the builtin `explorer`, shares
+        // `shared`/`contested` with higher-priority sources.
+        let user = tempfile::tempdir().expect("user tempdir");
+        write_file(
+            user.path(),
+            "explorer.md",
+            &md("user explorer override", ""),
+        );
+        write_file(
+            user.path(),
+            "shared.md",
+            &md("user shared", "model: user-model\n"),
+        );
+        write_file(user.path(), "contested.md", &md("user contested", ""));
+        write_file(user.path(), "user_only.md", &md("user only", ""));
+
+        // Project directory: same shape, higher priority.
+        let project = tempfile::tempdir().expect("project tempdir");
+        write_file(
+            project.path(),
+            "shared.md",
+            &md("project shared", "max_steps: 7\n"),
+        );
+        write_file(project.path(), "contested.md", &md("project contested", ""));
+        write_file(project.path(), "project_only.md", &md("project only", ""));
+
+        // TOML: highest priority, claims `shared`.
+        let snapshot = ConfigSnapshot::resolve(
+            &ConfigDto::parse_str("[agents.shared]\nrole = \"toml shared\"\n").expect("parse toml"),
+            1,
+        )
+        .expect("resolve toml");
+
+        let registry = AgentDefinitionRegistry::merge(
+            AgentDefinitionRegistry::merge(
+                AgentDefinitionRegistry::merge(
+                    AgentDefinitionRegistry::builtin(),
+                    AgentDefinitionRegistry::load_user_dir(user.path()).expect("load user dir"),
+                ),
+                AgentDefinitionRegistry::load_project_dir(project.path())
+                    .expect("load project dir"),
+            ),
+            AgentDefinitionRegistry::from_toml_snapshot(&snapshot, "default"),
+        );
+
+        // toml > project > user > builtin on `shared`.
+        let shared = registry.get("shared").expect("shared");
+        assert_eq!(shared.source, DefinitionSource::Toml);
+        assert_eq!(shared.description, "toml shared");
+        // project > user on `contested`.
+        let contested = registry.get("contested").expect("contested");
+        assert_eq!(contested.source, DefinitionSource::Project);
+        assert_eq!(contested.description, "project contested");
+        // user > builtin on `explorer`.
+        let explorer = registry.get("explorer").expect("explorer");
+        assert_eq!(explorer.source, DefinitionSource::User);
+        assert_eq!(explorer.description, "user explorer override");
+        // Uncontested definitions from every source survive.
+        assert_eq!(
+            registry.get("user_only").expect("user_only").source,
+            DefinitionSource::User
+        );
+        assert_eq!(
+            registry.get("project_only").expect("project_only").source,
+            DefinitionSource::Project
+        );
+        assert_eq!(
+            registry
+                .get("general-purpose")
+                .expect("general-purpose")
+                .source,
+            DefinitionSource::Builtin
+        );
+        assert_eq!(registry.len(), 6);
+    }
+
+    #[test]
+    fn missing_and_empty_directories_load_empty() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let missing = AgentDefinitionRegistry::load_user_dir(&base.path().join("does-not-exist"))
+            .expect("missing directory is not an error");
+        assert!(missing.is_empty());
+
+        let empty = tempfile::tempdir().expect("empty tempdir");
+        let registry =
+            AgentDefinitionRegistry::load_project_dir(empty.path()).expect("empty directory loads");
+        assert_eq!(registry, AgentDefinitionRegistry::default());
+    }
+
+    #[test]
+    fn broken_markdown_is_skipped_not_fatal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Sorts before `good.md`: the failure must not abort the load.
+        write_file(dir.path(), "bad.md", "no frontmatter at all\n");
+        write_file(dir.path(), "good.md", &md("loads fine", ""));
+        // Non-`.md` files are ignored, and so are directories named `*.md`.
+        write_file(dir.path(), "notes.txt", "not a definition\n");
+        std::fs::create_dir(dir.path().join("traps.md")).expect("create decoy directory");
+
+        let registry = AgentDefinitionRegistry::load_user_dir(dir.path()).expect("load dir");
+        assert_eq!(registry.len(), 1);
+        let good = registry.get("good").expect("good definition survived");
+        assert_eq!(good.source, DefinitionSource::User);
+        assert_eq!(good.description, "loads fine");
+    }
+
+    #[test]
+    fn toml_projection_matches_cli_example() {
+        let registry = AgentDefinitionRegistry::from_toml_snapshot(&example_snapshot(), "default");
+        // Exactly two definitions: the bound `default` entry is excluded.
+        assert_eq!(registry.len(), 2);
+
+        let reviewer = registry.get("reviewer").expect("reviewer");
+        assert_eq!(reviewer.source, DefinitionSource::Toml);
+        // No `role` in the example: the fallback description kicks in.
+        assert_eq!(reviewer.description, "Local subagent `reviewer`");
+        // No `system_prompt`: empty body.
+        assert_eq!(reviewer.body, "");
+        assert_eq!(
+            reviewer.kind,
+            AgentKindDef::Local {
+                model: Some("gpt-5-codex".to_owned()),
+                tools: Some(strings(&["read_file", "grep"])),
+                max_steps: None,
+            }
+        );
+
+        let peer = registry.get("peer_acp").expect("peer_acp");
+        assert_eq!(peer.source, DefinitionSource::Toml);
+        assert_eq!(peer.description, "External ACP subagent `peer_acp`");
+        assert_eq!(peer.body, "");
+        assert_eq!(
+            peer.kind,
+            AgentKindDef::ExternalAcp {
+                command: strings(&["peer-agent", "--acp"]),
+                env: BTreeMap::new(),
+            }
+        );
+
+        assert!(registry.get("default").is_none());
+    }
+
+    #[test]
+    fn toml_projection_maps_role_prompt_model_tools_and_budget() {
+        let dto = ConfigDto::parse_str(
+            r#"
+[agents.default]
+model = "sup"
+
+[agents.helper]
+role = "Helps out."
+system_prompt = "You help."
+model = "m1"
+tools = ["grep", "read_file"]
+budget = { max_steps = 9 }
+
+[tools.grep]
+enabled = false
+"#,
+        )
+        .expect("parse toml");
+        let snapshot = ConfigSnapshot::resolve(&dto, 1).expect("resolve toml");
+
+        let registry = AgentDefinitionRegistry::from_toml_snapshot(&snapshot, "default");
+        assert_eq!(registry.len(), 1);
+        let helper = registry.get("helper").expect("helper");
+        assert_eq!(helper.description, "Helps out.");
+        assert_eq!(helper.body, "You help.");
+        // The disabled tool drops out of the enabled name set.
+        assert_eq!(
+            helper.kind,
+            AgentKindDef::Local {
+                model: Some("m1".to_owned()),
+                tools: Some(strings(&["read_file"])),
+                max_steps: Some(9),
+            }
+        );
+
+        // Binding a different agent changes which entry is excluded.
+        let registry = AgentDefinitionRegistry::from_toml_snapshot(&snapshot, "helper");
+        assert!(registry.get("helper").is_none());
+        assert!(registry.get("default").is_some());
+    }
+
+    #[test]
+    fn toml_projection_skips_external_without_command() {
+        let dto =
+            ConfigDto::parse_str("[external_agents.broken]\nkind = \"acp\"\n").expect("parse toml");
+        let snapshot = ConfigSnapshot::resolve(&dto, 1).expect("resolve toml");
+        let registry = AgentDefinitionRegistry::from_toml_snapshot(&snapshot, "default");
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn describe_for_tool_lists_all_names_and_descriptions() {
+        let registry = AgentDefinitionRegistry::merge(
+            AgentDefinitionRegistry::builtin(),
+            AgentDefinitionRegistry::from_toml_snapshot(&example_snapshot(), "default"),
+        );
+        let text = registry.describe_for_tool();
+        assert!(text.starts_with("Available agent types:"));
+
+        let lines: Vec<&str> = text.lines().skip(1).collect();
+        assert_eq!(lines.len(), 4);
+        // Alphabetical by name, one line per definition, description included.
+        for def in [
+            registry.get("explorer").unwrap(),
+            registry.get("general-purpose").unwrap(),
+            registry.get("peer_acp").unwrap(),
+            registry.get("reviewer").unwrap(),
+        ] {
+            let line = lines
+                .iter()
+                .find(|line| line.contains(def.name.as_str()))
+                .unwrap_or_else(|| panic!("missing line for `{}`", def.name));
+            assert!(line.contains(def.description.as_str()));
+        }
+        // External definitions carry the `(acp)` marker, local ones do not.
+        let peer_line = lines.iter().find(|l| l.contains("peer_acp")).unwrap();
+        assert!(peer_line.contains("(acp)"));
+        let reviewer_line = lines.iter().find(|l| l.contains("reviewer")).unwrap();
+        assert!(!reviewer_line.contains("(acp)"));
+        // Stable ordering for the tool description.
+        assert!(lines.is_sorted());
+    }
+
+    #[test]
+    fn user_agents_dir_prefers_xdg_then_home() {
+        let xdg = OsStr::new("/xdg");
+        let home = OsStr::new("/home");
+        assert_eq!(
+            user_agents_dir_from(Some(xdg), Some(home)),
+            PathBuf::from("/xdg/mag/agents")
+        );
+        assert_eq!(
+            user_agents_dir_from(None, Some(home)),
+            PathBuf::from("/home/.config/mag/agents")
+        );
+        // Empty values count as unset.
+        assert_eq!(
+            user_agents_dir_from(Some(OsStr::new("")), Some(home)),
+            PathBuf::from("/home/.config/mag/agents")
+        );
+        assert_eq!(
+            user_agents_dir_from(None, None),
+            PathBuf::from("mag").join("agents")
+        );
+    }
+
+    #[test]
+    fn project_agents_dir_is_cwd_dot_mag_agents() {
+        assert_eq!(
+            project_agents_dir(Path::new("/repo")),
+            PathBuf::from("/repo/.mag/agents")
+        );
     }
 }

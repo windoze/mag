@@ -26,10 +26,10 @@
 //! # Dependency boundary (hard constraint)
 //!
 //! `mag-config` is a pure data crate: it depends only on generic crates
-//! (`serde` / `serde_yml` / `toml` / `thiserror`). It must **never** depend
-//! on `agent-lib`, `mag-core`, or `mag-service`. Contract consumers (e.g.
-//! `mag-service` config methods) depend on this crate, not the other way
-//! around.
+//! (`serde` / `serde_yml` / `toml` / `thiserror` / `tracing`). It must
+//! **never** depend on `agent-lib`, `mag-core`, or `mag-service`. Contract
+//! consumers (e.g. `mag-service` config methods) depend on this crate, not
+//! the other way around.
 //!
 //! # Entry points
 //!
@@ -46,6 +46,10 @@
 //! - [`parse_agent_md`] — markdown subagent-definition files
 //!   (`docs/dyn-agents.md` §3.1): frontmatter parsing into the unified
 //!   [`AgentDefinition`] model.
+//! - [`AgentDefinitionRegistry`] — the four-source merged definition table
+//!   (`docs/dyn-agents.md` §3.2): builtin definitions, user/project `*.md`
+//!   directories ([`default_user_agents_dir`] / [`project_agents_dir`]), and
+//!   the TOML projection, folded by priority.
 
 mod agent_def;
 mod dto;
@@ -55,7 +59,8 @@ mod secret;
 mod snapshot;
 
 pub use agent_def::{
-    AgentDefError, AgentDefinition, AgentKindDef, DefinitionSource, parse_agent_md,
+    AgentDefError, AgentDefinition, AgentDefinitionRegistry, AgentKindDef, DefinitionSource,
+    default_user_agents_dir, parse_agent_md, project_agents_dir,
 };
 pub use dto::{
     AgentDto, ApprovalSectionDto, BudgetDto, ConfigDto, ExternalAgentDto, ProviderDto,

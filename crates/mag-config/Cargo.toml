@@ -12,6 +12,7 @@ serde.workspace = true
 serde_yml.workspace = true
 thiserror.workspace = true
 toml.workspace = true
+tracing = "0.1"
 ts-rs = { workspace = true, optional = true }
 
 [dev-dependencies]

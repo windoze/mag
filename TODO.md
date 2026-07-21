@@ -277,7 +277,7 @@ markdown 定义文件解析器。
      `^0.0.12` 语义上限 <0.0.13 不会被自动升级。若后续要迁移 `noyalib`/`serde_yaml_ng`
      属独立决策，留给 M2-R 评估。
 
-### M2-2 [TODO] mag-config：四来源发现与合并 + 内置定义 + TOML 投影
+### M2-2 [DONE] mag-config：四来源发现与合并 + 内置定义 + TOML 投影
 
 **目标**：把内置定义、用户目录、项目目录、TOML 配置四个来源合并成一张注册表。
 
@@ -325,6 +325,65 @@ markdown 定义文件解析器。
   `docs/CLI.md:243-279` 示例配置（reviewer + peer_acp）产出正确两条定义；`describe_for_tool`
   输出含全部名字与 description。
 - 门禁序列全绿。
+
+**完成记录**（2026-07-22）：
+
+- 改动：
+  - `crates/mag-config/Cargo.toml`：加 `tracing = "0.1"`（warn 日志所需；叶子日志门面，依赖
+    边界不破，与 mag-core 同款直接声明——workspace deps 未统一管 tracing）。
+  - `crates/mag-config/src/agent_def.rs`（续写，现约 1600 行含测试）：
+    - `AgentDefinitionRegistry { defs: BTreeMap<String, AgentDefinition> }`（派生
+      Clone/Debug/Default/Eq/PartialEq）：`builtin()`（`general-purpose` Local{全 None
+      继承 supervisor} + `explorer` Local{tools: [read_file, list_dir, grep]}，body 为
+      const 文本——只写类型专属指令，角色与汇报契约留给 M3-3 骨架，避免重复漂移）；
+      `load_user_dir`/`load_project_dir`（共用私有 `load_dir(dir, source)`：目录不存在=空
+      表，read_dir 其他错误报新增的 `AgentDefError::Io{path, source}`；只读 `*.md` 普通
+      文件，路径先排序保证确定性，单文件读/解析失败 warn 跳过；同目录同名冲突按字典序
+      后者胜并 warn）；`from_toml_snapshot`（逻辑平移自 `assembly.rs:593-626`，见偏差 2）；
+      `merge(base, over)`（`BTreeMap::extend`，over 同名覆盖）；`get`；`len`/`is_empty`
+      （任务单未列，测试与 M3 枚举需要，clippy 成对要求）；`describe_for_tool()`（头行
+      `Available agent types:` + 每定义一行 `- <name>[(acp)]: <description>`，BTreeMap
+      字典序稳定输出，external 标 `(acp)` 提前满足 M4-1 第 2 点）。
+    - `default_user_agents_dir()`（镜像 `main.rs:234` 约定，env 读取委托纯函数
+      `user_agents_dir_from(xdg, home)`，测试不改进程 env）；`project_agents_dir(cwd)` =
+      `<cwd>/.mag/agents`。
+    - `AgentDefError` 新增 `Io` 变体（`#[non_exhaustive]` 允许；仅在 read_dir 非
+      NotFound 失败时返回，带目录路径）。
+  - `crates/mag-config/src/lib.rs`：导出 `AgentDefinitionRegistry`/
+    `default_user_agents_dir`/`project_agents_dir`；crate 文档依赖边界行补 `tracing`，
+    Entry points 补注册表一条。
+- 测试（`agent_def.rs` 模块内新增 10 个，全离线、tempdir；`cargo test -p mag-config`
+  lib 35 + 集成 34 + doctest 1 全绿）——TODO 清单逐项：内置表
+  `builtin_registry_contains_general_purpose_and_explorer`、四来源优先级
+  `four_source_merge_priority_overrides_by_name`（user/project tempdir + TOML 快照四链
+  merge，逐级断言 source 与字段）、目录容错 `missing_and_empty_directories_load_empty`、
+  坏文件 `broken_markdown_is_skipped_not_fatal`（坏 md 排序在前仍不中止、非 `.md` 与
+  `*.md` 目录被忽略）、TOML 投影 `toml_projection_matches_cli_example`（§4.2 示例逐字，
+  reviewer + peer_acp 恰好两条、bound `default` 被排除、role/system_prompt 缺省走兜底
+  description 与空 body）、`describe_for_tool_lists_all_names_and_descriptions`（全名字
+  + description + `(acp)` 标注 + 字典序）；补充用例：
+  `toml_projection_maps_role_prompt_model_tools_and_budget`（role→description、
+  system_prompt→body、budget.max_steps→max_steps、disabled 工具被滤出 enabled 名集、
+  换 bound_agent 改变排除项）、`toml_projection_skips_external_without_command`（偏差
+  2）、`user_agents_dir_prefers_xdg_then_home`（含空值视同未设）、
+  `project_agents_dir_is_cwd_dot_mag_agents`。
+- 门禁结果：`cargo fmt --all -- --check` ✅；`cargo test -p mag-config` ✅（70 项全绿）；
+  `cargo clippy --all-targets -- -D warnings` ✅（workspace，0 warning）；
+  `cargo test --workspace` ✅（全套件 0 失败）；`cargo doc --no-deps --workspace` ✅
+  （注册表 rustdoc 内含 no_run doctest 的四链 merge 组装示例，编译通过）。
+- 偏差（均为实现形态，无语义偏差）：
+  1. mag-config 新增 `tracing` 依赖——任务单要求"记 warn"，crate 原无日志门面；属
+     "serde/serde_yml 一类叶子依赖"范畴，不引入 mag-core/agent-lib 依赖。
+  2. `from_toml_snapshot` 对 `command` 为空的 external entry **warn 并跳过**而非照抄
+     （assembly 旧逻辑原样复制）：M2-1 已把 `AgentKindDef::ExternalAcp.command` 定死为
+     "never empty"，解析器侧空 command 即 `MissingField`，投影侧保持一致。external 定义
+     的兜底 description 取 `External ACP subagent \`<name>\``（旧
+     `ExternalDelegateBinding` 本无 description 字段，无可平移值）。
+  3. `ResolvedAgent.budget.max_steps` 是 `u64`、定义为 `u32`：超出 u32 范围时 warn 并
+     视同未设（沿用运行默认），不静默截断。
+  4. 同目录同名冲突的胜者规则为任务单未定义项：实现按文件名字典序后者胜 + warn（先排
+     序再加载，消除 read_dir 的平台序不确定性）；TOML 层 `[agents]` 与
+     `[external_agents]` 同名时 external 胜 + warn。
 
 ### M2-R [TODO] M2 review：定义模型与加载
 

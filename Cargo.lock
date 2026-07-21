@@ -1256,6 +1256,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
+ "tracing",
  "ts-rs",
 ]
 
