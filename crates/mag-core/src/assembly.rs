@@ -57,10 +57,20 @@ use crate::{
 };
 
 /// Name of the `agents.<name>` entry a session binds to when its wire
-/// `SessionConfig.provider` is empty, `"default"`, or names no configured
-/// entry (`docs/CLI.md` §4.2; the fallback keeps ACP's placeholder provider
-/// label and legacy free-form labels working).
+/// `SessionConfig.provider` is empty or names no configured entry and the
+/// configuration sets no `[session].default_agent` (`docs/CLI.md` §4.2; the
+/// fallback keeps ACP's placeholder provider label and legacy free-form
+/// labels working).
 pub(crate) const DEFAULT_AGENT_NAME: &str = "default";
+
+/// Effective default agent name for a snapshot: the configured
+/// `[session].default_agent` when set, else the well-known `default` entry.
+fn default_agent_name(snapshot: &ConfigSnapshot) -> &str {
+    snapshot
+        .session_defaults()
+        .default_agent()
+        .unwrap_or(DEFAULT_AGENT_NAME)
+}
 
 /// Filename of the SQLite session store created inside a configured
 /// `[session].persist_path` directory.
@@ -121,16 +131,18 @@ impl Engine {
     ///
     /// # LLM client
     ///
-    /// The engine's shared LLM client is built from the **`agents.default`
-    /// entry's provider**: its `base_url` (with a protocol default when unset)
+    /// The engine's shared LLM client is built from the **default agent
+    /// entry's provider** — the entry named by `[session].default_agent`
+    /// when configured, else `agents.default`: its `base_url` (with a
+    /// protocol default when unset)
     /// and its `api_key` [`SecretRef`], which is resolved here — environment
     /// variables are read at this point; `{keyring = "..."}` references report
     /// an explicit [`EngineError::Secret`] because this build has no keyring
     /// backend (the `mag-sources` `os-keyring` feature is off). A missing or
     /// empty variable, a provider without an `api_key` reference, or a keyring
     /// reference fails assembly with an error naming the provider and the
-    /// reference — never a secret value. When the snapshot has no
-    /// `agents.default` entry or that entry names no provider (for example the
+    /// reference — never a secret value. When the snapshot has no default
+    /// agent entry or that entry names no provider (for example the
     /// built-in default configuration of a missing config file), the engine is
     /// assembled **without** a client: session management works and run
     /// attempts report `ServiceError::Backend`, mirroring [`Engine::new`].
@@ -140,10 +152,11 @@ impl Engine {
     /// A session created on a configuration-backed engine binds to an
     /// `agents.<name>` entry through its wire `SessionConfig.provider`:
     ///
-    /// - `"default"`, an empty string, or a name with no matching
-    ///   `[agents.<name>]` entry binds the **`default`** entry (an unmatched
-    ///   name is logged at warn level — this keeps ACP's placeholder provider
-    ///   and legacy labels useful).
+    /// - An empty string, or a name with no matching `[agents.<name>]`
+    ///   entry, binds the **default agent** entry — the one named by
+    ///   `[session].default_agent` when configured, else the `default`
+    ///   entry (an unmatched name is logged at warn level — this keeps
+    ///   ACP's placeholder provider and legacy labels useful).
     /// - The bound entry supplies the session's `model`, tool surface, and
     ///   `system_prompt` when set (`docs/CLI.md` §4.4: new sessions use the
     ///   current DO graph); the wire `SessionConfig` values are the fallback
@@ -274,8 +287,9 @@ fn default_base_url(wire: ProviderWire) -> &'static str {
     }
 }
 
-/// Builds the engine's shared LLM client from the `agents.default` entry's
-/// provider, resolving the provider's secret reference (see the
+/// Builds the engine's shared LLM client from the default agent entry's
+/// provider (`[session].default_agent` when configured, else `agents.default`),
+/// resolving the provider's secret reference (see the
 /// [`Engine::from_config`] rustdoc for the full contract).
 ///
 /// Returns `Ok(None)` when the snapshot defines no default agent or the
@@ -285,7 +299,7 @@ fn assemble_llm_client(
     snapshot: &ConfigSnapshot,
     sources: &SourceRegistry,
 ) -> Result<Option<Arc<dyn LlmClient>>, EngineError> {
-    let Some(agent) = snapshot.agent(DEFAULT_AGENT_NAME) else {
+    let Some(agent) = snapshot.agent(default_agent_name(snapshot)) else {
         return Ok(None);
     };
     let Some(provider) = agent.provider() else {
@@ -510,16 +524,18 @@ impl SessionBinding {
         };
 
         let requested = config.provider.trim();
-        let agent_name = if requested.is_empty() || requested == DEFAULT_AGENT_NAME {
-            DEFAULT_AGENT_NAME.to_owned()
+        let default_name = default_agent_name(snapshot);
+        let agent_name = if requested.is_empty() {
+            default_name.to_owned()
         } else if snapshot.agent(requested).is_some() {
             requested.to_owned()
         } else {
             tracing::warn!(
                 provider = requested,
-                "session binding names no configured agent entry; falling back to `default`"
+                fallback = default_name,
+                "session binding names no configured agent entry; falling back to the default agent"
             );
-            DEFAULT_AGENT_NAME.to_owned()
+            default_name.to_owned()
         };
         let entry = snapshot.agent(&agent_name);
 
@@ -1049,6 +1065,43 @@ budget = { max_steps = 5 }
         assert_eq!(binding.agent_name(), "default");
         assert_eq!(binding.model(), None);
         assert_eq!(binding.budget().and_then(|b| b.max_tokens), Some(7));
+    }
+
+    /// `[session].default_agent` selects the entry an empty or unmatched
+    /// provider binds to, in place of the well-known `default` entry.
+    #[test]
+    fn session_binding_honors_the_configured_default_agent() {
+        let snapshot = snapshot(
+            r#"
+[agents.default]
+model = "model-d"
+
+[agents.main]
+model = "model-m"
+
+[session]
+default_agent = "main"
+"#,
+        );
+
+        // Empty provider binds the configured default agent, which is not
+        // listed as its own delegate.
+        let binding = SessionBinding::resolve(&session_config("", "wire-model"), Some(&snapshot));
+        assert_eq!(binding.agent_name(), "main");
+        assert_eq!(binding.model(), Some("model-m"));
+        let names: Vec<&str> = binding.delegates().iter().map(|d| d.name()).collect();
+        assert_eq!(names, vec!["default"]);
+
+        // An unknown name falls back to the configured default agent.
+        let binding =
+            SessionBinding::resolve(&session_config("ghost", "wire-model"), Some(&snapshot));
+        assert_eq!(binding.agent_name(), "main");
+
+        // An explicitly named existing entry still binds directly.
+        let binding =
+            SessionBinding::resolve(&session_config("default", "wire-model"), Some(&snapshot));
+        assert_eq!(binding.agent_name(), "default");
+        assert_eq!(binding.model(), Some("model-d"));
     }
 
     /// An explicit `tools = []` constrains the session to *no* tools

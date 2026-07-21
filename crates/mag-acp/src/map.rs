@@ -14,18 +14,14 @@ use mag_service::{
     SessionConfig, StepIdWire, ToolCallIdWire, ToolStatusWire, ToolTrace, UserInput,
 };
 
-/// Default AI provider used for ACP-created sessions.
-///
-/// ACP's `session/new` does not carry an LLM selection (`docs/ACP.md` §3.2), so
-/// the first version falls back to a fixed provider. This mirrors the provider
-/// used by the frozen `mag-service` contract's own fixtures.
-pub const DEFAULT_PROVIDER: &str = "openai";
-
 /// Default model identifier used for ACP-created sessions.
 ///
-/// Like [`DEFAULT_PROVIDER`], this is a placeholder default applied because ACP
-/// does not select a model (`docs/ACP.md` §3.2). A later interface/config source
-/// can override it without changing this mapping.
+/// ACP's `session/new` does not carry an LLM selection (`docs/ACP.md` §3.2), so
+/// the provider field is left empty — on a configuration-backed engine an empty
+/// provider binds the configured default agent (`[session].default_agent`, else
+/// the `default` entry). The model stays a placeholder fallback for agents that
+/// pin no model of their own; a later interface/config source can override it
+/// without changing this mapping.
 pub const DEFAULT_MODEL: &str = "gpt-5-codex";
 
 /// Converts a mag [`SessionId`](mag_service::SessionId) into an ACP
@@ -92,15 +88,16 @@ pub fn acp_session_id_to_mag(
 /// place it as the facade agent's worktree (M1-3). It is never dropped on the
 /// mag-acp side.
 ///
-/// ACP does not carry an LLM selection, so `provider`/`model` fall back to the
-/// fixed [`DEFAULT_PROVIDER`] / [`DEFAULT_MODEL`] constants; `tool_profile` is
+/// ACP does not carry an LLM selection, so `provider` is left empty (the
+/// engine binds the configured default agent) and `model` falls back to
+/// [`DEFAULT_MODEL`]; `tool_profile` is
 /// left unset and `routing` uses [`RoutingMode::default`]. The first version
 /// ignores `additional_directories` and `mcp_servers` (later source integration
 /// points, out of scope here per `docs/ACP.md` §3.2).
 #[must_use]
 pub fn new_session_request_to_config(req: &acp::NewSessionRequest) -> SessionConfig {
     SessionConfig {
-        provider: DEFAULT_PROVIDER.to_owned(),
+        provider: String::new(),
         model: DEFAULT_MODEL.to_owned(),
         tool_profile: None,
         cwd: Some(req.cwd.clone()),
@@ -717,9 +714,9 @@ mod tests {
 
         // The absolute cwd is carried through unchanged (never dropped).
         assert_eq!(config.cwd, Some(cwd));
-        // Provider/model fall back to the fixed defaults (ACP carries no LLM
-        // selection).
-        assert_eq!(config.provider, DEFAULT_PROVIDER);
+        // ACP carries no LLM selection: the provider is empty so the engine
+        // binds the configured default agent; the model keeps its placeholder.
+        assert_eq!(config.provider, "");
         assert_eq!(config.model, DEFAULT_MODEL);
         assert_eq!(config.tool_profile, None);
         assert_eq!(config.routing, mag_service::RoutingMode::default());

@@ -545,6 +545,7 @@ pub struct SessionDefaults {
     routing: Option<RoutingModeKind>,
     persist_path: Option<PathBuf>,
     budget: Option<Budget>,
+    default_agent: Option<String>,
 }
 
 impl SessionDefaults {
@@ -553,6 +554,7 @@ impl SessionDefaults {
         routing: None,
         persist_path: None,
         budget: None,
+        default_agent: None,
     };
 
     /// Raw routing mode, when the config sets one.
@@ -576,11 +578,18 @@ impl SessionDefaults {
         self.budget
     }
 
+    /// Name of the `[agents.<name>]` entry new sessions bind to by default,
+    /// when configured (`None` falls back to the `default` entry).
+    pub fn default_agent(&self) -> Option<&str> {
+        self.default_agent.as_deref()
+    }
+
     fn to_dto(&self) -> SessionDefaultsDto {
         SessionDefaultsDto {
             routing: self.routing.map(|r| r.as_str().to_string()),
             persist_path: self.persist_path.clone(),
             budget: self.budget.map(Budget::to_dto),
+            default_agent: self.default_agent.clone(),
         }
     }
 }
@@ -663,6 +672,8 @@ impl ConfigSnapshot {
     /// - `tools.<name>.approval` / `approval.default_policy` — must be
     ///   `"ask"` / `"allow"` / `"deny"`.
     /// - `session.routing` — must be `"model_routed"` or `"dispatcher"`.
+    /// - `session.default_agent` — when set, must name an existing
+    ///   `[agents.<name>]` entry (dangling references are rejected).
     /// - `external_agents.<name>.kind` — must be `"acp"`.
     ///
     /// Tool names referenced by `agents.<name>.tools` are *not* required to
@@ -764,6 +775,7 @@ impl ConfigSnapshot {
                     routing,
                     persist_path: s.persist_path.clone(),
                     budget: s.budget.map(Budget::from),
+                    default_agent: s.default_agent.clone(),
                 }))
             })
             .transpose()?;
@@ -838,6 +850,19 @@ impl ConfigSnapshot {
                     budget: a.budget.map(Budget::from),
                 }),
             );
+        }
+
+        // `[session].default_agent` must name an existing agent entry (same
+        // dangling-reference rule as `agents.<name>.provider`).
+        if let Some(default_agent) = session_defaults
+            .as_ref()
+            .and_then(|s| s.default_agent.as_deref())
+            && !agents.contains_key(default_agent)
+        {
+            return Err(ConfigError::validation(
+                "session.default_agent",
+                format!("unknown agent {default_agent:?} (no [agents.{default_agent}] entry)"),
+            ));
         }
 
         Ok(Self {

@@ -199,6 +199,11 @@ pub struct SessionDefaultsDto {
     /// Default per-run budget for new sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<BudgetDto>,
+    /// Name of the `[agents.<name>]` entry new sessions bind to when the
+    /// session request names no agent; validated at resolve time against
+    /// `agents` (an unset key falls back to the `default` entry).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_agent: Option<String>,
 }
 
 /// Approval defaults (`[approval]`).

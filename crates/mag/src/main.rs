@@ -59,6 +59,9 @@ struct Cli {
     config: Option<PathBuf>,
     /// Existing session to resume when running the terminal CLI.
     resume: Option<SessionId>,
+    /// Agent entry new terminal-CLI sessions bind to, overriding the
+    /// configured `[session].default_agent`.
+    agent: Option<String>,
     /// Web bind host.
     web_host: IpAddr,
     /// Web bind port.
@@ -80,6 +83,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
         web: false,
         config: None,
         resume: None,
+        agent: None,
         web_host: IpAddr::V4(Ipv4Addr::LOCALHOST),
         web_port: 8080,
         web_token: None,
@@ -104,6 +108,15 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
                     .next()
                     .ok_or_else(|| "--resume expects a session id argument".to_owned())?;
                 cli.resume = Some(parse_session_id(&value)?);
+            }
+            "--agent" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--agent expects an agent name argument".to_owned())?;
+                if value.is_empty() {
+                    return Err("--agent expects a non-empty agent name".to_owned());
+                }
+                cli.agent = Some(value);
             }
             "--host" => {
                 let value = args
@@ -146,6 +159,13 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, String> {
                     return Err("--resume expects a non-empty session id".to_owned());
                 }
                 cli.resume = Some(parse_session_id(value)?);
+            }
+            _ if arg.starts_with("--agent=") => {
+                let value = arg.trim_start_matches("--agent=");
+                if value.is_empty() {
+                    return Err("--agent expects a non-empty agent name".to_owned());
+                }
+                cli.agent = Some(value.to_owned());
             }
             _ if arg.starts_with("--host=") => {
                 let value = arg.trim_start_matches("--host=");
@@ -228,7 +248,7 @@ fn default_config_path() -> PathBuf {
 fn usage(write: &mut dyn std::io::Write) {
     let _ = writeln!(
         write,
-        "usage: mag [--config <path>] [--resume <session-id>] [--acp] [--web [--host <addr>] [--port <n>] [--token <t>] [--no-auth]]"
+        "usage: mag [--config <path>] [--resume <session-id>] [--agent <name>] [--acp] [--web [--host <addr>] [--port <n>] [--token <t>] [--no-auth]]"
     );
     let _ = writeln!(write, "  (no --acp/--web) run the terminal CLI");
     let _ = writeln!(
@@ -259,6 +279,10 @@ fn usage(write: &mut dyn std::io::Write) {
     let _ = writeln!(
         write,
         "  --resume <id>    resume an existing CLI session at startup"
+    );
+    let _ = writeln!(
+        write,
+        "  --agent <name>   agent entry new CLI sessions bind to (overrides [session].default_agent)"
     );
     let _ = writeln!(write, "  --help, -h       show this help");
 }
@@ -387,6 +411,11 @@ async fn main() -> ExitCode {
         usage(&mut std::io::stderr());
         return ExitCode::from(2);
     }
+    if (cli.acp || cli.web) && cli.agent.is_some() {
+        eprintln!("mag: --agent is only supported by the terminal CLI");
+        usage(&mut std::io::stderr());
+        return ExitCode::from(2);
+    }
 
     let config_path = cli.config.clone().unwrap_or_else(default_config_path);
     let engine = match assemble_engine(&config_path) {
@@ -416,10 +445,13 @@ async fn main() -> ExitCode {
             }
         }
     } else {
-        let opts = CliOptions {
+        let mut opts = CliOptions {
             resume: cli.resume,
             ..CliOptions::default()
         };
+        if let Some(agent) = cli.agent {
+            opts.session.provider = agent;
+        }
         match TerminalCli::run(service, opts).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
@@ -481,6 +513,18 @@ mod tests {
             .expect_err("conflicting auth flags must fail");
 
         assert!(error.contains("--token and --no-auth"));
+    }
+
+    #[test]
+    fn agent_flag_parses_both_forms_and_rejects_an_empty_name() {
+        let cli = parse(&["--agent", "reviewer"]).expect("agent flag parses");
+        assert_eq!(cli.agent.as_deref(), Some("reviewer"));
+
+        let cli = parse(&["--agent=reviewer"]).expect("--agent= form parses");
+        assert_eq!(cli.agent.as_deref(), Some("reviewer"));
+
+        let error = parse(&["--agent="]).expect_err("empty agent name must fail");
+        assert!(error.contains("--agent"), "error: {error}");
     }
 
     #[test]

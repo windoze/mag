@@ -70,6 +70,7 @@ crates/mag (bin)   唯一装配点：读配置 → 构造 mag-core::Engine → A
 ```
 mag                  交互式 CLI（本设计；默认子命令）
 mag --resume <id>    恢复指定会话后进入 CLI
+mag --agent <name>   新会话绑定的 agent 条目（覆盖 [session].default_agent）
 mag --config <path>  指定配置文件（缺省 ~/.config/mag/config.toml）
 mag --acp            ACP server over stdio（现有，不动；同样改走配置装配）
 ```
@@ -329,7 +330,7 @@ model/system 恒定。再叠加快照一致性：会话的 provider/工具装配
 | providers / external_agents（来源增删改） | **新会话**立即用新 DO 图；既有会话钉住创建时的 `Arc<ConfigSnapshot>`（持引用即钉住，零拷贝） |
 | agents.*（agent 定义：model/tools/system） | 同上；`apply_config`（全局无参）把 current 图**排队到各会话下一 turn 边界/闲置点**应用（覆盖 model/tools/system_prompt） |
 | tools.*.approval（审批策略） | **仅会话（重）建时生效**：`ApprovalPolicy` 在 facade agent build 时烤死（agent-lib 无 reconfigure 变体），改审批策略对既有会话不生效；`apply_config` 也不覆盖它 |
-| session 缺省（routing/budget） | 只影响新会话 |
+| session 缺省（routing/budget/default_agent） | 只影响新会话 |
 
 - 会话钉住的实现：`create_session` 时取 `current.clone()`（`Arc`）存入会话状态；restore 时
   快照中的会话 config 决定重建哪一版装配（持久化的是 DTO 形态的会话配置，恢复时 resolve 成

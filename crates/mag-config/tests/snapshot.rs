@@ -174,6 +174,45 @@ fn dto_do_dto_round_trip_is_lossless() {
 }
 
 #[test]
+fn session_default_agent_resolves_round_trips_and_must_exist() {
+    let dto = ConfigDto::parse_str(
+        r#"
+[agents.default]
+model = "model-d"
+
+[agents.reviewer]
+model = "model-r"
+
+[session]
+default_agent = "reviewer"
+"#,
+    )
+    .expect("parse");
+    let snapshot = ConfigSnapshot::resolve(&dto, 1).expect("resolve");
+    assert_eq!(
+        snapshot.session_defaults().default_agent(),
+        Some("reviewer")
+    );
+    assert_eq!(snapshot.project(), dto, "DTO→DO→DTO must be lossless");
+
+    // A dangling default_agent reference is rejected like a dangling
+    // agents.<name>.provider reference.
+    let dto = ConfigDto::parse_str(
+        r#"
+[agents.default]
+
+[session]
+default_agent = "ghost"
+"#,
+    )
+    .expect("parse");
+    let error = ConfigSnapshot::resolve(&dto, 1).expect_err("dangling default_agent must fail");
+    let (path, message) = validation_path(&error);
+    assert_eq!(path, "session.default_agent");
+    assert!(message.contains("ghost"), "message: {message}");
+}
+
+#[test]
 fn explicit_empty_tool_list_is_distinct_from_no_tool_list() {
     let dto = ConfigDto::parse_str(
         r#"

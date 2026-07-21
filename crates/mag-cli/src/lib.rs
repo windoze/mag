@@ -28,10 +28,6 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-/// Default provider used when the CLI creates a session without a user-supplied
-/// agent selection.
-pub const DEFAULT_PROVIDER: &str = "openai";
-
 /// Default model used when the CLI creates a session without a user-supplied
 /// agent selection.
 pub const DEFAULT_MODEL: &str = "gpt-5-codex";
@@ -66,7 +62,10 @@ impl Default for CliOptions {
     fn default() -> Self {
         Self {
             session: SessionConfig {
-                provider: DEFAULT_PROVIDER.to_owned(),
+                // An empty provider names no agent: on a configuration-backed
+                // engine the session binds the configured default agent
+                // (`[session].default_agent`, else the `default` entry).
+                provider: String::new(),
                 model: DEFAULT_MODEL.to_owned(),
                 tool_profile: None,
                 cwd: None,

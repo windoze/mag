@@ -19,4 +19,10 @@ persist_path?: string,
 /**
  * Default per-run budget for new sessions.
  */
-budget?: BudgetDto, };
+budget?: BudgetDto, 
+/**
+ * Name of the `[agents.<name>]` entry new sessions bind to when the
+ * session request names no agent; validated at resolve time against
+ * `agents` (an unset key falls back to the `default` entry).
+ */
+default_agent?: string, };
