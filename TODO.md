@@ -42,7 +42,7 @@
 
 ## M1 — agent-lib：一次性 external 调用面
 
-### M1-1 [TODO] agent-lib：pub `run_external_once` + `ExternalDriveOutcome` 提 pub + completed 回收
+### M1-1 [DONE] agent-lib：pub `run_external_once` + `ExternalDriveOutcome` 提 pub + completed 回收
 
 **目标**：给 mag 提供一个"拉起 external ACP agent → 跑一个 task → 拿最终文本 → 回收进程"的
 一次性 pub API。这是本计划在 agent-lib 的**唯一**新表面。
@@ -96,6 +96,48 @@
   且回收生效；④ 无 session_handler 报错路径。
 - 门禁：`cd ../agent-lib && cargo fmt -- --check && cargo clippy --all-targets -- -D warnings
   && cargo test`；再回 mag 根 `cargo test --workspace` 确认下游无破坏。
+
+**完成记录**（2026-07-22）：
+
+- 改动（agent-lib）：
+  - `src/facade/external/delegate.rs`：`ExternalDriveOutcome` 提 `pub`（字段不动，rustdoc 补
+    一句宿主经 `run_external_once` 获取）；新增 `pub async fn run_external_once`（签名与任务
+    单一致，内部 `CollabBridge::default()` + `RunContext::new_root_with_cancellation` 自建
+    root ctx，trace 根标签 `"external-once"`）；completed 时 wrapper 自己补一次 detached
+    sweep。
+  - 为拿到 drive 使用的 `agent_id`（`FacadeIds` 计数器单调、无法二次 mint 同值），把
+    `drive_external` 主体抽为私有 `drive_external_with_agent_id`（返回值多带一个
+    `AgentId`），`drive_external` 保持原签名原语义的薄包装——mint 位置、驱动逻辑、sweep
+    条件 `!captured.completed` **逐字未动**，旧静态委派路径（`facade/delegate/handler.rs`）
+    行为零变化。sweep 体抽为共用 `spawn_external_cleanup_sweep`（trace 节点 id 格式
+    `external-cleanup-sweep/{run_id}/{agent_id}/{seq}` 不变，completed sweep 与
+    uncommitted sweep 互斥，无重复 id）。
+  - re-export：`facade::external::{run_external_once, ExternalDriveOutcome}`，并按 crate
+    惯例在 facade 根（`agent_lib::facade::`）同步 re-export。
+  - rustdoc：一次性语义、三终态回收保证（failed/cancelled 由 drive 内部既有 sweep、
+    completed 由 wrapper 补 sweep）、detached 后台回收语义、`session_handler` 缺失返回
+    `FacadeError::ExternalAgent`。
+- 新增测试（`src/facade/external/tests.rs`，全部离线、**不依赖任何 `external-*` feature**，
+  默认 `cargo test` 即运行；新增非门控 fake adapter/session `OnceFakeAdapter`/
+  `OnceFakeSession` 置于真实 `ExternalSessionRegistry` 之后，并解除既有
+  `RecordingWorktreeManager`/`observed_within` 两个测试基建的 cfg 门控以复用）：
+  - `run_external_once_completes_and_returns_summary`（happy path，summary 回收）；
+  - `run_external_once_completed_sweeps_the_live_session`（返回时 registry 尚有 1 个存活
+    session → wrapper 的 detached sweep 落地后 `live_len()==0`、shutdown 计数 1、worktree
+    cleanup 1）；
+  - `run_external_once_cancel_abandons_and_sweeps_the_live_session`（advance 悬挂 + 50ms
+    cancel → 5s 内返回 `completed=false`/`cleanup_required=true` → sweep 回收生效）；
+  - `run_external_once_without_session_handler_fails_fast`（`FacadeError::ExternalAgent`，
+    报文含 `no runtime session handler`）。
+- 门禁结果：agent-lib `cargo fmt -- --check` ✅、`cargo clippy --all-targets -- -D warnings`
+  ✅（默认与 `--features external-acp` 两组合）、`cargo test` ✅（默认 feature lib 1061
+  passed 含 4 个新测试；`--features external-acp` 40 套件全绿，既有 gated sweep/路由测试
+  不受影响）；mag 根 `cargo check --workspace` ✅、`cargo test --workspace` ✅（32 套件全
+  ok，0 失败）。
+- 偏差：仅实现形态两点（① 私有助手 `drive_external_with_agent_id` 返回 `AgentId` 供
+  wrapper 补 sweep，而非任务单设想的"直接调 `drive_external`"——原因是 `FacadeIds` 无法
+  复现同值 mint；② 新测试走非门控 fake adapter 而非 `external-acp` gated 基建，保证默认
+  门禁命令即可执行）。无语义偏差。
 
 ### M1-R [TODO] M1 review：一次性 external 调用面
 
