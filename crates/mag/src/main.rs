@@ -244,6 +244,21 @@ fn default_config_path() -> PathBuf {
     PathBuf::from("mag").join("config.toml")
 }
 
+/// The default session persistence directory used when the configuration
+/// sets no `[session].persist_path`: `$XDG_DATA_HOME/mag` when
+/// `XDG_DATA_HOME` is set, else `~/.local/share/mag`; when neither variable
+/// is available the relative `mag/data` is used. An explicit
+/// `[session].persist_path` always wins over this default.
+fn default_data_dir() -> PathBuf {
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(xdg).join("mag");
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(home).join(".local").join("share").join("mag");
+    }
+    PathBuf::from("mag").join("data")
+}
+
 /// Prints the usage text.
 fn usage(write: &mut dyn std::io::Write) {
     let _ = writeln!(
@@ -289,7 +304,9 @@ fn usage(write: &mut dyn std::io::Write) {
 
 /// Assembles the configured engine: loads the configuration (a missing file
 /// yields the built-in default configuration with an info log, never an
-/// error) and builds the engine from it.
+/// error) and builds the engine from it. Sessions persist under
+/// [`default_data_dir`] unless the configuration sets its own
+/// `[session].persist_path`.
 fn assemble_engine(config_path: &std::path::Path) -> Result<Engine, String> {
     if !config_path.exists() {
         eprintln!(
@@ -299,7 +316,7 @@ fn assemble_engine(config_path: &std::path::Path) -> Result<Engine, String> {
     }
     let config = ConfigService::load_or_default(config_path)
         .map_err(|error| format!("failed to load config {}: {error}", config_path.display()))?;
-    Engine::from_config(Arc::new(config))
+    Engine::from_config_with_default_persist_path(Arc::new(config), &default_data_dir())
         .map_err(|error| format!("failed to assemble from {}: {error}", config_path.display()))
 }
 

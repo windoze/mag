@@ -32,7 +32,11 @@
 //! the strongest semantics agent-lib's build-time approval surface allows
 //! (`docs/CLI.md` §4.4, decision D2).
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use agent_lib::{
     adapter::{anthropic::AnthropicAdapter, openai_resp::OpenAiRespAdapter},
@@ -180,12 +184,36 @@ impl Engine {
     /// failure is a diagnosable error, never a silent downgrade (`docs/CLI.md`
     /// §4.2).
     pub fn from_config(config_service: Arc<ConfigService>) -> Result<Self, EngineError> {
+        Self::from_config_impl(config_service, None)
+    }
+
+    /// Like [`from_config`](Engine::from_config), but when the configuration
+    /// sets no `[session].persist_path`, sessions are persisted under
+    /// `default_persist_dir` instead of a private in-memory store. Interface
+    /// binaries use this to give sessions a durable default home; an explicit
+    /// `[session].persist_path` always wins.
+    ///
+    /// # Errors
+    ///
+    /// Same contract as [`from_config`](Engine::from_config), with the
+    /// persistence errors now also covering `default_persist_dir`.
+    pub fn from_config_with_default_persist_path(
+        config_service: Arc<ConfigService>,
+        default_persist_dir: &Path,
+    ) -> Result<Self, EngineError> {
+        Self::from_config_impl(config_service, Some(default_persist_dir))
+    }
+
+    fn from_config_impl(
+        config_service: Arc<ConfigService>,
+        default_persist_dir: Option<&Path>,
+    ) -> Result<Self, EngineError> {
         let snapshot = config_service.current();
         reject_external_agents_without_feature(&snapshot)?;
         let tools = assemble_tool_registry(&snapshot);
         let sources = assemble_source_registry(&snapshot);
         let client = assemble_llm_client(&snapshot, &sources)?;
-        let store = open_session_store(&snapshot)?;
+        let store = open_session_store(&snapshot, default_persist_dir)?;
         Ok(Self::assemble(
             client,
             Arc::new(tools),
@@ -375,12 +403,20 @@ fn client_for_provider(provider_config: ProviderConfig) -> Result<Arc<dyn LlmCli
 
 /// Opens the session persistence store selected by `snapshot`: a SQLite
 /// database inside the configured `[session].persist_path` directory (created
-/// when missing), or a private in-memory store when the configuration sets no
-/// persistence path.
-fn open_session_store(snapshot: &ConfigSnapshot) -> Result<Arc<Persistence>, EngineError> {
-    match snapshot.session_defaults().persist_path() {
+/// when missing), else inside `default_persist_dir` when the caller supplies
+/// one, or a private in-memory store when neither is set.
+fn open_session_store(
+    snapshot: &ConfigSnapshot,
+    default_persist_dir: Option<&Path>,
+) -> Result<Arc<Persistence>, EngineError> {
+    let dir = snapshot
+        .session_defaults()
+        .persist_path()
+        .map(PathBuf::from)
+        .or_else(|| default_persist_dir.map(PathBuf::from));
+    match dir {
         Some(dir) => {
-            std::fs::create_dir_all(dir)?;
+            std::fs::create_dir_all(&dir)?;
             Ok(Arc::new(Persistence::open(dir.join(SESSION_DB_FILENAME))?))
         }
         None => Ok(crate::engine::in_memory_store()),
@@ -990,6 +1026,71 @@ model = "gpt-5-codex"
         assert!(
             persist_dir.join(SESSION_DB_FILENAME).exists(),
             "session store created under the configured persist_path"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_config_with_default_persist_path_persists_without_a_config_key() {
+        let dir = TempDir::new("default-persist");
+        let persist_dir = dir.0.join("data");
+        // No config file at all: the default configuration sets no
+        // [session].persist_path, so the caller-supplied default applies.
+        let service =
+            Arc::new(ConfigService::load_or_default(dir.config_path()).expect("load config"));
+
+        let engine =
+            Engine::from_config_with_default_persist_path(Arc::clone(&service), &persist_dir)
+                .expect("assembles");
+        let session = engine
+            .create_session(session_config("default", "any-model"))
+            .await
+            .expect("create session");
+
+        assert!(
+            persist_dir.join(SESSION_DB_FILENAME).exists(),
+            "session store created under the default persist dir"
+        );
+
+        // A second engine over the same default dir finds the session
+        // persisted by the first (the store is the listing's source of truth;
+        // resuming would additionally need an LLM client this config lacks).
+        drop(engine);
+        let engine2 = Engine::from_config_with_default_persist_path(service, &persist_dir)
+            .expect("assembles");
+        let sessions = engine2.list_sessions().await.expect("list sessions");
+        assert!(
+            sessions.iter().any(|info| info.id == session),
+            "persisted session visible to a restarted engine"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_persist_path_wins_over_the_default() {
+        let dir = TempDir::new("persist-wins");
+        let configured = dir.0.join("configured");
+        let fallback = dir.0.join("fallback");
+        let config = format!(
+            "[session]\npersist_path = {:?}\n",
+            configured.to_string_lossy()
+        );
+        fs::write(dir.config_path(), &config).expect("write config");
+        let service =
+            Arc::new(ConfigService::load_or_default(dir.config_path()).expect("load config"));
+
+        let engine =
+            Engine::from_config_with_default_persist_path(service, &fallback).expect("assembles");
+        engine
+            .create_session(session_config("default", "any-model"))
+            .await
+            .expect("create session");
+
+        assert!(
+            configured.join(SESSION_DB_FILENAME).exists(),
+            "configured persist_path used"
+        );
+        assert!(
+            !fallback.join(SESSION_DB_FILENAME).exists(),
+            "default dir untouched when persist_path is configured"
         );
     }
 
