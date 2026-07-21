@@ -8,6 +8,10 @@ mod driver;
 mod engine;
 mod event_bus;
 mod history;
+// Skeleton consumed by the M3-3/M3-4 tool handlers and drive tasks; the
+// allowance is removed once those land (TODO.md M3-2).
+#[allow(dead_code)]
+mod instances;
 mod persistence;
 mod session;
 mod turn_complete;

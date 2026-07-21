@@ -518,7 +518,7 @@ service 层投影给所有 interface。
   语义，`DelegationStatusWire` 的 `#[default] Started` 是 `DelegationTrace` 字段缺省
   所需，此处无对应场景）。
 
-### M3-2 [TODO] mag-core：`AgentInstanceRegistry` 实例注册表
+### M3-2 [DONE] mag-core：`AgentInstanceRegistry` 实例注册表
 
 **目标**：新增 `crates/mag-core/src/instances.rs`（模块骨架），提供跨工具调用、跨任务共享的
 实例状态表。
@@ -549,6 +549,73 @@ service 层投影给所有 interface。
 
 **验证**：模块内单测——id 递增、complete/cancel 状态迁移 + Notify 唤醒、cancel_all、并发
 register（`tokio::test` 多 task）。门禁全绿。
+
+**完成记录**（2026-07-22）：
+
+- 改动：
+  - `crates/mag-core/src/instances.rs`（新，约 560 行含测试）：`AgentInstanceRegistry`
+    （`#[derive(Clone)]` 句柄，内裹 `Arc<RegistryInner>`，风格对照 `EventBus`；
+    `RegistryInner` 持有 `counters: Mutex<BTreeMap<String,u64>>`、
+    `instances: Mutex<BTreeMap<String,Arc<Instance>>>`（BTreeMap 使 `list()` 输出确定）、
+    `notifications: Mutex<VecDeque<String>>`）；`Instance`（`pub id/agent_type/depth` +
+    私有 `status: Mutex<InstanceStatus>`、`cancel: CancelHandle`、`done: Notify`，经
+    `status()`/`cancel_handle()`/`done()` 访问）；`InstanceStatus`（`Running |
+    Completed{report} | Failed{error} | Cancelled}`，`is_terminal()`）。
+  - API：`next_id(type)`（per-type 计数从 1 递增，`"<type>-<n>"`）、`register(instance)
+    -> Arc<Instance>`、`get`、`list`、`complete(id, status) -> bool`（首次终态迁移生效：
+    置状态 + `notify_waiters` + 推通知；未知 id 或已终态返回 false）、`cancel(id) ->
+    Option<InstanceStatus>`（首次迁移到 Cancelled 才触发 CancelHandle——已终态不覆盖、
+    句柄至多触发一次，返回调用后状态快照）、`cancel_all()`（级联取消全部 Running
+    实例，供 M3-5 session 结束/cancel 级联）、`drain_notifications()`。
+  - `crates/mag-core/src/lib.rs`：注册 `mod instances;`（私有模块，全部项
+    `pub(crate)`）。
+- cancel 句柄最终选择：**直接用 agent-lib 的 `CancelHandle`**（任务单第 3 点的备选
+  `CancellationToken` 未启用）。核实结果：`CancelHandle` 在 `agent-lib/src/facade/
+  agent.rs:103` 为 `pub`（`new()`/`cancel()`/`is_cancelled()` 均 pub），且经
+  `facade/mod.rs:54` re-export 到 `agent_lib::facade::CancelHandle`；mag-core 既有代码
+  （`session.rs:28`、`driver.rs:47`）已在用同一路径。M3-3 驱动任务可直接把
+  `instance.cancel_handle()` 传给 `Agent::run_full_with_cancel`。
+- 竞态裁决：全部终态迁移走 `Instance::transition` 单一入口，**首次终态迁移胜出**
+  （M3-R 要求的"cancel 与 complete 同时发生最终状态唯一"）：并发的
+  complete/cancel/cancel_all 只有一个生效并产生恰好一条通知；`cancel` 只在胜出时
+  触发 CancelHandle，不覆盖已达成的 Completed 报告。
+- 通知队列：通知文本在迁移胜出时生成——`completed: <报告前 200 字符>`（按 char
+  计、`\n` 折叠为空格、超长加 `...`）、`failed: <error 同样截断>`、`cancelled`
+  （无摘要）；M3-6 经 `drain_notifications()` 消费。
+- 测试（模块内 9 个，全离线，聚焦 `cargo test -p mag-core instances` 全绿）——TODO
+  清单逐项：id 递增 per-type 独立 `ids_increment_per_type_independently`；complete
+  状态迁移 + Notify 唤醒 + 通知 `complete_transitions_status_wakes_waiters_and_
+  notifies`（含二次 complete 幂等）；cancel 迁移 + 句柄触发 + 唤醒
+  `cancel_fires_handle_transitions_and_wakes_waiters`；cancel_all
+  `cancel_all_cancels_only_running_instances`（已终态不动、句柄不触发、三态通知
+  顺序断言、二次级联幂等）；并发 register
+  `concurrent_registration_allocates_unique_ids`（8 task × 10 id，current_thread +
+  `tokio::spawn`，80 id 唯一无空洞）；补充用例：
+  `register_get_and_list_round_trip`、`complete_notification_previews_and_flattens_
+  long_reports`（200 字符截断 + 换行折叠）、`cancel_after_completion_keeps_the_
+  completed_report`（complete 胜出竞态）、`unknown_ids_are_no_ops`。Notify 唤醒断言
+  统一用 `Notified::enable()` 先注册再迁移的无竞态范式（`done()` rustdoc 已注明
+  M3-4 的 `agent_result` 必须沿用同一范式，否则错过 check 与 wait 之间的迁移）。
+- 门禁结果：`cargo fmt --all -- --check` ✅；`cargo test -p mag-core instances`
+  ✅（9 passed，0 失败）；`cargo clippy --all-targets -- -D warnings` ✅（0
+  warning）；`cargo test --workspace` ✅（32 套件全 ok，0 失败）；
+  `cargo doc --no-deps --workspace` ✅（mag-config 1 个既有 rustdoc warning，与
+  本任务无关，同 M3-1 记录）。
+- 偏差（均为实现形态，无语义偏差）：
+  1. 任务单代码块写 `pub struct AgentInstanceRegistry`；实现统一 `pub(crate)`——
+     消费方（M3-3/3-4 工具、M3-5 接线、M3-6 通知 drain）全在 mag-core crate 内，
+     interface 只经 wire 事件观察实例生命周期，不扩大 crate 公共表面。
+  2. 通知不只 `complete()` 生成：`cancel`/`cancel_all` 的胜出迁移同样推通知
+     （单一迁移入口自然结果；supervisor run cancel 级联后残留通知正好供 M3-6
+     下一次输入前缀消费）。首次迁移胜出保证每实例恰好一条。
+  3. API 清单补 `drain_notifications()`——任务单第 4 点要求 M3-6 消费队列，无
+     drain 则队列无读取端。
+  4. `mod instances;` 暂挂 `#[allow(dead_code)]`（lib.rs 处附注释）：骨架的消费
+     者 M3-3 才落地，否则 `clippy -D warnings` 门禁被 dead_code 卡住；M3-3 接线
+     时移除。
+  5. `register` 签名为 `register(instance: Instance) -> Arc<Instance>`（注册并返回
+     共享句柄），调用流程 `next_id` → `Instance::new` → `register`，与 M3-3
+     "register 后 spawn_local"的顺序一致。
 
 ### M3-3 [TODO] mag-core：`agent` spawn 工具 + 实例驱动任务 + origin 路由 + 分层 prompt
 
