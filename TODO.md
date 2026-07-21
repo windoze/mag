@@ -139,7 +139,7 @@
   复现同值 mint；② 新测试走非门控 fake adapter 而非 `external-acp` gated 基建，保证默认
   门禁命令即可执行）。无语义偏差。
 
-### M1-R [TODO] M1 review：一次性 external 调用面
+### M1-R [DONE] M1 review：一次性 external 调用面
 
 **内容**：
 - review M1 全部 diff：新表面是否最小（只此一个函数 + outcome 提 pub）；`drive_external` 旧
@@ -149,6 +149,34 @@
 - 对照设计文档 `docs/dyn-agents.md` §6 确认语义一致（按实例拉起、完成回收）。
 
 **验证**：门禁序列全绿；review 发现的问题已修复并附完成记录。
+
+**完成记录**（2026-07-22）：review 通过，未发现问题，agent-lib 零改动。
+
+- review 范围：`git diff c1f7751..8db05c7` 全量（4 文件，+491/-54）。
+- 新表面最小：pub 新增仅 `run_external_once` + `ExternalDriveOutcome` 提 pub（re-export
+  路径 `facade::external::` 与 facade 根两处，符合 crate 惯例）；`drive_external_with_agent_id`
+  与 `spawn_external_cleanup_sweep` 均为私有。
+- 旧静态委派路径零变化（唯一旧调用方 `facade/delegate/handler.rs:807`）：`agent_id` mint
+  位置（worker 内 `ids.agent_id()`）未动；sweep 条件 `!captured.completed` 逐字未动；
+  trace 节点 id 格式 `external-cleanup-sweep/{run_id}/{agent_id}/{seq}` 未动；`drive_external`
+  保持原签名，仅为丢弃 `AgentId` 的薄包装。
+- completed 补 sweep 确为 wrapper 自身行为：`run_external_once` 内 `outcome.completed &&
+  session_handler` 才补扫，与 drive 的 uncommitted sweep 互斥（completed 时 drive 不扫），
+  trace id 无碰撞；错误返回路径（`?`）由 drive 内部 sweep 覆盖，无泄漏。
+- rustdoc 完整：一次性语义、三终态回收保证、detached 后台回收、缺 `session_handler` 报
+  `FacadeError::ExternalAgent`，intra-doc 链接指向真实存在的方法。
+- `#[non_exhaustive]` 判断：`ExternalDriveOutcome` 未加，与同文件同为「事实捕获 DO」的
+  pub 结构 `RetainedExternalSession`（pub 字段、无 non_exhaustive）一致——模块内惯例统一，
+  合理，不改。
+- 测试断言真实回收：detached sweep 的落地经 `observed_within` 轮询断言
+  （`live_len()==0` + shutdown 计数 + worktree cleanup 计数），非竞态猜测；completed 测试
+  还先断言返回瞬间 registry 仍有 1 个存活 session（证明回收来自 wrapper 补扫而非 drive）。
+- 语义对照 `docs/dyn-agents.md` §6：按实例拉起 + 三终态（completed/failed/cancelled）回收，
+  一致。
+- 门禁（全部实跑复验）：agent-lib 默认 feature `cargo fmt -- --check` ✅、
+  `cargo clippy --all-targets -- -D warnings` ✅、`cargo test` ✅（4 个
+  `run_external_once_*` 新测试单独复跑全绿）；`--features external-acp` clippy ✅、test ✅
+  （全套件 0 失败）；mag 根 `cargo test --workspace` ✅（32 套件全 ok，0 失败）。
 
 ---
 
