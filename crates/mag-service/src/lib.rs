@@ -304,6 +304,38 @@ pub enum Event {
         /// Delegated-agent message payload.
         message: DelegationMessageWire,
     },
+    /// An agent instance spawned through the `agent` tool started
+    /// (`docs/dyn-agents.md`, decision D3).
+    AgentInstanceStarted {
+        /// Session that owns the instance.
+        id: SessionId,
+        /// Stable instance identity (`"<type>-<n>"`, per-type counter).
+        instance_id: String,
+        /// Agent type (definition name) the instance was spawned from.
+        agent_type: String,
+        /// Optional human-readable task description.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        /// Nesting depth: `1` for a direct child of the session's root agent.
+        depth: u32,
+    },
+    /// An agent instance reached a terminal state (`docs/dyn-agents.md`).
+    AgentInstanceFinished {
+        /// Session that owns the instance.
+        id: SessionId,
+        /// Stable instance identity (`"<type>-<n>"`, per-type counter).
+        instance_id: String,
+        /// Agent type (definition name) the instance was spawned from.
+        agent_type: String,
+        /// Terminal status of the instance.
+        status: AgentInstanceStatusWire,
+        /// Final report text when the instance completed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        report: Option<String>,
+        /// Failure or cancellation detail when the instance did not complete.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     /// Local coding-agent probes completed.
     LocalAgentsProbed {
         /// Available sources discovered by the probe.
@@ -602,6 +634,24 @@ pub enum DelegationStatusWire {
     Finished,
     /// The delegation failed.
     Failed,
+}
+
+/// Wire-visible terminal state of an agent instance (`docs/dyn-agents.md`).
+///
+/// Unlike [`DelegationStatusWire`] there is no in-flight state: instance start
+/// is reported by [`Event::AgentInstanceStarted`] itself, so only terminal
+/// outcomes appear on [`Event::AgentInstanceFinished`].
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum AgentInstanceStatusWire {
+    /// The instance completed successfully; `report` carries the final text.
+    Completed,
+    /// The instance failed; `error` carries the failure detail.
+    Failed,
+    /// The instance was cancelled before completion.
+    Cancelled,
 }
 
 /// Message emitted by a delegated child agent.
@@ -929,6 +979,7 @@ mod ts_exports {
             .with_large_int("number");
 
         export_type::<AgentIdWire>(&config);
+        export_type::<AgentInstanceStatusWire>(&config);
         export_type::<ApprovalDecisionWire>(&config);
         export_type::<ApprovalRequirementWire>(&config);
         export_type::<Command>(&config);
@@ -1301,6 +1352,27 @@ mod tests {
                 "delegation_message",
             ),
             (
+                Event::AgentInstanceStarted {
+                    id: session_id(),
+                    instance_id: "explorer-1".to_owned(),
+                    agent_type: "explorer".to_owned(),
+                    description: Some("map the codebase".to_owned()),
+                    depth: 1,
+                },
+                "agent_instance_started",
+            ),
+            (
+                Event::AgentInstanceFinished {
+                    id: session_id(),
+                    instance_id: "explorer-1".to_owned(),
+                    agent_type: "explorer".to_owned(),
+                    status: AgentInstanceStatusWire::Completed,
+                    report: Some("found 3 call sites".to_owned()),
+                    error: None,
+                },
+                "agent_instance_finished",
+            ),
+            (
                 Event::LocalAgentsProbed {
                     available: vec![source()],
                 },
@@ -1321,6 +1393,21 @@ mod tests {
         for (event, expected_tag) in cases {
             assert_tag(&event, expected_tag);
             assert_round_trip(event);
+        }
+    }
+
+    #[test]
+    fn agent_instance_status_wire_round_trips_with_stable_tags() {
+        let cases = vec![
+            (AgentInstanceStatusWire::Completed, "completed"),
+            (AgentInstanceStatusWire::Failed, "failed"),
+            (AgentInstanceStatusWire::Cancelled, "cancelled"),
+        ];
+
+        for (status, expected_tag) in cases {
+            let json = serde_json::to_value(status).expect("serialize status");
+            assert_eq!(json, Value::String(expected_tag.to_owned()));
+            assert_round_trip(status);
         }
     }
 

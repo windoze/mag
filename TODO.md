@@ -448,7 +448,7 @@ assembly 原逻辑语义等价（对照 `assembly.rs:593-626`）。
 
 ## M3 — mag-core：local 实例运行时与接线（核心）
 
-### M3-1 [TODO] mag-service：实例生命周期 wire 事件 + ts-rs 再生成
+### M3-1 [DONE] mag-service：实例生命周期 wire 事件 + ts-rs 再生成
 
 **目标**：wire 层新增实例生命周期事件变体，供 M3-3 的实例驱动任务向 EventBus 发布、
 service 层投影给所有 interface。
@@ -477,6 +477,46 @@ service 层投影给所有 interface。
 **验证**：
 - mag-service 内投影单测（对照 `driver.rs:1478+` 既有 wire 投影测试风格）；
   `cargo test -p mag-service`；ts-rs 生成物 diff 干净；门禁序列全绿。
+
+**完成记录**（2026-07-22）：
+
+- 改动：
+  - `crates/mag-service/src/lib.rs`：`Event` 新增 `AgentInstanceStarted{id, instance_id,
+    agent_type, description, depth}` 与 `AgentInstanceFinished{id, instance_id, agent_type,
+    status, report, error}` 两变体（位于 `DelegationMessage` 之后；Option 字段沿用
+    `#[serde(default, skip_serializing_if = "Option::is_none")]` 惯例）；新增
+    `AgentInstanceStatusWire{Completed, Failed, Cancelled}`（`#[non_exhaustive]` +
+    serde snake_case + feature-gated `#[derive(TS)]`，风格对照 `DelegationStatusWire`；
+    不派生 `Default`——三态均终态、无缺省语义，与 `ToolStatusWire` 一致）；
+    `ts_exports::export_ts` 按字母序注册新类型。`Delegation*` 旧变体逐字未动。
+  - `crates/mag-service/src/service.rs`：`ServiceEvent` 同构追加两变体；`session_id()`
+    归入 session 级 `Some(*id)` 分支；`From<Event>` 投影逐字段同构追加。
+  - `ui/packages/protocol`（全部生成物，无手写 TS）：`cargo test -p mag-service
+    --features ts-export export_ts` 重新生成——新增 `generated/AgentInstanceStatusWire.ts`
+    （`"completed" | "failed" | "cancelled"`），`Event.ts`/`ServiceEvent.ts` 各追加两变体
+    （Option 字段导出为 `field?: string | null`），`index.ts` 按排序插入 export 行。
+- 测试（mag-service 内，全离线）：
+  - lib.rs：`event_variants_round_trip_and_keep_stable_tags` 补两变体（稳定 tag
+    `agent_instance_started`/`agent_instance_finished` + serde roundtrip）；新增
+    `agent_instance_status_wire_round_trips_with_stable_tags`（三态 wire tag + roundtrip）。
+  - service.rs：`service_event_variants_round_trip_and_keep_stable_tags` 补两变体；
+    `event_projects_into_matching_service_event` 补 Started 与 Finished(Failed) 投影
+    用例；`service_event_session_id_is_none_only_for_global_events` 补两变体 `Some(id)`
+    归属断言；新增 `agent_instance_finished_projects_for_all_terminal_statuses`——
+    Completed/Failed/Cancelled 三态逐一断言 Event→ServiceEvent 投影、payload 全字段
+    保留（投影前后 JSON 相等）、`session_id()` 归属、tag + serde roundtrip。
+- 门禁结果：`cargo fmt --all -- --check` ✅；`cargo test -p mag-service` ✅（29
+  passed，0 失败）；`cargo clippy --all-targets -- -D warnings` ✅（0 warning）；
+  `cargo test --workspace` ✅（全套件 0 失败）；`cargo doc --no-deps --workspace` ✅
+  （mag-config 有 1 个既有 rustdoc warning，与本任务无关）；前端 `npx tsc --noEmit -p
+  ui/packages/protocol/tsconfig.json` ✅；生成物 diff 即本任务提交内容，提交后
+  `git diff --exit-code -- ui/packages/protocol/src` 无漂移。
+- 偏差（仅实现形态，无语义偏差）：任务单代码块只列 payload 字段；两变体按既有
+  `Delegation*` 惯例以 `id: SessionId` 为首字段——这是任务单第 2 点"session_id()
+  归属正确"的前提（无该字段只能归全局），且 M3-3 的发布点本就持有 session 上下文。
+  `AgentInstanceStatusWire` 不派生 `Default`（对照 `ToolStatusWire`；终态枚举无缺省
+  语义，`DelegationStatusWire` 的 `#[default] Started` 是 `DelegationTrace` 字段缺省
+  所需，此处无对应场景）。
 
 ### M3-2 [TODO] mag-core：`AgentInstanceRegistry` 实例注册表
 

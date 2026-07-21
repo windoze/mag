@@ -19,9 +19,9 @@ use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt};
 
 use crate::{
-    DelegationMessageWire, DelegationTrace, Event, HistoryEntry, InteractionKindWire,
-    InteractionOrigin, InteractionResponseWire, RequestId, RunErrorKind, RunId, RunOutput,
-    SessionConfig, SessionId, SourceInfo, ToolTrace,
+    AgentInstanceStatusWire, DelegationMessageWire, DelegationTrace, Event, HistoryEntry,
+    InteractionKindWire, InteractionOrigin, InteractionResponseWire, RequestId, RunErrorKind,
+    RunId, RunOutput, SessionConfig, SessionId, SourceInfo, ToolTrace,
 };
 
 /// Transport-neutral service facade implemented by `mag-core::Engine`.
@@ -449,6 +449,38 @@ pub enum ServiceEvent {
         /// Delegated-agent message payload.
         message: DelegationMessageWire,
     },
+    /// An agent instance spawned through the `agent` tool started
+    /// (`docs/dyn-agents.md`, decision D3).
+    AgentInstanceStarted {
+        /// Session that owns the instance.
+        id: SessionId,
+        /// Stable instance identity (`"<type>-<n>"`, per-type counter).
+        instance_id: String,
+        /// Agent type (definition name) the instance was spawned from.
+        agent_type: String,
+        /// Optional human-readable task description.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        /// Nesting depth: `1` for a direct child of the session's root agent.
+        depth: u32,
+    },
+    /// An agent instance reached a terminal state (`docs/dyn-agents.md`).
+    AgentInstanceFinished {
+        /// Session that owns the instance.
+        id: SessionId,
+        /// Stable instance identity (`"<type>-<n>"`, per-type counter).
+        instance_id: String,
+        /// Agent type (definition name) the instance was spawned from.
+        agent_type: String,
+        /// Terminal status of the instance.
+        status: AgentInstanceStatusWire,
+        /// Final report text when the instance completed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        report: Option<String>,
+        /// Failure or cancellation detail when the instance did not complete.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     /// Local coding-agent probes completed.
     LocalAgentsProbed {
         /// Available sources discovered by the probe.
@@ -516,6 +548,8 @@ impl ServiceEvent {
             | Self::DelegationFinished { id, .. }
             | Self::DelegationFailed { id, .. }
             | Self::DelegationMessage { id, .. }
+            | Self::AgentInstanceStarted { id, .. }
+            | Self::AgentInstanceFinished { id, .. }
             | Self::PivotQueued { id, .. }
             | Self::PivotApplied { id, .. }
             | Self::PivotDropped { id, .. } => Some(*id),
@@ -556,6 +590,34 @@ impl From<Event> for ServiceEvent {
             Event::DelegationFinished { id, trace } => Self::DelegationFinished { id, trace },
             Event::DelegationFailed { id, trace } => Self::DelegationFailed { id, trace },
             Event::DelegationMessage { id, message } => Self::DelegationMessage { id, message },
+            Event::AgentInstanceStarted {
+                id,
+                instance_id,
+                agent_type,
+                description,
+                depth,
+            } => Self::AgentInstanceStarted {
+                id,
+                instance_id,
+                agent_type,
+                description,
+                depth,
+            },
+            Event::AgentInstanceFinished {
+                id,
+                instance_id,
+                agent_type,
+                status,
+                report,
+                error,
+            } => Self::AgentInstanceFinished {
+                id,
+                instance_id,
+                agent_type,
+                status,
+                report,
+                error,
+            },
             Event::LocalAgentsProbed { available } => Self::LocalAgentsProbed { available },
             Event::PivotQueued { id } => Self::PivotQueued { id },
             Event::PivotApplied { id } => Self::PivotApplied { id },
@@ -994,6 +1056,27 @@ mod tests {
                 "delegation_message",
             ),
             (
+                ServiceEvent::AgentInstanceStarted {
+                    id: session_id(),
+                    instance_id: "explorer-1".to_owned(),
+                    agent_type: "explorer".to_owned(),
+                    description: Some("map the codebase".to_owned()),
+                    depth: 1,
+                },
+                "agent_instance_started",
+            ),
+            (
+                ServiceEvent::AgentInstanceFinished {
+                    id: session_id(),
+                    instance_id: "explorer-1".to_owned(),
+                    agent_type: "explorer".to_owned(),
+                    status: AgentInstanceStatusWire::Completed,
+                    report: Some("found 3 call sites".to_owned()),
+                    error: None,
+                },
+                "agent_instance_finished",
+            ),
+            (
                 ServiceEvent::LocalAgentsProbed {
                     available: vec![source()],
                 },
@@ -1079,6 +1162,40 @@ mod tests {
                 },
             ),
             (
+                Event::AgentInstanceStarted {
+                    id: session_id(),
+                    instance_id: "explorer-1".to_owned(),
+                    agent_type: "explorer".to_owned(),
+                    description: Some("map the codebase".to_owned()),
+                    depth: 1,
+                },
+                ServiceEvent::AgentInstanceStarted {
+                    id: session_id(),
+                    instance_id: "explorer-1".to_owned(),
+                    agent_type: "explorer".to_owned(),
+                    description: Some("map the codebase".to_owned()),
+                    depth: 1,
+                },
+            ),
+            (
+                Event::AgentInstanceFinished {
+                    id: session_id(),
+                    instance_id: "explorer-1".to_owned(),
+                    agent_type: "explorer".to_owned(),
+                    status: AgentInstanceStatusWire::Failed,
+                    report: None,
+                    error: Some("step budget exhausted".to_owned()),
+                },
+                ServiceEvent::AgentInstanceFinished {
+                    id: session_id(),
+                    instance_id: "explorer-1".to_owned(),
+                    agent_type: "explorer".to_owned(),
+                    status: AgentInstanceStatusWire::Failed,
+                    report: None,
+                    error: Some("step budget exhausted".to_owned()),
+                },
+            ),
+            (
                 Event::LocalAgentsProbed {
                     available: vec![source()],
                 },
@@ -1122,6 +1239,69 @@ mod tests {
     }
 
     #[test]
+    fn agent_instance_finished_projects_for_all_terminal_statuses() {
+        let cases = vec![
+            (
+                AgentInstanceStatusWire::Completed,
+                Some("report body".to_owned()),
+                None,
+            ),
+            (
+                AgentInstanceStatusWire::Failed,
+                None,
+                Some("boom".to_owned()),
+            ),
+            (
+                AgentInstanceStatusWire::Cancelled,
+                None,
+                Some("supervisor cancelled".to_owned()),
+            ),
+        ];
+
+        for (status, report, error) in cases {
+            let event = Event::AgentInstanceFinished {
+                id: session_id(),
+                instance_id: "general-purpose-2".to_owned(),
+                agent_type: "general-purpose".to_owned(),
+                status,
+                report,
+                error,
+            };
+            let projected = ServiceEvent::from(event.clone());
+
+            let ServiceEvent::AgentInstanceFinished {
+                id,
+                instance_id,
+                agent_type,
+                status: projected_status,
+                ..
+            } = &projected
+            else {
+                panic!("expected agent_instance_finished, got {projected:?}");
+            };
+            assert_eq!(*id, session_id());
+            assert_eq!(instance_id, "general-purpose-2");
+            assert_eq!(agent_type, "general-purpose");
+            assert_eq!(*projected_status, status);
+            assert_eq!(projected.session_id(), Some(session_id()));
+
+            // The projection preserves every payload field exactly.
+            assert_eq!(
+                serde_json::to_value(&projected).expect("serialize projected"),
+                serde_json::to_value(&event).expect("serialize event"),
+            );
+
+            let json = serde_json::to_value(&projected).expect("serialize event");
+            assert_eq!(
+                json.get("type"),
+                Some(&Value::String("agent_instance_finished".to_owned())),
+            );
+            let decoded = serde_json::from_value::<ServiceEvent>(json).expect("deserialize event");
+            assert_eq!(decoded, projected);
+        }
+    }
+
+    #[test]
     fn service_event_session_id_is_none_only_for_global_events() {
         assert_eq!(
             ServiceEvent::TextDelta {
@@ -1143,6 +1323,29 @@ mod tests {
             ServiceEvent::PivotDropped {
                 id: session_id(),
                 reason: "run cancelled".to_owned(),
+            }
+            .session_id(),
+            Some(session_id()),
+        );
+        assert_eq!(
+            ServiceEvent::AgentInstanceStarted {
+                id: session_id(),
+                instance_id: "explorer-1".to_owned(),
+                agent_type: "explorer".to_owned(),
+                description: None,
+                depth: 1,
+            }
+            .session_id(),
+            Some(session_id()),
+        );
+        assert_eq!(
+            ServiceEvent::AgentInstanceFinished {
+                id: session_id(),
+                instance_id: "explorer-1".to_owned(),
+                agent_type: "explorer".to_owned(),
+                status: AgentInstanceStatusWire::Cancelled,
+                report: None,
+                error: Some("supervisor cancelled".to_owned()),
             }
             .session_id(),
             Some(session_id()),
