@@ -788,7 +788,7 @@ register（`tokio::test` 多 task）。门禁全绿。
      session 注册表）；session binding 级的 supervisor 面收窄（`agents.<name>.tools`）
      若要再交一层，M3-5 接线时给 ctx 加一个 supervisor 面过滤字段即可（在此记录备查）。
 
-### M3-4 [TODO] mag-core：`agent_result` 与 `agent_cancel` 工具
+### M3-4 [DONE] mag-core：`agent_result` 与 `agent_cancel` 工具
 
 **目标**：拉取/取消配套工具。
 
@@ -803,6 +803,65 @@ register（`tokio::test` 多 task）。门禁全绿。
 
 **验证**：FakeLlmClient + Gated 脚本（`test_support.rs:257`）控制 child 完成时机：阻塞等到
 结果、超时返回 running、cancel 后 result 返回 cancelled、未知 id 报错。门禁全绿。
+
+**完成记录**（2026-07-22）：
+
+- 改动（均在 `crates/mag-core/src/`，无新依赖）：
+  - `instances/spawn.rs`：`AGENT_RESULT_TOOL_NAME = "agent_result"` /
+    `AGENT_CANCEL_TOOL_NAME = "agent_cancel"` / `DEFAULT_RESULT_TIMEOUT_SECS = 600`；
+    `agent_tools(ctx)` 扩展为三件套（supervisor 与 child 面经同一函数同时获得，child 面
+    测试断言同步更新）。`agent_result`（`Tool::function_with_schema`，schema
+    `{id, timeout_secs?}`；handler 为 async：`parse_instance_id` → `timeout_secs` 校验
+    （非负整数，缺省 600，`0` = 立即轮询一次）→ `registry.get`（未知 id 报错附
+    `unknown_instance_error` 的实例表）→ `tokio::select! { biased; timeout(..,
+    await_terminal) => .., tool_ctx.cancel.cancelled() => 报错返回 }`——`await_terminal`
+    逐字采用 `Instance::done()` rustdoc 的无竞态范式（check → `Notified::enable` →
+    re-check → wait，同测试 `wait_terminal`），cancel 抢占形状对照 agent-lib
+    `fulfill_batch_cancellable`（drive.rs:952-975，等待为主分支、cancel 为抢占分支）。
+    返回：Completed→`{id, status:"completed", report}`、Failed→`{..., status:"failed",
+    error}`、Cancelled→`{..., status:"cancelled"}`（`instance_status_json` 统一渲染）、
+    超时→`{id, status:"running"}`（ToolStatus::Ok，**不**置失败、实例不转台）。
+    `agent_cancel`：handler 同步（同 `agent` 工具风格）：`registry.cancel(id)` 的
+    first-terminal-wins 转台与 cancel handle 触发都在应答前完成，返回的已是终态快照；
+    未知 id 同样报错附实例表。`unknown_instance_error`：空表提示
+    "no agent instances have been spawned"，非空逐行列 `id (agent_type, status)`。
+  - `instances.rs`：移除 `Instance::done` / `AgentInstanceRegistry::list` /
+    `AgentInstanceRegistry::cancel` 三个条目级 `#[allow(dead_code)]` 及其"M3-4 消费"
+    注释（现被两工具真实消费）；`new`/`cancel_all`/`drain_notifications` 的 allow 保留
+    （M3-5/M3-6 消费）；模块文档同步。
+- 测试（spawn.rs 新增 4 个 + 既有 3 个 child 面断言更新 + 1 个工具列表断言改写，全离线，
+  聚焦 `cargo test -p mag-core instances` 25 项全绿）：
+  - `agent_result_blocks_until_the_instance_completes`——child 停在新增 `GatedStubTool`
+    （`StreamGate` 卡住的 stub 工具，test_support 预留用法）内；supervisor drive 用
+    `spawn_local` 并发，断言 `agent_result` 阻塞期间 supervisor 不推进（请求数不变、
+    实例 Running），开闸后收到 `{status:"completed", report}`；
+  - `agent_result_timeout_returns_running_without_failing`——`timeout_secs: 0` + 永不
+    开闸：立即返回 `{status:"running"}`（ToolStatus::Ok），实例保持 Running 不转台；
+  - `agent_cancel_then_result_returns_cancelled`——child 停在 gated `shell` 审批上，
+    supervisor 连发 `agent_cancel` → `agent_result`：两者都返回 `{status:"cancelled"}`
+    终态快照，cancel handle 已触发，Cancelled 的 `AgentInstanceFinished` 经 OriginRouter
+    cancel 包装及时到达；
+  - `unknown_instance_id_errors_with_instance_list`——空表报错提示未 spawn；spawn 后
+    `agent_result`/`agent_cancel` 对未知 id 报错并附 `general-purpose-1` 实例表；
+  - `agent_tools_expose_spawn_result_and_cancel`（原 `agent_tool_description_…` 改写：
+    三工具齐备、schema required 与 `timeout_secs` 声明）；child 面三测试断言工具名列表
+    追加 `agent_cancel`/`agent_result`。
+  - 测试基建：requests 的 `tool_results` 收集全量历史，断言取每个请求的**最后一个**
+    tool result（每 step 恰好一个新结果）；新增 `await_until` 轮询助手与 `GatedStubTool`。
+- 门禁结果：`cargo fmt --all -- --check` ✅；聚焦测试（instances 25）✅；
+  `cargo clippy --all-targets -- -D warnings` ✅（0 warning）；`cargo test --workspace`
+  ✅（全套件 0 失败）；`cargo doc --no-deps --workspace` ✅（mag-config 1 个既有
+  rustdoc warning，同 M3-1/M3-2/M3-3 记录，与本任务无关）。
+- 偏差（均为实现形态，无语义偏差）：
+  1. Failed 终态的返回形态任务单未列，按 Completed 对称补 `{id, status:"failed", error}`
+     （Cancelled 同理 `{id, status:"cancelled"}`；父任务测试要求"cancel 后 result 返回
+     cancelled"即此形态）。
+  2. `timeout_secs: 0` 允许（`tokio::time::timeout` 零时长 = 轮询一次现状），成为
+     §5.1"立即返回当前状态"的 escape hatch；非整数/负数报错。
+  3. Gated 控制点落在 stub 工具而非 LLM 流：child 走非流式 `chat` 端点，
+     `StreamScript::Gated` 在该端点退化为事件拼接（`test_support.rs:62-66`），故用
+     `StreamGate` 的 stub 工具用法（其 rustdoc 预留的第二种用途）卡住 child 的工具执行
+     来控制完成时机。
 
 ### M3-5 [TODO] mag-core：driver 接线 + 静态委派退役 + 审批 tier + cancel 级联
 

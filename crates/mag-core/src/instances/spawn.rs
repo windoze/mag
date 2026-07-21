@@ -1,5 +1,6 @@
-//! The `agent` spawn tool and the local-instance drive task
-//! (`docs/dyn-agents.md` §4/§5, TODO M3-3).
+//! The `agent` spawn tool, its `agent_result` / `agent_cancel` companions,
+//! and the local-instance drive task (`docs/dyn-agents.md` §4/§5, TODO
+//! M3-3/M3-4).
 //!
 //! One shared [`InstanceSpawnContext`] per spawning agent (the session's root
 //! supervisor at depth `0`, or a spawned instance at its own depth) backs the
@@ -21,8 +22,21 @@
 //! instance report (the report contract of §4); the terminal transition goes
 //! through [`AgentInstanceRegistry::complete`] and is announced as
 //! [`Event::AgentInstanceFinished`].
+//!
+//! `agent_result` (§5.1, D8) blocks on one instance's terminal state under a
+//! caller-bounded timeout (`timeout_secs`, default 600): it answers the
+//! terminal snapshot (`completed` carries the report, `failed` the error), or
+//! `{"status": "running"}` when the timeout elapses — a timeout is not a
+//! failure and never transitions the instance. The wait follows the race-free
+//! check → enable → re-check → wait pattern [`Instance::done`] mandates and
+//! selects on [`ToolContext::cancel`], so a cancelled run pre-empts the wait
+//! instead of parking the tool until the timeout (the
+//! `fulfill_batch_cancellable` contract of agent-lib's drive).
+//! `agent_cancel` goes through [`AgentInstanceRegistry::cancel`] — the
+//! first-terminal-wins transition plus the cooperative cancel handle — and
+//! answers the instance's state after the call.
 
-use std::{convert::Infallible, sync::Arc};
+use std::{convert::Infallible, fmt::Write as _, sync::Arc, time::Duration};
 
 use agent_lib::{
     agent::{
@@ -47,9 +61,20 @@ use crate::{
     engine::approval::IpcApproval,
 };
 
-/// Name of the spawn tool (§5.1, D5); `agent_result` / `agent_cancel` land in
-/// M3-4 and extend [`agent_tools`].
+/// Name of the spawn tool (§5.1, D5); the [`AGENT_RESULT_TOOL_NAME`] /
+/// [`AGENT_CANCEL_TOOL_NAME`] companions (M3-4) share its [`agent_tools`]
+/// extension point.
 pub(crate) const AGENT_TOOL_NAME: &str = "agent";
+
+/// Name of the blocking result-collection tool (§5.1, D8).
+pub(crate) const AGENT_RESULT_TOOL_NAME: &str = "agent_result";
+
+/// Name of the instance-cancellation tool (§5.1).
+pub(crate) const AGENT_CANCEL_TOOL_NAME: &str = "agent_cancel";
+
+/// Wait budget of [`AGENT_RESULT_TOOL_NAME`] when the call omits
+/// `timeout_secs` (§5.1).
+const DEFAULT_RESULT_TIMEOUT_SECS: u64 = 600;
 
 /// Default agent type when the `agent` call omits `type` (§3.3).
 const DEFAULT_AGENT_TYPE: &str = "general-purpose";
@@ -152,18 +177,21 @@ impl std::fmt::Debug for InstanceSpawnContext {
     }
 }
 
-/// The instance tools available on one spawning agent's tool surface.
-///
-/// Currently just the [`AGENT_TOOL_NAME`] spawn tool (M3-3); M3-4 appends
-/// `agent_result` and `agent_cancel` here so the supervisor and every child
-/// surface gain them together (§5.1). The child surface reserves the same
-/// extension point: [`drive_local`] appends `agent_tools` of the instance's
-/// own context after its projected plugins.
+/// The instance tools available on one spawning agent's tool surface: the
+/// [`AGENT_TOOL_NAME`] spawn tool (M3-3) plus the [`AGENT_RESULT_TOOL_NAME`] /
+/// [`AGENT_CANCEL_TOOL_NAME`] companions (M3-4), so the supervisor and every
+/// child surface gain the trio together (§5.1). The child surface reserves
+/// the same extension point: [`drive_local`] appends `agent_tools` of the
+/// instance's own context after its projected plugins.
 // Wired into the session tool surface in M3-5; until then only tests and the
 // child-surface assembly below consume this.
 #[allow(dead_code)]
 pub(crate) fn agent_tools(ctx: &Arc<InstanceSpawnContext>) -> Vec<Tool> {
-    vec![agent_tool(ctx)]
+    vec![
+        agent_tool(ctx),
+        agent_result_tool(ctx),
+        agent_cancel_tool(ctx),
+    ]
 }
 
 /// Builds the `agent` spawn tool for one spawning agent's surface.
@@ -269,6 +297,207 @@ fn spawn_instance(ctx: &Arc<InstanceSpawnContext>, args: Value) -> ToolResult {
         task,
     ));
     ToolResult::text(json!({ "id": id, "status": "running" }).to_string())
+}
+
+/// Builds the `agent_result` blocking-collection tool (§5.1, D8).
+///
+/// Unlike the spawn tool's synchronous handler, this one awaits: it blocks on
+/// the instance's terminal state under the caller's `timeout_secs` budget and
+/// selects on [`ToolContext::cancel`] so a cancelled run pre-empts the wait
+/// (the `fulfill_batch_cancellable` contract of agent-lib's drive — a tool
+/// must not rely on running to completion once its run is cancelled).
+fn agent_result_tool(ctx: &Arc<InstanceSpawnContext>) -> Tool {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "id": {
+                "type": "string",
+                "description": "Instance id returned by `agent`.",
+            },
+            "timeout_secs": {
+                "type": "number",
+                "description": "Maximum seconds to wait for the terminal state; defaults to 600. \
+                                Timing out returns `running` — the instance keeps going.",
+            },
+        },
+        "required": ["id"],
+    });
+    let ctx = Arc::clone(ctx);
+    Tool::function_with_schema(
+        AGENT_RESULT_TOOL_NAME,
+        "Block until an agent instance reaches a terminal state and return its outcome: the \
+         completed report, the failure error, or `cancelled`. Elapsing `timeout_secs` (default \
+         600) answers `running` — not a failure, the instance keeps going; call again to keep \
+         waiting, or rely on the completion notification.",
+        schema,
+        move |tool_ctx: ToolContext, args: Value| {
+            let ctx = Arc::clone(&ctx);
+            async move {
+                Ok::<ToolResult, Infallible>(await_instance_result(&ctx, &tool_ctx, args).await)
+            }
+        },
+    )
+}
+
+/// Body of the `agent_result` handler: resolve the instance, then race its
+/// terminal state against the caller's timeout and the calling run's
+/// cancellation.
+async fn await_instance_result(
+    ctx: &Arc<InstanceSpawnContext>,
+    tool_ctx: &ToolContext,
+    args: Value,
+) -> ToolResult {
+    let id = match parse_instance_id(&args) {
+        Ok(id) => id.to_owned(),
+        Err(result) => return result,
+    };
+    let timeout_secs = match args.get("timeout_secs") {
+        None | Some(Value::Null) => DEFAULT_RESULT_TIMEOUT_SECS,
+        Some(Value::Number(timeout)) => match timeout.as_u64() {
+            Some(timeout) => timeout,
+            None => {
+                return ToolResult::error(
+                    "`timeout_secs` must be a non-negative integer number of seconds",
+                );
+            }
+        },
+        Some(_) => {
+            return ToolResult::error(
+                "`timeout_secs` must be a non-negative integer number of seconds",
+            );
+        }
+    };
+    let Some(instance) = ctx.registry.get(&id) else {
+        return ToolResult::error(unknown_instance_error(&ctx.registry, &id));
+    };
+
+    // The cancel-preemption shape of agent-lib's `fulfill_batch_cancellable`
+    // (`agent-lib/src/agent/drive.rs`): the wait is the primary branch and a
+    // fired `ToolContext.cancel` aborts it promptly instead of leaving the
+    // tool parked until the timeout.
+    let wait = tokio::time::timeout(Duration::from_secs(timeout_secs), await_terminal(&instance));
+    let status = tokio::select! {
+        biased;
+        status = wait => status.ok(),
+        () = tool_ctx.cancel.cancelled() => {
+            return ToolResult::error(format!(
+                "cancelled while waiting for agent instance `{id}`"
+            ));
+        }
+    };
+    match status {
+        // A timeout is not a failure: the instance keeps running and the
+        // model may collect it later (or rely on the notification).
+        None => ToolResult::text(json!({ "id": id, "status": "running" }).to_string()),
+        Some(status) => ToolResult::text(instance_status_json(&id, &status).to_string()),
+    }
+}
+
+/// Builds the `agent_cancel` tool (§5.1). The handler is synchronous like the
+/// spawn tool's: the registry transition and the cooperative cancel-handle
+/// fire both happen before it answers, so the snapshot it returns is already
+/// terminal.
+fn agent_cancel_tool(ctx: &Arc<InstanceSpawnContext>) -> Tool {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "id": {
+                "type": "string",
+                "description": "Instance id returned by `agent`.",
+            },
+        },
+        "required": ["id"],
+    });
+    let ctx = Arc::clone(ctx);
+    Tool::function_with_schema(
+        AGENT_CANCEL_TOOL_NAME,
+        "Cancel a running agent instance: its in-flight work is interrupted cooperatively and its \
+         terminal state becomes `cancelled`. An already-finished instance keeps its outcome. \
+         Returns the instance state after the call.",
+        schema,
+        move |_ctx: ToolContext, args: Value| {
+            let ctx = Arc::clone(&ctx);
+            async move { Ok::<ToolResult, Infallible>(cancel_instance(&ctx, args)) }
+        },
+    )
+}
+
+/// Synchronous body of the `agent_cancel` handler.
+fn cancel_instance(ctx: &Arc<InstanceSpawnContext>, args: Value) -> ToolResult {
+    let id = match parse_instance_id(&args) {
+        Ok(id) => id.to_owned(),
+        Err(result) => return result,
+    };
+    match ctx.registry.cancel(&id) {
+        Some(status) => ToolResult::text(instance_status_json(&id, &status).to_string()),
+        None => ToolResult::error(unknown_instance_error(&ctx.registry, &id)),
+    }
+}
+
+/// Extracts the `id` argument `agent_result` and `agent_cancel` both require.
+fn parse_instance_id(args: &Value) -> Result<&str, ToolResult> {
+    match args.get("id").and_then(Value::as_str) {
+        Some(id) if !id.trim().is_empty() => Ok(id),
+        _ => Err(ToolResult::error(
+            "`id` is required and must be a non-empty string",
+        )),
+    }
+}
+
+/// Awaits the instance's terminal status with the race-free
+/// check → enable → re-check → wait pattern [`Instance::done`] mandates.
+async fn await_terminal(instance: &Instance) -> InstanceStatus {
+    loop {
+        let notified = instance.done().notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let status = instance.status();
+        if status.is_terminal() {
+            return status;
+        }
+        notified.as_mut().await;
+    }
+}
+
+/// The state snapshot `agent_result` and `agent_cancel` answer with (§5.1):
+/// `completed` carries the report, `failed` the error.
+fn instance_status_json(id: &str, status: &InstanceStatus) -> Value {
+    match status {
+        InstanceStatus::Completed { report } => {
+            json!({ "id": id, "status": "completed", "report": report })
+        }
+        InstanceStatus::Failed { error } => {
+            json!({ "id": id, "status": "failed", "error": error })
+        }
+        InstanceStatus::Cancelled => json!({ "id": id, "status": "cancelled" }),
+        InstanceStatus::Running => json!({ "id": id, "status": "running" }),
+    }
+}
+
+/// The unknown-id error of `agent_result` / `agent_cancel`, attaching the
+/// current instance table so the model can recover a valid id.
+fn unknown_instance_error(registry: &AgentInstanceRegistry, id: &str) -> String {
+    let instances = registry.list();
+    if instances.is_empty() {
+        return format!(
+            "unknown agent instance `{id}`\n\nno agent instances have been spawned in this session"
+        );
+    }
+    let mut error = format!("unknown agent instance `{id}`\n\nknown agent instances:");
+    for instance in instances {
+        let status = match instance.status() {
+            InstanceStatus::Running => "running",
+            InstanceStatus::Completed { .. } => "completed",
+            InstanceStatus::Failed { .. } => "failed",
+            InstanceStatus::Cancelled => "cancelled",
+        };
+        let _ = write!(
+            error,
+            "\n- {} ({}, {status})",
+            instance.id, instance.agent_type
+        );
+    }
+    error
 }
 
 /// Assembles the two-layer system prompt of a local instance (§4): the shared
@@ -504,8 +733,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        AGENT_TOOL_NAME, InstanceSpawnContext, MAX_INSTANCE_DEPTH, SUBAGENT_SKELETON, agent_tools,
-        layered_system_prompt,
+        AGENT_CANCEL_TOOL_NAME, AGENT_RESULT_TOOL_NAME, AGENT_TOOL_NAME, InstanceSpawnContext,
+        MAX_INSTANCE_DEPTH, SUBAGENT_SKELETON, agent_tools, layered_system_prompt,
     };
     use crate::{
         EventBus, EventStream,
@@ -513,7 +742,8 @@ mod tests {
         engine::approval::{AskFrontendDecider, IpcApproval},
         instances::{AgentInstanceRegistry, Instance, InstanceStatus},
         test_support::{
-            FakeLlmClient, RequestRoute, StreamScript, text_stream_with_usage, tool_use_stream,
+            FakeLlmClient, RequestRoute, StreamGate, StreamScript, text_stream_with_usage,
+            tool_use_stream,
         },
     };
 
@@ -653,6 +883,18 @@ mod tests {
         .expect("matching event arrives within 5s")
     }
 
+    /// Polls `pred` until it holds (5s backstop; a hang is a bug). Used to
+    /// sync the test body with runs it drives concurrently on the LocalSet.
+    async fn await_until(mut pred: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !pred() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("condition holds within 5s");
+    }
+
     /// `(status, concatenated text)` of every tool result in one request.
     fn tool_results(request: &ChatRequest) -> Vec<(ToolStatus, String)> {
         request
@@ -747,6 +989,38 @@ mod tests {
 
         fn permission(&self) -> Option<PermissionSpec> {
             self.permission
+        }
+    }
+
+    /// A stub tool that parks inside `invoke` until the test opens the gate
+    /// (the "stub tool" use case [`StreamGate`] declares), giving the test
+    /// deterministic control over when a child's in-flight run completes.
+    #[derive(Debug)]
+    struct GatedStubTool {
+        gate: Arc<StreamGate>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolPlugin for GatedStubTool {
+        fn name(&self) -> &str {
+            "gated_stub"
+        }
+
+        fn declaration(&self) -> ToolDecl {
+            ToolDecl {
+                name: self.name().to_owned(),
+                description: "gated stub tool".to_owned(),
+                input_schema: json!({ "type": "object", "properties": {} }),
+            }
+        }
+
+        async fn invoke(&self, _ctx: ToolContext, _args: Value) -> ToolResult {
+            self.gate.wait().await;
+            ToolResult::text("gated stub output")
+        }
+
+        fn permission(&self) -> Option<PermissionSpec> {
+            None
         }
     }
 
@@ -1251,6 +1525,342 @@ mod tests {
         });
     }
 
+    #[test]
+    fn agent_result_blocks_until_the_instance_completes() {
+        run_local(async {
+            let gate = StreamGate::new();
+            let client = routed_client(
+                vec![
+                    // The child parks inside the gated stub tool until the test
+                    // opens the gate, then closes with its report.
+                    StreamScript::Complete(tool_use_stream(
+                        "gated_stub",
+                        "child-call-1",
+                        json!({}),
+                    )),
+                    StreamScript::Complete(text_stream_with_usage(
+                        &["report: gate-opened findings"],
+                        usage(),
+                    )),
+                ],
+                vec![
+                    StreamScript::Complete(tool_use_stream(
+                        AGENT_TOOL_NAME,
+                        "call-1",
+                        json!({ "task": "inspect the vault" }),
+                    )),
+                    StreamScript::Complete(tool_use_stream(
+                        AGENT_RESULT_TOOL_NAME,
+                        "call-2",
+                        json!({ "id": "general-purpose-1" }),
+                    )),
+                    StreamScript::Complete(text_stream_with_usage(&["supervisor final"], usage())),
+                ],
+            );
+            let rig = rig(
+                &client,
+                ToolRegistry::new().register(Arc::new(GatedStubTool {
+                    gate: Arc::clone(&gate),
+                })),
+                AgentDefinitionRegistry::builtin(),
+            );
+            let agent = supervisor_agent(&rig);
+            // Drive the supervisor concurrently so the test can control the
+            // child's completion timing while `agent_result` is blocked.
+            let drive = tokio::task::spawn_local(async move {
+                let mut agent = agent;
+                drive_supervisor(&mut agent, "please delegate").await;
+            });
+
+            // The supervisor's second request carries the `agent_result`
+            // call; the child's first request is the gated stub tool call.
+            await_until(|| client.stream_requests().len() == 2).await;
+            await_until(|| client.chat_requests().len() == 1).await;
+            assert_eq!(
+                rig.registry
+                    .get("general-purpose-1")
+                    .map(|instance| instance.status()),
+                Some(InstanceStatus::Running),
+                "the child is parked inside the gated stub tool"
+            );
+            // A genuinely blocked `agent_result` does not let the supervisor
+            // advance while the instance runs.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(
+                client.stream_requests().len(),
+                2,
+                "agent_result keeps blocking while the instance runs"
+            );
+
+            gate.open();
+            tokio::time::timeout(Duration::from_secs(5), drive)
+                .await
+                .expect("supervisor turn completes")
+                .expect("supervisor drive task");
+
+            // Each request carries the full history; the new tool result of
+            // the step is the last one.
+            let (status, text) = tool_results(&client.stream_requests()[2])
+                .last()
+                .expect("agent_result tool result")
+                .clone();
+            assert_eq!(status, ToolStatus::Ok);
+            assert_eq!(
+                serde_json::from_str::<Value>(&text).expect("json tool result"),
+                json!({
+                    "id": "general-purpose-1",
+                    "status": "completed",
+                    "report": "report: gate-opened findings",
+                })
+            );
+        });
+    }
+
+    #[test]
+    fn agent_result_timeout_returns_running_without_failing() {
+        run_local(async {
+            let gate = StreamGate::new();
+            let client = routed_client(
+                // The child parks inside the gated stub tool and the test
+                // never opens the gate: the instance is still running when
+                // `agent_result` times out.
+                vec![
+                    StreamScript::Complete(tool_use_stream(
+                        "gated_stub",
+                        "child-call-1",
+                        json!({}),
+                    )),
+                    StreamScript::Complete(text_stream_with_usage(&["unreached"], usage())),
+                ],
+                vec![
+                    StreamScript::Complete(tool_use_stream(
+                        AGENT_TOOL_NAME,
+                        "call-1",
+                        json!({ "task": "long work" }),
+                    )),
+                    StreamScript::Complete(tool_use_stream(
+                        AGENT_RESULT_TOOL_NAME,
+                        "call-2",
+                        json!({ "id": "general-purpose-1", "timeout_secs": 0 }),
+                    )),
+                    StreamScript::Complete(text_stream_with_usage(&["supervisor final"], usage())),
+                ],
+            );
+            let rig = rig(
+                &client,
+                ToolRegistry::new().register(Arc::new(GatedStubTool {
+                    gate: Arc::clone(&gate),
+                })),
+                AgentDefinitionRegistry::builtin(),
+            );
+            let mut agent = supervisor_agent(&rig);
+
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                drive_supervisor(&mut agent, "please delegate"),
+            )
+            .await
+            .expect("supervisor turn completes");
+
+            let (status, text) = tool_results(&client.stream_requests()[2])
+                .last()
+                .expect("agent_result tool result")
+                .clone();
+            assert_eq!(status, ToolStatus::Ok, "a timeout is not a failure");
+            assert_eq!(
+                serde_json::from_str::<Value>(&text).expect("json tool result"),
+                json!({ "id": "general-purpose-1", "status": "running" })
+            );
+            // The timeout did not transition the instance.
+            assert_eq!(
+                rig.registry
+                    .get("general-purpose-1")
+                    .map(|instance| instance.status()),
+                Some(InstanceStatus::Running)
+            );
+        });
+    }
+
+    #[test]
+    fn agent_cancel_then_result_returns_cancelled() {
+        run_local(async {
+            let client = routed_client(
+                // The child parks on its gated `shell` approval; the cancel
+                // resolves the parked interaction conservatively through the
+                // origin router (no answer needed from the test).
+                vec![StreamScript::Complete(tool_use_stream(
+                    "shell",
+                    "child-shell-1",
+                    json!({ "cmd": "ls" }),
+                ))],
+                vec![
+                    StreamScript::Complete(tool_use_stream(
+                        AGENT_TOOL_NAME,
+                        "call-1",
+                        json!({ "task": "run the shell" }),
+                    )),
+                    StreamScript::Complete(tool_use_stream(
+                        AGENT_CANCEL_TOOL_NAME,
+                        "call-2",
+                        json!({ "id": "general-purpose-1" }),
+                    )),
+                    StreamScript::Complete(tool_use_stream(
+                        AGENT_RESULT_TOOL_NAME,
+                        "call-3",
+                        json!({ "id": "general-purpose-1" }),
+                    )),
+                    StreamScript::Complete(text_stream_with_usage(&["supervisor final"], usage())),
+                ],
+            );
+            let rig = rig(
+                &client,
+                gated_registry(),
+                AgentDefinitionRegistry::builtin(),
+            );
+            let mut subscriber = rig.events.subscribe();
+            let mut agent = supervisor_agent(&rig);
+
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                drive_supervisor(&mut agent, "please delegate"),
+            )
+            .await
+            .expect("supervisor turn completes");
+
+            let requests = client.stream_requests();
+            assert_eq!(requests.len(), 4);
+            // Each request carries the full history; the new tool result of
+            // the step is the last one.
+            for request in [&requests[2], &requests[3]] {
+                let (status, text) = tool_results(request)
+                    .last()
+                    .expect("instance tool result")
+                    .clone();
+                assert_eq!(status, ToolStatus::Ok);
+                assert_eq!(
+                    serde_json::from_str::<Value>(&text).expect("json tool result"),
+                    json!({ "id": "general-purpose-1", "status": "cancelled" }),
+                    "agent_cancel and agent_result both answer the terminal snapshot"
+                );
+            }
+
+            let instance = rig
+                .registry
+                .get("general-purpose-1")
+                .expect("instance registered");
+            assert_eq!(instance.status(), InstanceStatus::Cancelled);
+            assert!(instance.cancel_handle().is_cancelled());
+
+            // The cancelled drive unwinds promptly (the router's cancel
+            // wrapper resolves the parked interaction) and announces the
+            // terminal state.
+            let event = next_matching(&mut subscriber, |event| {
+                matches!(event, Event::AgentInstanceFinished { .. })
+            })
+            .await;
+            assert_eq!(
+                event,
+                Event::AgentInstanceFinished {
+                    id: rig.ctx.session_id,
+                    instance_id: "general-purpose-1".to_owned(),
+                    agent_type: "general-purpose".to_owned(),
+                    status: AgentInstanceStatusWire::Cancelled,
+                    report: None,
+                    error: None,
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn unknown_instance_id_errors_with_instance_list() {
+        run_local(async {
+            let client = routed_client(
+                vec![StreamScript::Complete(text_stream_with_usage(
+                    &["report"],
+                    usage(),
+                ))],
+                vec![
+                    // The registry is still empty: the error says so.
+                    StreamScript::Complete(tool_use_stream(
+                        AGENT_RESULT_TOOL_NAME,
+                        "call-1",
+                        json!({ "id": "ghost-1" }),
+                    )),
+                    StreamScript::Complete(tool_use_stream(
+                        AGENT_TOOL_NAME,
+                        "call-2",
+                        json!({ "task": "t" }),
+                    )),
+                    // After the spawn the table is attached to the error.
+                    StreamScript::Complete(tool_use_stream(
+                        AGENT_RESULT_TOOL_NAME,
+                        "call-3",
+                        json!({ "id": "ghost-1" }),
+                    )),
+                    StreamScript::Complete(tool_use_stream(
+                        AGENT_CANCEL_TOOL_NAME,
+                        "call-4",
+                        json!({ "id": "ghost-2" }),
+                    )),
+                    StreamScript::Complete(text_stream_with_usage(&["supervisor final"], usage())),
+                ],
+            );
+            let rig = rig(
+                &client,
+                ToolRegistry::with_builtins(),
+                AgentDefinitionRegistry::builtin(),
+            );
+            let mut agent = supervisor_agent(&rig);
+
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                drive_supervisor(&mut agent, "please delegate"),
+            )
+            .await
+            .expect("supervisor turn completes");
+
+            let requests = client.stream_requests();
+            assert_eq!(requests.len(), 5);
+
+            // Each request carries the full history; the new tool result of
+            // the step is the last one.
+            let (status, error) = tool_results(&requests[1])
+                .last()
+                .expect("agent_result unknown-id error")
+                .clone();
+            assert_eq!(status, ToolStatus::Error);
+            assert!(error.contains("`ghost-1`"), "names the bad id: {error}");
+            assert!(
+                error.contains("no agent instances have been spawned"),
+                "empty-table hint: {error}"
+            );
+
+            let (status, error) = tool_results(&requests[3])
+                .last()
+                .expect("agent_result unknown-id error")
+                .clone();
+            assert_eq!(status, ToolStatus::Error);
+            assert!(
+                error.contains("known agent instances:") && error.contains("general-purpose-1"),
+                "attaches the instance table: {error}"
+            );
+
+            let (status, error) = tool_results(&requests[4])
+                .last()
+                .expect("agent_cancel unknown-id error")
+                .clone();
+            assert_eq!(status, ToolStatus::Error);
+            assert!(
+                error.contains("`ghost-2`") && error.contains("general-purpose-1"),
+                "names the bad id and attaches the table: {error}"
+            );
+
+            // The failed lookups touched no instance.
+            assert_eq!(rig.registry.list().len(), 1);
+        });
+    }
+
     /// Spawns one `agent_type` instance and returns the tool names the child
     /// advertised on its first LLM request (sorted).
     fn child_tool_names(
@@ -1301,6 +1911,8 @@ mod tests {
             names,
             [
                 "agent",
+                "agent_cancel",
+                "agent_result",
                 "ask_user",
                 "grep",
                 "list_dir",
@@ -1318,8 +1930,18 @@ mod tests {
             "explorer",
         );
         // `tools = [read_file, list_dir, grep]` narrows the supervisor's
-        // surface; the `agent` tool itself is always appended (§5.4).
-        assert_eq!(names, ["agent", "grep", "list_dir", "read_file"]);
+        // surface; the instance tool trio is always appended (§5.1/§5.4).
+        assert_eq!(
+            names,
+            [
+                "agent",
+                "agent_cancel",
+                "agent_result",
+                "grep",
+                "list_dir",
+                "read_file"
+            ]
+        );
     }
 
     #[test]
@@ -1330,24 +1952,46 @@ mod tests {
             "---\nname: reader\ndescription: reads files only\ntools: read_file, ghost\n---\nRead things carefully.\n",
         );
         let names = child_tool_names(ToolRegistry::with_builtins(), dir.definitions(), "reader");
-        assert_eq!(names, ["agent", "read_file"]);
+        assert_eq!(
+            names,
+            ["agent", "agent_cancel", "agent_result", "read_file"]
+        );
     }
 
     #[test]
-    fn agent_tool_description_enumerates_definitions_and_requires_task() {
+    fn agent_tools_expose_spawn_result_and_cancel() {
         let rig = rig(
             &FakeLlmClient::scripted(Vec::new()),
             ToolRegistry::with_builtins(),
             AgentDefinitionRegistry::builtin(),
         );
         let tools = agent_tools(&rig.ctx);
-        assert_eq!(tools.len(), 1, "M3-4 appends agent_result/agent_cancel");
-        let tool = &tools[0];
-        assert_eq!(tool.name(), AGENT_TOOL_NAME);
-        assert!(tool.description().contains("Available agent types:"));
-        assert!(tool.description().contains("general-purpose"));
-        assert!(tool.description().contains("explorer"));
-        assert_eq!(tool.input_schema()["required"], json!(["task"]));
+        assert_eq!(tools.len(), 3);
+
+        let agent = tools
+            .iter()
+            .find(|tool| tool.name() == AGENT_TOOL_NAME)
+            .expect("agent tool");
+        assert!(agent.description().contains("Available agent types:"));
+        assert!(agent.description().contains("general-purpose"));
+        assert!(agent.description().contains("explorer"));
+        assert_eq!(agent.input_schema()["required"], json!(["task"]));
+
+        let result = tools
+            .iter()
+            .find(|tool| tool.name() == AGENT_RESULT_TOOL_NAME)
+            .expect("agent_result tool");
+        assert_eq!(result.input_schema()["required"], json!(["id"]));
+        assert!(
+            result.input_schema()["properties"]["timeout_secs"].is_object(),
+            "the timeout parameter is declared"
+        );
+
+        let cancel = tools
+            .iter()
+            .find(|tool| tool.name() == AGENT_CANCEL_TOOL_NAME)
+            .expect("agent_cancel tool");
+        assert_eq!(cancel.input_schema()["required"], json!(["id"]));
     }
 
     #[test]
