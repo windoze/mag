@@ -546,6 +546,7 @@ pub struct SessionDefaults {
     persist_path: Option<PathBuf>,
     budget: Option<Budget>,
     default_agent: Option<String>,
+    default_subagent_tools: Option<Vec<String>>,
 }
 
 impl SessionDefaults {
@@ -555,6 +556,7 @@ impl SessionDefaults {
         persist_path: None,
         budget: None,
         default_agent: None,
+        default_subagent_tools: None,
     };
 
     /// Raw routing mode, when the config sets one.
@@ -584,12 +586,21 @@ impl SessionDefaults {
         self.default_agent.as_deref()
     }
 
+    /// Default tool surface for subagent instances whose definition sets no
+    /// `tools`, when configured (`docs/dyn-agents.md` §7; `None` falls back
+    /// to the session's full tool registry). The names are validated against
+    /// the session registry at surface-build time, not here.
+    pub fn default_subagent_tools(&self) -> Option<&[String]> {
+        self.default_subagent_tools.as_deref()
+    }
+
     fn to_dto(&self) -> SessionDefaultsDto {
         SessionDefaultsDto {
             routing: self.routing.map(|r| r.as_str().to_string()),
             persist_path: self.persist_path.clone(),
             budget: self.budget.map(Budget::to_dto),
             default_agent: self.default_agent.clone(),
+            default_subagent_tools: self.default_subagent_tools.clone(),
         }
     }
 }
@@ -776,6 +787,7 @@ impl ConfigSnapshot {
                     persist_path: s.persist_path.clone(),
                     budget: s.budget.map(Budget::from),
                     default_agent: s.default_agent.clone(),
+                    default_subagent_tools: s.default_subagent_tools.clone(),
                 }))
             })
             .transpose()?;

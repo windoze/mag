@@ -149,9 +149,10 @@ pub(crate) struct SessionDriver {
     system_prompt: Option<String>,
     /// The root supervisor's instance spawn context (depth `0`,
     /// `docs/dyn-agents.md` §5): the session's instance registry, the shared
-    /// spawn state (definition table + supervisor model), and every handle the
-    /// `agent` tool trio captured when it was appended to the tool surface.
-    /// Held for the cancel cascade and the `apply_config` definition rebuild.
+    /// spawn state (definition table + supervisor model + session default
+    /// subagent toolset), and every handle the `agent` tool trio captured
+    /// when it was appended to the tool surface. Held for the cancel cascade
+    /// and the `apply_config` definition/toolset rebuild.
     spawn_ctx: Arc<InstanceSpawnContext>,
     /// The session's configured working directory, retained so `apply_config`
     /// can re-load the project-level definition directory (M3-5).
@@ -661,10 +662,9 @@ impl SessionDriver {
     ///   with no registered plugin is skipped with a warn log. An agent entry
     ///   with no tool list imposes no constraint and leaves the current
     ///   surface untouched; an explicit `tools = []` clears the plugin
-    ///   surface while the instance tools remain. The spawn context's shared
-    ///   surface filter follows the same projection, so instances spawned
-    ///   after the apply stay bounded by the supervisor's new surface
-    ///   (`docs/dyn-agents.md` §7).
+    ///   surface while the instance tools remain. The bound entry's tool list
+    ///   constrains only the supervisor's own surface — it never narrows a
+    ///   spawned child's surface (`docs/dyn-agents.md` §7).
     /// - `system_prompt` → this driver's config-controlled overlay target. The
     ///   target is queued as [`ReconfigRequest::SetSystemPromptOverlay`] right
     ///   before the next turn starts instead of being stored in the agent's
@@ -674,9 +674,11 @@ impl SessionDriver {
     /// The definition table is rebuilt on every apply (M3-5): the TOML layer
     /// is re-projected from the applied snapshot and re-merged over the
     /// builtin/user/project layers (the two directory layers are re-read, so
-    /// edited definition files are picked up too). Definitions only affect
-    /// *later* spawns; running instances keep driving with the context they
-    /// captured.
+    /// edited definition files are picked up too). The session's default
+    /// subagent toolset (`[session].default_subagent_tools`,
+    /// `docs/dyn-agents.md` §7) is re-read alongside it. Definitions and the
+    /// default toolset only affect *later* spawns; running instances keep
+    /// driving with the context they captured.
     ///
     /// Out of scope on the current agent-lib reconfigure surface (documented
     /// for M3-R): the approval policy is baked into the agent at build time
@@ -702,23 +704,16 @@ impl SessionDriver {
         }) {
             self.spawn_ctx.shared.set_supervisor_model(model);
         }
-        // Mirror a bound tool-list change into the spawn surface filter (§7):
-        // the facade's `ReplaceToolSet` lands at the next turn boundary, so
-        // instances spawned from the next run on stay bounded by the
-        // supervisor's own surface. An entry without a tool list leaves the
-        // current filter untouched, matching the `ReplaceToolSet` rule (this
-        // is the same enabled-name projection `reconfig_requests` applies).
-        if let Some(agent_config) = snapshot.agent(&self.agent_name)
-            && let Some(tools) = agent_config.tools_list()
-        {
-            self.spawn_ctx.shared.set_surface(Some(
-                tools
-                    .iter()
-                    .filter(|tool| tool.is_enabled())
-                    .map(|tool| tool.name().to_owned())
-                    .collect(),
-            ));
-        }
+        // Re-read the session's default subagent toolset from the applied
+        // snapshot (same rebuild semantics as the definition table below):
+        // instances spawned after the apply whose definition sets no `tools`
+        // fall back to the new list (`docs/dyn-agents.md` §7).
+        self.spawn_ctx.shared.set_default_tools(
+            snapshot
+                .session_defaults()
+                .default_subagent_tools()
+                .map(<[String]>::to_vec),
+        );
         self.apply_reconfig_items(session_id, requests);
         // Rebuild the definition table in the shared spawn state
         // (`docs/dyn-agents.md` §3.2, M3-5): the TOML layer is re-projected
@@ -1116,10 +1111,11 @@ fn budget_limits(budget: &SessionBudget) -> BudgetLimits {
 
 /// Assembles the session's root (depth `0`) [`InstanceSpawnContext`]
 /// (`docs/dyn-agents.md` §5, M3-5): a fresh instance registry, the four-layer
-/// definition table merged from the binding's TOML layer, and the supervisor's
-/// own client / tools / approval / event handles the spawned instances share.
-/// `supervisor_model` seeds the shared cell and is corrected to the built
-/// agent's authoritative model right after construction.
+/// definition table merged from the binding's TOML layer, the session's
+/// default subagent toolset (§7), and the supervisor's own client / tools /
+/// approval / event handles the spawned instances share. `supervisor_model`
+/// seeds the shared cell and is corrected to the built agent's authoritative
+/// model right after construction.
 #[allow(clippy::too_many_arguments)]
 fn root_spawn_context(
     config: &SessionConfig,
@@ -1137,7 +1133,7 @@ fn root_spawn_context(
         shared: SharedSpawnState::new(
             assemble_agent_definitions(config.cwd.as_deref(), binding.agent_definitions().clone()),
             supervisor_model,
-            binding.tools().map(<[String]>::to_vec),
+            binding.default_subagent_tools().map(<[String]>::to_vec),
         ),
         client,
         tools,
@@ -1601,7 +1597,9 @@ mod tests {
     use serde_json::Map;
     use uuid::Uuid;
 
-    use crate::test_support::{FakeLlmClient, text_stream_with_usage};
+    use crate::test_support::{
+        FakeLlmClient, RequestRoute, StreamScript, text_stream_with_usage, tool_use_stream,
+    };
 
     use super::map_wire_event;
 
@@ -1863,10 +1861,34 @@ mod tests {
     }
 
     /// Builds a driver whose session binding is resolved from `snapshot`
-    /// (the bound entry's tool list seeds the spawn surface filter, §7).
+    /// over the full built-in registry.
     fn driver_with_binding(
         client: std::sync::Arc<FakeLlmClient>,
         snapshot: &mag_config::ConfigSnapshot,
+    ) -> super::SessionDriver {
+        driver_with_snapshot_tools(client, snapshot, mag_tools::ToolRegistry::with_builtins())
+    }
+
+    /// Builds a driver whose session binding and tool registry are both
+    /// assembled from `snapshot` (the production `Engine::from_config`
+    /// wiring: `[tools.<name>] enabled = false` entries leave the registry).
+    fn driver_with_filtered_registry(
+        client: std::sync::Arc<FakeLlmClient>,
+        snapshot: &mag_config::ConfigSnapshot,
+    ) -> super::SessionDriver {
+        driver_with_snapshot_tools(
+            client,
+            snapshot,
+            crate::assembly::assemble_tool_registry(snapshot),
+        )
+    }
+
+    /// Builds a driver whose session binding is resolved from `snapshot`
+    /// over the supplied tool registry.
+    fn driver_with_snapshot_tools(
+        client: std::sync::Arc<FakeLlmClient>,
+        snapshot: &mag_config::ConfigSnapshot,
+        tools: mag_tools::ToolRegistry,
     ) -> super::SessionDriver {
         use crate::EventBus;
         use crate::assembly::{ApprovalOverrides, SessionBinding};
@@ -1890,7 +1912,7 @@ mod tests {
         super::SessionDriver::new(
             &config,
             client,
-            std::sync::Arc::new(mag_tools::ToolRegistry::with_builtins()),
+            std::sync::Arc::new(tools),
             approval,
             TurnCompleteHub::default(),
             &SessionBinding::resolve(&config, Some(snapshot)),
@@ -2026,50 +2048,56 @@ role = "Researches topics."
         });
     }
 
-    /// §7 (M3-R): the spawn surface filter — the anti-escalation bound every
-    /// child surface is intersected with — is seeded from the bound entry's
-    /// tool list at build and follows a tool-list change at config apply; an
-    /// entry without a tool list leaves the filter untouched.
+    /// §7 (post-F-R): the session's default subagent toolset
+    /// (`[session].default_subagent_tools`) seeds the shared spawn state at
+    /// build and is re-read from the applied snapshot at config apply. The
+    /// bound entry's own tool list plays no role in it — the M3-R surface
+    /// filter is gone, so the supervisor's surface never constrains a child.
     #[test]
-    fn spawn_surface_filter_follows_the_bound_tool_list() {
+    fn default_subagent_tools_seed_at_build_and_follow_config_apply() {
         use mag_config::{ConfigDto, ConfigSnapshot};
 
-        // An unconstrained binding leaves the filter open.
+        // An unconfigured session has no default toolset.
         let driver = driver_for_test(FakeLlmClient::scripted(Vec::new()));
-        assert_eq!(driver.spawn_ctx.shared.surface(), None);
+        assert_eq!(driver.spawn_ctx.shared.default_tools(), None);
 
-        // A bound tool list seeds the filter at build.
+        // `[session].default_subagent_tools` seeds the spawn state at build.
         let dto = ConfigDto::parse_str(
             r#"
-[agents.default]
-tools = ["read_file", "shell"]
+[session]
+default_subagent_tools = ["read_file", "shell"]
 "#,
         )
         .expect("config parses");
         let snapshot = ConfigSnapshot::resolve(&dto, 1).expect("config resolves");
         let mut driver = driver_with_binding(FakeLlmClient::scripted(Vec::new()), &snapshot);
         assert_eq!(
-            driver.spawn_ctx.shared.surface(),
+            driver.spawn_ctx.shared.default_tools(),
             Some(vec!["read_file".to_owned(), "shell".to_owned()])
         );
 
-        // A config apply with a new list re-seeds the filter.
+        // A config apply re-reads the `[session]` value (the bound entry's
+        // own tool list is irrelevant to it).
         let dto = ConfigDto::parse_str(
             r#"
 [agents.default]
-tools = ["grep"]
+tools = ["shell"]
+
+[session]
+default_subagent_tools = ["grep"]
 "#,
         )
         .expect("config parses");
         let snapshot = ConfigSnapshot::resolve(&dto, 2).expect("config resolves");
         driver.apply_config(session_id(), &snapshot);
         assert_eq!(
-            driver.spawn_ctx.shared.surface(),
-            Some(vec!["grep".to_owned()])
+            driver.spawn_ctx.shared.default_tools(),
+            Some(vec!["grep".to_owned()]),
+            "the applied `[session]` value, not the bound tool list"
         );
 
-        // An entry without a tool list leaves the filter untouched (the same
-        // rule `ReplaceToolSet` follows).
+        // An applied snapshot without the key clears the toolset (the same
+        // wholesale rebuild semantics as the definition table).
         let dto = ConfigDto::parse_str(
             r#"
 [agents.default]
@@ -2079,10 +2107,192 @@ model = "model-b"
         .expect("config parses");
         let snapshot = ConfigSnapshot::resolve(&dto, 3).expect("config resolves");
         driver.apply_config(session_id(), &snapshot);
-        assert_eq!(
-            driver.spawn_ctx.shared.surface(),
-            Some(vec!["grep".to_owned()])
-        );
+        assert_eq!(driver.spawn_ctx.shared.default_tools(), None);
+    }
+
+    /// §7 (post-F-R semantic reversal of the M3-R anti-escalation rule): the
+    /// supervisor's bound tool list constrains only the supervisor itself. A
+    /// spawned child's surface is a property of the agent definition — a
+    /// definition without `tools` gets the full session registry, and an
+    /// explicit `tools` list is applied exactly, even where it names plugins
+    /// the supervisor itself does not have.
+    #[test]
+    fn child_surface_ignores_the_supervisor_bound_tool_list() {
+        use crate::instances::spawn::SUBAGENT_SKELETON;
+
+        driver_local(async {
+            use mag_config::{ConfigDto, ConfigSnapshot};
+
+            // The supervisor binds to a one-tool surface.
+            let dto = ConfigDto::parse_str("[agents.default]\ntools = [\"read_file\"]\n")
+                .expect("config parses");
+            let snapshot = ConfigSnapshot::resolve(&dto, 1).expect("config resolves");
+            let client = FakeLlmClient::scripted_routes(vec![
+                RequestRoute::system_contains(
+                    SUBAGENT_SKELETON,
+                    vec![
+                        StreamScript::Complete(text_stream_with_usage(&["report"], usage(1, 1))),
+                        StreamScript::Complete(text_stream_with_usage(&["report"], usage(1, 1))),
+                    ],
+                ),
+                RequestRoute::any(vec![
+                    StreamScript::Complete(tool_use_stream(
+                        "agent",
+                        "call-1",
+                        serde_json::json!({ "type": "general-purpose", "task": "t" }),
+                    )),
+                    StreamScript::Complete(text_stream_with_usage(&["done"], usage(1, 1))),
+                    StreamScript::Complete(tool_use_stream(
+                        "agent",
+                        "call-2",
+                        serde_json::json!({ "type": "explorer", "task": "t" }),
+                    )),
+                    StreamScript::Complete(text_stream_with_usage(&["done"], usage(1, 1))),
+                ]),
+            ]);
+            let mut driver = driver_with_binding(client.clone(), &snapshot);
+
+            // Sanity: the supervisor's own surface really is narrowed to
+            // `read_file` plus the instance tool trio.
+            let names: Vec<&str> = driver
+                .agent
+                .state()
+                .current_tool_set()
+                .tools()
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect();
+            assert_eq!(
+                names,
+                ["read_file", "agent", "agent_result", "agent_cancel"]
+            );
+
+            // A definition without `tools` spawns a child on the full
+            // session registry, not on the supervisor's narrowed surface.
+            drive_one_turn(&mut driver).await;
+            let instance = driver
+                .spawn_ctx
+                .registry
+                .get("general-purpose-1")
+                .expect("instance registered");
+            await_instance_terminal(&instance).await;
+
+            // An explicit `tools` list is applied exactly: `explorer` gets
+            // `grep`/`list_dir`, which the supervisor itself does not have.
+            drive_one_turn(&mut driver).await;
+            let instance = driver
+                .spawn_ctx
+                .registry
+                .get("explorer-1")
+                .expect("instance registered");
+            await_instance_terminal(&instance).await;
+
+            let chat_requests = client.chat_requests();
+            assert_eq!(chat_requests.len(), 2);
+            let mut first: Vec<&str> = chat_requests[0]
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect();
+            first.sort_unstable();
+            assert_eq!(
+                first,
+                [
+                    "agent",
+                    "agent_cancel",
+                    "agent_result",
+                    "ask_user",
+                    "grep",
+                    "list_dir",
+                    "read_file",
+                    "shell"
+                ]
+            );
+            let mut second: Vec<&str> = chat_requests[1]
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect();
+            second.sort_unstable();
+            assert_eq!(
+                second,
+                [
+                    "agent",
+                    "agent_cancel",
+                    "agent_result",
+                    "grep",
+                    "list_dir",
+                    "read_file"
+                ]
+            );
+        });
+    }
+
+    /// §7's session-level hard boundary: a `[tools.<name>] enabled = false`
+    /// tool never enters the session registry, so a child surface naming it
+    /// (here through a TOML definition's `tools` list) drops it.
+    #[test]
+    fn child_surface_drops_tools_disabled_at_session_level() {
+        use crate::instances::spawn::SUBAGENT_SKELETON;
+
+        driver_local(async {
+            use mag_config::{ConfigDto, ConfigSnapshot};
+
+            let dto = ConfigDto::parse_str(
+                r#"
+[agents.default]
+
+[agents.reviewer]
+role = "Reviews changes."
+tools = ["read_file", "shell"]
+
+[tools.shell]
+enabled = false
+"#,
+            )
+            .expect("config parses");
+            let snapshot = ConfigSnapshot::resolve(&dto, 1).expect("config resolves");
+            let client = FakeLlmClient::scripted_routes(vec![
+                RequestRoute::system_contains(
+                    SUBAGENT_SKELETON,
+                    vec![StreamScript::Complete(text_stream_with_usage(
+                        &["report"],
+                        usage(1, 1),
+                    ))],
+                ),
+                RequestRoute::any(vec![
+                    StreamScript::Complete(tool_use_stream(
+                        "agent",
+                        "call-1",
+                        serde_json::json!({ "type": "reviewer", "task": "t" }),
+                    )),
+                    StreamScript::Complete(text_stream_with_usage(&["done"], usage(1, 1))),
+                ]),
+            ]);
+            let mut driver = driver_with_filtered_registry(client.clone(), &snapshot);
+
+            drive_one_turn(&mut driver).await;
+            let instance = driver
+                .spawn_ctx
+                .registry
+                .get("reviewer-1")
+                .expect("instance registered");
+            await_instance_terminal(&instance).await;
+
+            let chat_requests = client.chat_requests();
+            assert_eq!(chat_requests.len(), 1);
+            let mut names: Vec<&str> = chat_requests[0]
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect();
+            names.sort_unstable();
+            assert_eq!(
+                names,
+                ["agent", "agent_cancel", "agent_result", "read_file"],
+                "`shell` is disabled session-wide and drops out of the child surface"
+            );
+        });
     }
 
     /// M3-5 restore compatibility: a snapshot persisted before the static
@@ -2432,6 +2642,27 @@ tools = []
             .enable_all()
             .build()
             .expect("build driver test runtime")
+    }
+
+    /// Runs `test` on the driver-test runtime inside a
+    /// [`tokio::task::LocalSet`], so the `agent` tool handler's
+    /// `tokio::task::spawn_local` works (mirrors the session actor's `!Send`
+    /// discipline, `crate::session`).
+    fn driver_local<T>(test: impl std::future::Future<Output = T>) -> T {
+        let runtime = driver_test_runtime();
+        tokio::task::LocalSet::new().block_on(&runtime, test)
+    }
+
+    /// Polls the instance until it reaches a terminal status (5s backstop; a
+    /// hang is a bug).
+    async fn await_instance_terminal(instance: &std::sync::Arc<crate::instances::Instance>) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !instance.status().is_terminal() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("instance reaches a terminal status");
     }
 
     /// Drives one turn through the driver's own `run_turn` and asserts it

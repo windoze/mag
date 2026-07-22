@@ -204,6 +204,13 @@ pub struct SessionDefaultsDto {
     /// `agents` (an unset key falls back to the `default` entry).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_agent: Option<String>,
+    /// Default tool surface for subagent instances whose definition sets no
+    /// `tools` (`docs/dyn-agents.md` §7): a plain tool-name list. Validation
+    /// is deferred to surface-build time, where names unknown to the session
+    /// registry or disabled by `[tools.<name>] enabled = false` are dropped
+    /// with a warning; an unset key falls back to the full session registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_subagent_tools: Option<Vec<String>>,
 }
 
 /// Approval defaults (`[approval]`).

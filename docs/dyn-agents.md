@@ -103,7 +103,7 @@ env:
 | `name` | 否 | 缺省取文件名（去 `.md`） |
 | `description` | 是 | 出现在 `agent` 工具描述中，model 据此选类型；同时用于 UI |
 | `kind` | 否 | `local`（缺省）或 `acp` |
-| `tools` | 否 | 仅 local。逗号分隔；**缺省 = 继承 supervisor 工具面**；显式给出时与 supervisor 工具面**取交集**（防提权，等价 Codex 的 sandbox 约束） |
+| `tools` | 否 | 仅 local。逗号分隔；显式给出 = child 的**恰好**那份工具列表；缺省 = session 缺省 toolset（`[session].default_subagent_tools`），未配置 = session 可用工具全量。工具面是 agent 种类的属性，**不与 supervisor 工具面取交集**（§7） |
 | `model` | 否 | 仅 local。缺省继承 supervisor 的 model；受 M4-R 限制只能选同 provider 的 model |
 | `max_steps` | 否 | 仅 local。步数预算上限；缺省用运行时默认 |
 | `command` / `env` | external 必选 / 否 | 仅 `kind: acp` |
@@ -124,7 +124,7 @@ env:
 ### 3.3 内置 agent
 
 - **`general-purpose`**：永远存在、零配置可用的兜底类型，`agent` 工具 `type` 参数的缺省值。
-  工具面 = 继承 supervisor。正文是通用任务执行指令。
+  工具面 = session 缺省 toolset（未配置 = session 可用工具全量）。正文是通用任务执行指令。
 - **`explorer`**：内置只读类型（`tools` 限只读集），对应 Claude Code 的 `Explore` 与 Codex
   的 `explorer`，也是并发探查场景的主力类型。
 
@@ -215,8 +215,13 @@ TOML `[external_agents.<name>]` 与 markdown `kind: acp` 定义等价，同为�
 
 ## 7. 工具面与审批策略
 
-- **实例工具面**：定义 `tools` 缺省继承 supervisor；显式给出时与 supervisor 工具面取交集。
-  `agent` 工具默认包含（支持嵌套，深度受限）。
+- **实例工具面**：工具面是 **agent 种类的属性**，与 supervisor 自身（绑定项塑造的）工具面无关
+  ——supervisor 的 `tools` 只约束 supervisor 自己。child 面解析顺序：定义 `tools` 显式给出 →
+  恰好那份列表；缺省 → session 缺省 toolset（`[session].default_subagent_tools`，便利配置，
+  随 `apply_config` 重建、只影响之后的 spawn）；再缺省 → session 可用工具全量。三种结果都过
+  可用性校验：注册表未知名与被 `[tools.x] enabled = false` 禁用的名字 drop + warn（每会话
+  一次）；`enabled = false` 与 `approval = "deny"` 是 session 级硬边界——前者在面构建时
+  排除，后者走审批层。`agent` 工具默认包含（支持嵌套，深度受限）。
 - **spawn 审批**：沿用现有 delegate start tier 的模式（`apply_delegate_start_tiers`，
   `driver.rs:1245`），粒度细化到类型：`agent:explorer` 可免审、`agent:peer`（external）
   要审。策略表达从 `ask_tool("ask_<name>")` 迁移为按 `agent:<type>` 匹配。

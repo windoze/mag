@@ -25,4 +25,12 @@ budget?: BudgetDto,
  * session request names no agent; validated at resolve time against
  * `agents` (an unset key falls back to the `default` entry).
  */
-default_agent?: string, };
+default_agent?: string, 
+/**
+ * Default tool surface for subagent instances whose definition sets no
+ * `tools` (`docs/dyn-agents.md` §7): a plain tool-name list. Validation
+ * is deferred to surface-build time, where names unknown to the session
+ * registry or disabled by `[tools.<name>] enabled = false` are dropped
+ * with a warning; an unset key falls back to the full session registry.
+ */
+default_subagent_tools?: Array<string>, };

@@ -36,6 +36,7 @@ approval = "ask"                            # ask | allow | deny（→ ApprovalP
 [session]
 routing = "model_routed"
 budget = { max_tokens = 200000 }
+default_subagent_tools = ["read_file", "list_dir", "grep"]  # 可选：定义未设 tools 的 subagent 缺省工具面（dyn-agents.md §7）
 "#;
 
 #[test]
@@ -107,6 +108,14 @@ fn example_toml_parses_into_expected_dto() {
             max_tokens: Some(200_000),
             ..BudgetDto::default()
         })
+    );
+    assert_eq!(
+        session.default_subagent_tools.as_deref(),
+        Some(
+            ["read_file", "list_dir", "grep"]
+                .map(str::to_string)
+                .as_slice()
+        )
     );
 }
 

@@ -14,10 +14,11 @@
 //!
 //! The drive task assembles the child from the definition: a `kind: local`
 //! definition builds a child facade agent (the layered system prompt of
-//! [`SUBAGENT_SKELETON`] + definition body, §4; the supervisor's tool surface
-//! filtered by the supervisor's own surface bound and the definition's
-//! `tools` allowlist plus the `agent` tool itself for nesting, §5.4/§7; the
-//! supervisor's approval-policy projection), while a `kind: acp` definition
+//! [`SUBAGENT_SKELETON`] + definition body, §4; the child tool surface
+//! resolved from the definition's `tools` list — falling back to the
+//! session's configured default toolset, then to the full session registry —
+//! plus the `agent` tool itself for nesting, §5.4/§7; the supervisor's
+//! approval-policy projection), while a `kind: acp` definition
 //! launches one external ACP process per instance and drives it through
 //! agent-lib's one-shot [`run_external_once`](agent_lib::facade::run_external_once)
 //! (§6, feature-gated `external-acp`). Both paths bubble every paused
@@ -42,6 +43,7 @@
 //! answers the instance's state after the call.
 
 use std::{
+    collections::HashSet,
     convert::Infallible,
     fmt::Write as _,
     sync::{Arc, PoisonError, RwLock},
@@ -130,7 +132,7 @@ your task brief.
 
 /// Session-wide spawn state shared by every [`InstanceSpawnContext`] of one
 /// session: the merged agent-definition table, the supervisor's effective
-/// model, and the supervisor's plugin-surface filter
+/// model, and the session's default subagent toolset
 /// (`docs/dyn-agents.md` §3.2/§7).
 ///
 /// All three pieces are hot-swappable behind one lock: the session driver
@@ -138,16 +140,16 @@ your task brief.
 /// layer is re-projected and re-merged), the supervisor model follows the
 /// built agent's authoritative value at build and at every turn start (an
 /// applied `SetModel` reconfiguration lands at the turn boundary), and the
-/// surface filter follows a bound tool-list change the same way. The root
-/// supervisor's context and every child context derived from it share the
-/// same cell, so a rebuilt table takes effect for the next spawn at any depth
-/// (definitions only affect *later* spawns, M3-5).
+/// default toolset is re-read from the applied snapshot the same way. The
+/// root supervisor's context and every child context derived from it share
+/// the same cell, so a rebuilt table takes effect for the next spawn at any
+/// depth (definitions only affect *later* spawns, M3-5).
 #[derive(Clone, Debug)]
 pub(crate) struct SharedSpawnState {
     inner: Arc<RwLock<SpawnStateInner>>,
 }
 
-/// The swappable triple behind [`SharedSpawnState`].
+/// The swappable state behind [`SharedSpawnState`].
 #[derive(Clone, Debug)]
 struct SpawnStateInner {
     /// Merged definition table the `agent` tool's `type` resolves against.
@@ -155,28 +157,31 @@ struct SpawnStateInner {
     /// The supervisor's effective model; a definition without `model`
     /// inherits it, and `max_tokens` always aligns with it.
     supervisor_model: ModelRef,
-    /// The supervisor's plugin-surface filter — its bound `agents.<name>`
-    /// tool list; `None` is unconstrained. Every instance surface is
-    /// intersected with it (§7's anti-escalation rule: a definition, which
-    /// is data possibly shipped by a project, must never grant a child a
-    /// plugin the supervisor itself does not have). The instance tool trio
-    /// is exempt, exactly as on the supervisor's own surface.
-    surface: Option<Vec<String>>,
+    /// The session's configured default subagent toolset
+    /// (`[session].default_subagent_tools`, `docs/dyn-agents.md` §7): the
+    /// fallback surface for a definition that sets no `tools`; `None` leaves
+    /// such a child on the full session registry.
+    default_tools: Option<Vec<String>>,
+    /// Surface names already warned about (unknown to the session registry
+    /// or disabled by `[tools.<name>] enabled = false`), so a bad entry is
+    /// reported once per session instead of on every spawn.
+    warned_unavailable_tools: HashSet<String>,
 }
 
 impl SharedSpawnState {
     /// Creates the shared cell from the assembled definition table, the
-    /// supervisor's model, and the supervisor's plugin-surface filter.
+    /// supervisor's model, and the session's default subagent toolset.
     pub(crate) fn new(
         definitions: AgentDefinitionRegistry,
         supervisor_model: ModelRef,
-        surface: Option<Vec<String>>,
+        default_tools: Option<Vec<String>>,
     ) -> Self {
         Self {
             inner: Arc::new(RwLock::new(SpawnStateInner {
                 definitions,
                 supervisor_model,
-                surface,
+                default_tools,
+                warned_unavailable_tools: HashSet::new(),
             })),
         }
     }
@@ -193,16 +198,18 @@ impl SharedSpawnState {
         self.lock().supervisor_model = supervisor_model;
     }
 
-    /// Replaces only the supervisor's plugin-surface filter (config apply
-    /// changed the bound entry's tool list).
-    pub(crate) fn set_surface(&self, surface: Option<Vec<String>>) {
-        self.lock().surface = surface;
+    /// Replaces only the session's default subagent toolset (config apply
+    /// swapped the `[session]` section).
+    pub(crate) fn set_default_tools(&self, default_tools: Option<Vec<String>>) {
+        self.lock().default_tools = default_tools;
     }
 
-    /// Returns the supervisor's current plugin-surface filter (`None` is
-    /// unconstrained).
-    pub(crate) fn surface(&self) -> Option<Vec<String>> {
-        self.lock().surface.clone()
+    /// Returns the session's current default subagent toolset (`None` falls
+    /// back to the full session registry). Test-only observability: the
+    /// production path reads the toolset through [`child_surface_names`].
+    #[cfg(test)]
+    pub(crate) fn default_tools(&self) -> Option<Vec<String>> {
+        self.lock().default_tools.clone()
     }
 
     /// Returns a clone of the definition named `name` (the `agent` tool's
@@ -219,6 +226,61 @@ impl SharedSpawnState {
     /// Returns the supervisor's current effective model.
     pub(crate) fn supervisor_model(&self) -> ModelRef {
         self.lock().supervisor_model.clone()
+    }
+
+    /// Resolves the tool-name list one spawned child's surface is projected
+    /// from (`docs/dyn-agents.md` §7): the definition's explicit `tools`
+    /// list wins; a definition without one falls back to the session's
+    /// configured default toolset; `None` is unconstrained — the child is
+    /// projected from the full session registry.
+    ///
+    /// Names with no registered plugin are dropped and warned about once per
+    /// session (a name can be unknown to the registry, or disabled by
+    /// `[tools.<name>] enabled = false`, which never enters the registry —
+    /// both are session-level hard boundaries the child surface must not
+    /// cross).
+    pub(crate) fn child_surface_names(
+        &self,
+        definition_tools: Option<Vec<String>>,
+        tools: &ToolRegistry,
+    ) -> Option<Vec<String>> {
+        let mut inner = self.lock();
+        let names = definition_tools.or_else(|| inner.default_tools.clone())?;
+        let mut unavailable = Vec::new();
+        let available = names
+            .into_iter()
+            .filter(|name| {
+                let registered = tools.plugins().iter().any(|plugin| plugin.name() == name);
+                if !registered {
+                    unavailable.push(name.clone());
+                }
+                registered
+            })
+            .collect();
+        for name in unavailable {
+            if inner.warned_unavailable_tools.insert(name.clone()) {
+                tracing::warn!(
+                    tool = name.as_str(),
+                    "subagent tool surface names a tool unavailable in this session (unknown or \
+                     disabled by `[tools.<name>] enabled = false`); dropped"
+                );
+            }
+        }
+        Some(available)
+    }
+
+    /// Names already warned about (test-only observability for the
+    /// once-per-session warning guard).
+    #[cfg(test)]
+    pub(crate) fn warned_unavailable_tools(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .lock()
+            .warned_unavailable_tools
+            .iter()
+            .cloned()
+            .collect();
+        names.sort();
+        names
     }
 
     /// Locks the cell, recovering the guard from a poisoned lock (the
@@ -781,23 +843,15 @@ async fn drive_local(
     let user_interaction = Arc::new(IpcUserInteractionBridge::new(
         origin.clone() as Arc<dyn InteractionHandler>
     ));
-    // §7: the child surface is the supervisor's plugin projection narrowed
-    // by the supervisor's own surface filter (the bound `agents.<name>`
-    // tool list — the anti-escalation anchor, shared at every depth) and
-    // intersected with the definition's allowlist (`None` inherits the
-    // supervisor's surface), plus the instance tools of the child's own
-    // context for nesting (§5.4).
-    let allowed: Option<Vec<String>> = match (ctx.shared.surface(), tools.clone()) {
-        (None, None) => None,
-        (Some(bound), None) => Some(bound),
-        (None, Some(definition)) => Some(definition),
-        (Some(bound), Some(definition)) => Some(
-            definition
-                .into_iter()
-                .filter(|name| bound.contains(name))
-                .collect(),
-        ),
-    };
+    // §7: the child surface is a property of the agent *definition*, never
+    // narrowed by the supervisor's own (binding-shaped) surface: the
+    // definition's explicit `tools` list wins; without it the session's
+    // configured default toolset applies; without either the full session
+    // registry is projected. Names unavailable in this session (unknown, or
+    // disabled by `[tools.<name>] enabled = false`) are dropped with a
+    // once-per-session warning. The instance tools of the child's own
+    // context are always appended for nesting (§5.4).
+    let allowed = ctx.shared.child_surface_names(tools.clone(), &ctx.tools);
     let (mut surface, policy) = project_tool_plugins(
         &ctx.tools,
         allowed.as_deref(),
@@ -1057,15 +1111,15 @@ mod tests {
         definitions: AgentDefinitionRegistry,
         depth: u32,
     ) -> TestRig {
-        rig_with_surface(client, tools, definitions, depth, None)
+        rig_with_default_tools(client, tools, definitions, depth, None)
     }
 
-    fn rig_with_surface(
+    fn rig_with_default_tools(
         client: &Arc<FakeLlmClient>,
         tools: ToolRegistry,
         definitions: AgentDefinitionRegistry,
         depth: u32,
-        surface: Option<Vec<String>>,
+        default_tools: Option<Vec<String>>,
     ) -> TestRig {
         let events = EventBus::new();
         let session_id = SessionId::new(Uuid::from_u128(7));
@@ -1085,7 +1139,7 @@ mod tests {
                     None,
                     None,
                 ),
-                surface,
+                default_tools,
             ),
             client: client.clone() as Arc<dyn LlmClient>,
             tools: Arc::new(tools),
@@ -2164,13 +2218,14 @@ mod tests {
     }
 
     /// Spawns one `agent_type` instance and returns the tool names the child
-    /// advertised on its first LLM request (sorted). `surface` is the
-    /// supervisor's plugin-surface filter (`None` = unconstrained).
+    /// advertised on its first LLM request (sorted). `default_tools` is the
+    /// session's configured default subagent toolset (`None` = unconfigured,
+    /// so a definition without `tools` falls back to the full registry).
     fn child_tool_names(
         tools: ToolRegistry,
         definitions: AgentDefinitionRegistry,
         agent_type: &str,
-        surface: Option<Vec<String>>,
+        default_tools: Option<Vec<String>>,
     ) -> Vec<String> {
         run_local(async move {
             let client = routed_client(
@@ -2180,7 +2235,7 @@ mod tests {
                 ))],
                 supervisor_scripts(json!({ "type": agent_type, "task": "t" })),
             );
-            let rig = rig_with_surface(&client, tools, definitions, 0, surface);
+            let rig = rig_with_default_tools(&client, tools, definitions, 0, default_tools);
             let mut agent = supervisor_agent(&rig);
 
             tokio::time::timeout(Duration::from_secs(5), drive_supervisor(&mut agent, "go"))
@@ -2204,8 +2259,14 @@ mod tests {
         })
     }
 
+    /// §7's fallback chain for a definition without `tools`: the session's
+    /// configured default toolset wins when present; otherwise the child is
+    /// projected from the full session registry. Neither branch consults the
+    /// supervisor's own (binding-shaped) surface.
     #[test]
-    fn child_inherits_full_surface_when_tools_unset() {
+    fn child_surface_defaults_to_toolset_then_full_registry() {
+        // No default toolset configured: the full registry is projected, and
+        // the instance tool trio is always appended (§5.1/§5.4).
         let names = child_tool_names(
             ToolRegistry::with_builtins(),
             AgentDefinitionRegistry::builtin(),
@@ -2225,18 +2286,34 @@ mod tests {
                 "shell"
             ]
         );
+
+        // A configured default toolset is the child's exact plugin set.
+        let names = child_tool_names(
+            ToolRegistry::with_builtins(),
+            AgentDefinitionRegistry::builtin(),
+            "general-purpose",
+            Some(vec!["read_file".to_owned(), "grep".to_owned()]),
+        );
+        assert_eq!(
+            names,
+            ["agent", "agent_cancel", "agent_result", "grep", "read_file"]
+        );
     }
 
+    /// §7: an explicit `tools` list on the definition is the child's exact
+    /// plugin set — it wins over the session's default toolset and is not
+    /// narrowed by anything else.
     #[test]
-    fn child_surface_intersects_definition_tools() {
+    fn explicit_definition_tools_win_over_the_default_toolset() {
         let names = child_tool_names(
             ToolRegistry::with_builtins(),
             AgentDefinitionRegistry::builtin(),
             "explorer",
-            None,
+            Some(vec!["shell".to_owned()]),
         );
-        // `tools = [read_file, list_dir, grep]` narrows the supervisor's
-        // surface; the instance tool trio is always appended (§5.1/§5.4).
+        // `explorer` declares `tools = [read_file, list_dir, grep]`: exactly
+        // that list (not the default toolset's `shell`), plus the instance
+        // tool trio (§5.1/§5.4).
         assert_eq!(
             names,
             [
@@ -2269,45 +2346,42 @@ mod tests {
         );
     }
 
-    /// §7's anti-escalation rule: a child never widens past the supervisor's
-    /// own (binding-narrowed) surface — a definition with no `tools` inherits
-    /// the narrowed surface, and an explicit `tools` allowlist is intersected
-    /// with it. The instance tool trio is exempt (§5.1).
+    /// The session's default toolset goes through the same availability
+    /// check as a definition's `tools` list: unknown names drop out.
     #[test]
-    fn child_surface_is_bounded_by_the_supervisor_surface() {
-        let bound = || Some(vec!["read_file".to_owned(), "shell".to_owned()]);
-        // The definition sets no `tools`: it inherits the supervisor's
-        // narrowed surface, not the full registry (`ask_user`, `grep`,
-        // `list_dir` are all out).
+    fn child_surface_skips_unknown_default_toolset_names() {
         let names = child_tool_names(
             ToolRegistry::with_builtins(),
             AgentDefinitionRegistry::builtin(),
             "general-purpose",
-            bound(),
-        );
-        assert_eq!(
-            names,
-            [
-                "agent",
-                "agent_cancel",
-                "agent_result",
-                "read_file",
-                "shell"
-            ]
-        );
-
-        // An explicit `tools` allowlist is intersected with the supervisor's
-        // surface: `explorer` names `grep`/`list_dir`, which the supervisor
-        // itself does not have, so they drop out.
-        let names = child_tool_names(
-            ToolRegistry::with_builtins(),
-            AgentDefinitionRegistry::builtin(),
-            "explorer",
-            bound(),
+            Some(vec!["read_file".to_owned(), "ghost".to_owned()]),
         );
         assert_eq!(
             names,
             ["agent", "agent_cancel", "agent_result", "read_file"]
+        );
+    }
+
+    /// An unavailable surface name is dropped deterministically and warned
+    /// about once per session, not on every spawn.
+    #[test]
+    fn unavailable_surface_names_warn_once_per_session() {
+        let tools = ToolRegistry::with_builtins();
+        let rig = rig_with_default_tools(
+            &FakeLlmClient::scripted(Vec::new()),
+            ToolRegistry::with_builtins(),
+            AgentDefinitionRegistry::builtin(),
+            0,
+            Some(vec!["read_file".to_owned(), "ghost".to_owned()]),
+        );
+        let expected = Some(vec!["read_file".to_owned()]);
+        for _ in 0..3 {
+            assert_eq!(rig.ctx.shared.child_surface_names(None, &tools), expected);
+        }
+        assert_eq!(
+            rig.ctx.shared.warned_unavailable_tools(),
+            ["ghost".to_owned()],
+            "the once-guard recorded the single warning"
         );
     }
 

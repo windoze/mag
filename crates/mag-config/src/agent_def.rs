@@ -59,9 +59,10 @@ pub enum AgentKindDef {
     Local {
         /// Model override; `None` inherits the supervisor's model.
         model: Option<String>,
-        /// Tool-name allowlist; `None` inherits the supervisor tool surface,
-        /// `Some` is intersected with it (a definition can only narrow the
-        /// surface, never widen it, §3.1).
+        /// Tool-name allowlist: the child's exact plugin surface when set;
+        /// `None` falls back to the session's configured default subagent
+        /// toolset, then to the full session registry
+        /// (`docs/dyn-agents.md` §7).
         tools: Option<Vec<String>>,
         /// Step-budget override; `None` uses the runtime default.
         max_steps: Option<u32>,
@@ -1306,6 +1307,7 @@ approval = "ask"                            # ask | allow | deny（→ ApprovalP
 [session]
 routing = "model_routed"
 budget = { max_tokens = 200000 }
+default_subagent_tools = ["read_file", "list_dir", "grep"]  # 可选：定义未设 tools 的 subagent 缺省工具面（dyn-agents.md §7）
 "#;
 
     fn example_snapshot() -> ConfigSnapshot {

@@ -5478,9 +5478,9 @@ done
     #[tokio::test]
     async fn two_explorer_instances_run_concurrently_and_report_through_agent_result() {
         let read_gate = StreamGate::new();
-        // The `explorer` surface intersects to the read-only set, so both
-        // children park inside this shared gated `read_file` (a bare
-        // registry: `registry()` already carries a plain `read_file`).
+        // The `explorer` surface is its exact read-only list projected onto
+        // this bare registry (only `read_file` is registered), so both
+        // children park inside this shared gated `read_file`.
         let tools = ToolRegistry::new().register(Arc::new(ParkTool {
             name: "read_file",
             gate: read_gate.clone(),

@@ -278,7 +278,7 @@ tools = ["read_file", "list_dir", "grep", "shell", "ask_user"]
 role = "只读审查 subagent"                   # role → 定义 description（出现在 agent 工具描述中）
 model = "claude-haiku-4-5"                  # 实例 model 覆盖；缺省继承 supervisor，仅限同 provider
 system_prompt = "审查改动，只报问题不改代码。" # → 定义正文（分层 prompt 第二层）
-tools = ["read_file", "grep"]               # 与 supervisor 工具面取交集（只窄不宽）
+tools = ["read_file", "grep"]               # child 的恰好工具列表（显式 tools 优先于 session 缺省 toolset）
 
 [external_agents.peer_acp]                  # external ACP subagent 定义（kind: acp，按实例拉起进程）
 kind = "acp"
@@ -290,6 +290,7 @@ approval = "ask"                            # ask | allow | deny（→ ApprovalP
 [session]
 routing = "model_routed"
 budget = { max_tokens = 200000 }
+default_subagent_tools = ["read_file", "list_dir", "grep"]  # 可选：定义未设 tools 的 subagent 缺省工具面（dyn-agents.md §7）
 ```
 
 启动装配（bin 侧）：读文件 → DTO → resolve 成 DO 图 → 从 DO 图装配 `SourceRegistry` /
@@ -305,7 +306,7 @@ budget = { max_tokens = 200000 }
 | `name` | 否 | 缺省取文件名（去 `.md`） |
 | `description` | 是 | 出现在 `agent` 工具描述中，model 据此选类型；同时用于 UI |
 | `kind` | 否 | `local`（缺省）或 `acp` |
-| `tools` | 否 | 仅 local。逗号分隔；缺省继承 supervisor 工具面，显式给出时取交集（只窄不宽） |
+| `tools` | 否 | 仅 local。逗号分隔；显式给出 = child 的恰好工具列表；缺省 = session 缺省 toolset（`[session].default_subagent_tools`），未配置 = session 可用工具全量；不与 supervisor 工具面取交集 |
 | `model` | 否 | 仅 local。缺省继承 supervisor 的 model；仅限同 provider 的 model |
 | `max_steps` | 否 | 仅 local。步数预算上限；缺省用运行时默认 |
 | `command` / `env` | external 必选 / 否 | 仅 `kind: acp`；spawn 命令行（argv 形式）与额外环境变量 |
@@ -313,7 +314,10 @@ budget = { max_tokens = 200000 }
 同名定义四来源优先级（高 → 低）：**TOML > 项目级 > 用户级 > 内置**；内置提供
 `general-purpose`（零配置兜底，`agent` 工具 `type` 的缺省值）与 `explorer`（只读探查）。
 定义注册表在会话创建时装配、`apply_config` 时重建（两个 markdown 目录层一并重读），只影响
-之后的 spawn（§4.4）。
+之后的 spawn（§4.4）。`[session].default_subagent_tools` 是纯名字列表的便利配置：定义未设
+`tools` 的 subagent 以它为缺省工具面（未配置 = session 可用工具全量）；名字校验推迟到面
+构建——注册表未知名与 `[tools.x] enabled = false` 禁用名 drop + warn（每会话一次）——并同样
+随 `apply_config` 重建、只影响之后的 spawn。
 
 ### 4.3 运行时模型：ConfigService（mag-core 内）
 
@@ -370,6 +374,7 @@ model/system 恒定。再叠加快照一致性：会话的 provider/工具装配
 | subagent 定义（agents.* 非绑定项 / external_agents.* / 两个 markdown 目录） | 定义注册表随会话创建装配、随 `apply_config` 重建（TOML 层重投影、目录层重读）；**只影响之后的 spawn**，运行中实例钉住 spawn 时的上下文 |
 | tools.*.approval（审批策略） | **仅会话（重）建时生效**：`ApprovalPolicy` 在 facade agent build 时烤死（agent-lib 无 reconfigure 变体），改审批策略对既有会话不生效；`apply_config` 也不覆盖它 |
 | session 缺省（routing/budget/default_agent） | 只影响新会话 |
+| session.default_subagent_tools（subagent 缺省工具面） | 随会话创建播种、随 `apply_config` 重建（与定义注册表同语义）；**只影响之后的 spawn**，且只作用于定义未设 `tools` 的 subagent（dyn-agents.md §7） |
 
 - 会话钉住的实现：`create_session` 时取 `current.clone()`（`Arc`）存入会话状态；restore 时
   快照中的会话 config 决定重建哪一版装配（持久化的是 DTO 形态的会话配置，恢复时 resolve 成

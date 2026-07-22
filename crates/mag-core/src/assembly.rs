@@ -465,6 +465,11 @@ pub(crate) struct SessionBinding {
     /// driver merges it over the builtin/user/project layers; the bound entry
     /// itself is excluded.
     agent_definitions: AgentDefinitionRegistry,
+    /// The session's configured default subagent toolset
+    /// (`[session].default_subagent_tools`, `docs/dyn-agents.md` §7): seeds
+    /// the shared spawn state; a definition without `tools` falls back to it
+    /// (and then to the full session registry when unset).
+    default_subagent_tools: Option<Vec<String>>,
 }
 
 impl SessionBinding {
@@ -480,6 +485,7 @@ impl SessionBinding {
                 system_prompt: None,
                 budget: config.budget,
                 agent_definitions: AgentDefinitionRegistry::default(),
+                default_subagent_tools: None,
             };
         };
 
@@ -523,6 +529,10 @@ impl SessionBinding {
             system_prompt: entry.and_then(|agent| agent.system_prompt().map(str::to_owned)),
             budget,
             agent_definitions,
+            default_subagent_tools: snapshot
+                .session_defaults()
+                .default_subagent_tools()
+                .map(<[String]>::to_vec),
         }
     }
 
@@ -562,6 +572,13 @@ impl SessionBinding {
     /// builtin/user/project layers and rebuilds it on `apply_config` (M3-5).
     pub(crate) fn agent_definitions(&self) -> &AgentDefinitionRegistry {
         &self.agent_definitions
+    }
+
+    /// The session's configured default subagent toolset
+    /// (`[session].default_subagent_tools`, `docs/dyn-agents.md` §7); `None`
+    /// leaves definitions without `tools` on the full session registry.
+    pub(crate) fn default_subagent_tools(&self) -> Option<&[String]> {
+        self.default_subagent_tools.as_deref()
     }
 }
 

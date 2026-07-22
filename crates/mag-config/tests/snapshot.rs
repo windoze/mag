@@ -43,6 +43,7 @@ approval = "ask"                            # ask | allow | deny（→ ApprovalP
 [session]
 routing = "model_routed"
 budget = { max_tokens = 200000 }
+default_subagent_tools = ["read_file", "list_dir", "grep"]  # 可选：定义未设 tools 的 subagent 缺省工具面（dyn-agents.md §7）
 "#;
 
 /// Extracts the `(path, message)` of a `ConfigError::Validation`.
@@ -147,6 +148,14 @@ fn example_toml_resolves_into_shared_arc_graph() {
             .and_then(|b| b.max_tokens()),
         Some(200000)
     );
+    assert_eq!(
+        snapshot.session_defaults().default_subagent_tools(),
+        Some(
+            ["read_file", "list_dir", "grep"]
+                .map(str::to_string)
+                .as_slice()
+        )
+    );
     // No [approval] section: effective default matches agent-lib's default tier.
     assert_eq!(snapshot.approval().default_policy(), None);
     assert_eq!(
@@ -210,6 +219,33 @@ default_agent = "ghost"
     let (path, message) = validation_path(&error);
     assert_eq!(path, "session.default_agent");
     assert!(message.contains("ghost"), "message: {message}");
+}
+
+/// `[session].default_subagent_tools` is a plain name list: resolve keeps it
+/// verbatim (unknown-name validation is deferred to surface-build time,
+/// `docs/dyn-agents.md` §7) and `project()` round-trips it losslessly.
+#[test]
+fn session_default_subagent_tools_resolves_and_round_trips() {
+    let dto = ConfigDto::parse_str(
+        r#"
+[session]
+default_subagent_tools = ["read_file", "ghost"]
+"#,
+    )
+    .expect("parse");
+    let snapshot = ConfigSnapshot::resolve(&dto, 1).expect("resolve");
+    assert_eq!(
+        snapshot.session_defaults().default_subagent_tools(),
+        Some(["read_file", "ghost"].map(str::to_string).as_slice()),
+        "even an unknown name passes resolve; it is dropped with a warning at surface build"
+    );
+    assert_eq!(snapshot.project(), dto, "DTO→DO→DTO must be lossless");
+
+    // An unset key stays unset through resolve and projection.
+    let dto = ConfigDto::parse_str("[session]\nrouting = \"model_routed\"\n").expect("parse");
+    let snapshot = ConfigSnapshot::resolve(&dto, 1).expect("resolve");
+    assert_eq!(snapshot.session_defaults().default_subagent_tools(), None);
+    assert_eq!(snapshot.project(), dto);
 }
 
 #[test]

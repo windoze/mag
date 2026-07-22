@@ -1727,3 +1727,48 @@ review 范围：mag `git diff 3e2a56f..HEAD`（24 文件，+9554/-1858，14 comm
 
 **遗留事项**：全部收录于 §11（7+1 条），本 review 无新增；M5-R defer 的 CLI 实例渲染
 e2e 维持原结论，随实例 UI 里程碑一并补。
+
+---
+
+## F-R 后设计修订（2026-07-22）：child 工具面归属 agent 种类
+
+**主题**：动态 subagent 的 child 工具面语义变更。M3-R 引入的"交集"语义（`def.tools ∩
+supervisor 绑定面`）被推翻：工具面是 **agent 种类的属性**，supervisor 绑定 allowlist 彻底退出
+child 面计算。
+
+**语义变更**：
+
+- 删除 `SharedSpawnState.surface`（`crates/mag-core/src/instances/spawn.rs`）及 driver 侧的
+  播种（`root_spawn_context` 的 `binding.tools()`）与 `apply_config` 镜像更新。
+- child 面解析顺序：定义 `tools` 显式给出 → 恰好那份列表；缺省 → session 缺省 toolset（新增
+  `[session].default_subagent_tools`，纯名字列表，不做 ResolvedTool 投影，校验推迟到面构建）；
+  再缺省 → session 可用工具全量。三种结果都过可用性校验：注册表未知名与
+  `[tools.x] enabled = false` 禁用名 drop + warn（每会话一次）；`enabled = false` 与
+  `approval = "deny"` 是 session 级硬边界——前者在面构建时排除，后者走审批层（现状不动）。
+- `agent` / `agent_result` / `agent_cancel` 三工具作为运行时能力照旧默认附加给每个 child。
+- TOML `[agents.<name>]` 非绑定项投影不变（其 `tools` → `def.tools`）；绑定项（supervisor）的
+  `tools` 语义不变，只约束 supervisor 自己。
+- `default_subagent_tools` 随会话创建播种、随 `apply_config` 重建（与定义注册表同语义），只
+  影响之后的 spawn。
+
+**理由**：supervisor 面是主 agent 自身的行为塑造（绑定项对自身能力的裁剪），与 child 无关；
+交集语义会静默阉割项目携带的定义（定义声明的工具因 supervisor 未配而悄悄消失），并堵死
+coordinator 拓扑（面被刻意收窄的 supervisor 无法派出需要更多工具的 child）。
+
+**涉及 commit**：`<提交后回填>`
+
+**测试**：M3-R 两个"supervisor 收窄约束 child"测试语义反转（driver.rs
+`child_surface_ignores_the_supervisor_bound_tool_list` +
+`default_subagent_tools_seed_at_build_and_follow_config_apply`）；M3-3
+`child_inherits_full_surface_when_tools_unset` → spawn.rs
+`child_surface_defaults_to_toolset_then_full_registry`（缺省取 toolset / 未配置取全量）；新增
+`[session].default_subagent_tools` 配置链路（mag-config
+`session_default_subagent_tools_resolves_and_round_trips` + 上述 driver 测试）、显式 def.tools
+优先于缺省（`explicit_definition_tools_win_over_the_default_toolset`）、未知名/enabled=false
+drop + warn（`child_surface_skips_unknown_default_toolset_names`、
+`child_surface_drops_tools_disabled_at_session_level`、
+`unavailable_surface_names_warn_once_per_session`）；既有测试全绿。
+
+**文档**：`docs/dyn-agents.md` §3.1 字段表 `tools` 行、§3.3 `general-purpose` 条目、§7 工具面
+条目重写；`docs/CLI.md` §4.2 TOML 示例与 frontmatter 字段表 `tools` 行、[session] 说明、§4.4
+生效时机表同步。
