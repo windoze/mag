@@ -4560,7 +4560,11 @@ mod instances {
     //! (`docs/dyn-agents.md` §5.1), their per-tool approval tiers, and the
     //! supervisor-run cancel cascade into the session's instance registry —
     //! plus the M3-6 completion-notification delivery (in-run pivot channel
-    //! and idle next-turn input prefix, §5.2).
+    //! and idle next-turn input prefix, §5.2). The M5-1 scenarios extend the
+    //! same harness to end-to-end coverage (`TODO.md` M5-1): concurrent
+    //! multi-instance turns, the report contract, approval bubbling, the
+    //! cancel cascade over a blocked `agent_result`, the local+external
+    //! mix, and four-source definition loading.
 
     use std::{
         fs,
@@ -4582,11 +4586,11 @@ mod instances {
         },
     };
     use async_trait::async_trait;
-    use futures::stream::BoxStream;
+    use futures::{FutureExt, stream::BoxStream};
     use mag_service::{
         AgentInstanceStatusWire, MagService, RoutingMode, ServiceEvent, SessionConfig, UserInput,
     };
-    use mag_tools::{ToolPlugin, ToolRegistry};
+    use mag_tools::{PermissionSpec, ToolCategory, ToolPlugin, ToolRegistry, ToolRisk};
     use serde_json::{Value, json};
     use tokio::time::{Duration, timeout};
 
@@ -4630,6 +4634,7 @@ mod instances {
     struct StubTool {
         name: &'static str,
         output: &'static str,
+        permission: Option<PermissionSpec>,
     }
 
     #[async_trait]
@@ -4648,6 +4653,10 @@ mod instances {
 
         async fn invoke(&self, _ctx: ToolContext, _args: Value) -> ToolResult {
             ToolResult::text(self.output)
+        }
+
+        fn permission(&self) -> Option<PermissionSpec> {
+            self.permission
         }
     }
 
@@ -4686,6 +4695,7 @@ mod instances {
         ToolRegistry::new().register(Arc::new(StubTool {
             name: "read_file",
             output: "file contents",
+            permission: None,
         }))
     }
 
@@ -5277,6 +5287,958 @@ model = "model-d"
         assert!(
             user_text.ends_with("next question"),
             "the original user input follows the prefix block: {user_text:?}"
+        );
+    }
+
+    // ===== M5-1 e2e scenarios (`TODO.md` M5-1) =====
+
+    /// Reads events until `pred` holds over everything collected so far,
+    /// returning the lot (the matching event included). `next_event`'s 5s
+    /// backstop makes a hang a failure, matching the module's style.
+    async fn collect_events_until(
+        events: &mut BoxStream<'static, ServiceEvent>,
+        pred: impl Fn(&[ServiceEvent]) -> bool,
+    ) -> Vec<ServiceEvent> {
+        let mut collected = Vec::new();
+        while !pred(&collected) {
+            collected.push(next_event(events).await);
+        }
+        collected
+    }
+
+    /// Returns every event already buffered without blocking.
+    fn drain_ready(events: &mut BoxStream<'static, ServiceEvent>) -> Vec<ServiceEvent> {
+        let mut drained = Vec::new();
+        while let Some(Some(event)) = futures::StreamExt::next(events).now_or_never() {
+            drained.push(event);
+        }
+        drained
+    }
+
+    /// Polls `pred` until it holds (5s backstop; a hang is a bug).
+    async fn poll_until(mut pred: impl FnMut() -> bool) {
+        timeout(Duration::from_secs(5), async {
+            while !pred() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("condition holds within 5s");
+    }
+
+    /// `(status, concatenated text)` of every tool result in one request.
+    fn tool_results(request: &agent_lib::client::ChatRequest) -> Vec<(ToolStatus, String)> {
+        request
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult {
+                    content, status, ..
+                } => Some((
+                    *status,
+                    content
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text { text, .. } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Extracts `(instance_id, agent_type, depth)` of every instance start.
+    fn instance_starts(events: &[ServiceEvent]) -> Vec<(String, String, u32)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ServiceEvent::AgentInstanceStarted {
+                    instance_id,
+                    agent_type,
+                    depth,
+                    ..
+                } => Some((instance_id.clone(), agent_type.clone(), *depth)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Extracts `(instance_id, status, report)` of every instance finish.
+    fn instance_finishes(
+        events: &[ServiceEvent],
+    ) -> Vec<(String, AgentInstanceStatusWire, Option<String>)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ServiceEvent::AgentInstanceFinished {
+                    instance_id,
+                    status,
+                    report,
+                    ..
+                } => Some((instance_id.clone(), *status, report.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Sets a process env var for the test's duration, restoring the
+    /// previous value on drop (the `unsafe` blocks: env mutation is
+    /// process-global in edition 2024). Used to point `XDG_CONFIG_HOME` at
+    /// a tempdir for the definition-loading e2e; the injected user-level
+    /// definitions use e2e-specific names, so a parallel test building a
+    /// session inside the window only sees additive, non-colliding lines in
+    /// its `agent` description (all existing description assertions are
+    /// `contains`-based).
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set_path(key: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(previous) => unsafe { std::env::set_var(self.key, previous) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    /// Writes the fake ACP agent script (same pattern as the spawn-module
+    /// fake, trimmed to the `success` flow the mix e2e needs): a
+    /// line-oriented JSON-RPC peer logging every received frame to `$1`,
+    /// answering `initialize` / `session/new` / `session/prompt`, and
+    /// exiting on `session/cancel` with a `SESSION_CANCELLED` marker.
+    /// Returns the script path.
+    #[cfg(all(unix, feature = "external-acp"))]
+    fn fake_acp_script(dir: &TempConfigDir) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = dir.0.join("fake-acp.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+set -eu
+MAG_FAKE_ACP_LOG="$1"
+session="$2"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$MAG_FAKE_ACP_LOG"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}'
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"%s"}}\n' "$session"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"external summary"}}}}\n' "$session"
+      printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
+      ;;
+    *'"method":"session/cancel"'*)
+      printf '%s\n' 'SESSION_CANCELLED' >> "$MAG_FAKE_ACP_LOG"
+      exit 0
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write fake ACP script");
+        let mut permissions = fs::metadata(&script)
+            .expect("fake ACP script metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).expect("chmod fake ACP script");
+        script
+    }
+
+    /// Escapes a path for embedding into a TOML basic string.
+    #[cfg(all(unix, feature = "external-acp"))]
+    fn toml_string(value: &std::path::Path) -> String {
+        value
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+    }
+
+    /// M5-1 scenario 1 (parallel multi-instance): the supervisor spawns two
+    /// `explorer` instances within one turn. Both provably advance
+    /// concurrently — each parks inside the gated `read_file` while the
+    /// other is in flight too and neither has finished — and each report is
+    /// retrievable through `agent_result` (completion order is free).
+    #[tokio::test]
+    async fn two_explorer_instances_run_concurrently_and_report_through_agent_result() {
+        let read_gate = StreamGate::new();
+        // The `explorer` surface intersects to the read-only set, so both
+        // children park inside this shared gated `read_file` (a bare
+        // registry: `registry()` already carries a plain `read_file`).
+        let tools = ToolRegistry::new().register(Arc::new(ParkTool {
+            name: "read_file",
+            gate: read_gate.clone(),
+        }));
+        let fake = FakeLlmClient::scripted_routes(vec![
+            // The two explorer children share one layered system prompt, so
+            // their requests are routed by the opening task brief instead.
+            RequestRoute::user_text_contains(
+                "probe area alpha",
+                vec![
+                    StreamScript::Complete(tool_use_stream("read_file", "alpha-1", json!({}))),
+                    StreamScript::Complete(text_stream_with_usage(&["alpha report"], usage())),
+                ],
+            ),
+            RequestRoute::user_text_contains(
+                "probe area beta",
+                vec![
+                    StreamScript::Complete(tool_use_stream("read_file", "beta-1", json!({}))),
+                    StreamScript::Complete(text_stream_with_usage(&["beta report"], usage())),
+                ],
+            ),
+            RequestRoute::any(vec![
+                StreamScript::Complete(tool_use_stream(
+                    "agent",
+                    "call-1",
+                    json!({ "type": "explorer", "task": "probe area alpha" }),
+                )),
+                StreamScript::Complete(tool_use_stream(
+                    "agent",
+                    "call-2",
+                    json!({ "type": "explorer", "task": "probe area beta" }),
+                )),
+                StreamScript::Complete(tool_use_stream(
+                    "agent_result",
+                    "call-3",
+                    json!({ "id": "explorer-1" }),
+                )),
+                StreamScript::Complete(tool_use_stream(
+                    "agent_result",
+                    "call-4",
+                    json!({ "id": "explorer-2" }),
+                )),
+                StreamScript::Complete(text_stream_with_usage(&["both reports in"], usage())),
+            ]),
+        ]);
+        let (_dir, engine) = engine_with_client(
+            r#"
+[agents.default]
+model = "model-d"
+"#,
+            tools,
+            fake.clone(),
+        );
+        let session = engine
+            .create_session(session_config("default", "fake-chat"))
+            .await
+            .expect("create session");
+        let mut events = engine.subscribe(Some(session));
+        engine
+            .send_message(session, UserInput::text("scout both areas"))
+            .await
+            .expect("send message");
+
+        // Both spawns return immediately; both instances start as direct
+        // children.
+        let spawned = collect_events_until(&mut events, |collected| {
+            instance_starts(collected).len() == 2
+        })
+        .await;
+        assert_eq!(
+            instance_starts(&spawned),
+            vec![
+                ("explorer-1".to_owned(), "explorer".to_owned(), 1),
+                ("explorer-2".to_owned(), "explorer".to_owned(), 1),
+            ],
+            "both explorer instances started as direct children"
+        );
+
+        // Concurrency proof: both children made their first LLM request and
+        // park inside the gated `read_file` while neither has finished (the
+        // supervisor is blocked inside `agent_result` at this point).
+        poll_until(|| fake.chat_requests().len() == 2).await;
+        assert!(
+            instance_finishes(&drain_ready(&mut events)).is_empty(),
+            "both instances are still in flight before the gate opens"
+        );
+
+        // Release both children; their reports land in either order.
+        read_gate.open();
+        read_gate.open();
+        let finished = collect_events_until(&mut events, |collected| {
+            collected
+                .iter()
+                .any(|event| matches!(event, ServiceEvent::RunFinished { .. }))
+        })
+        .await;
+        let mut finishes = instance_finishes(&finished);
+        finishes.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            finishes,
+            vec![
+                (
+                    "explorer-1".to_owned(),
+                    AgentInstanceStatusWire::Completed,
+                    Some("alpha report".to_owned()),
+                ),
+                (
+                    "explorer-2".to_owned(),
+                    AgentInstanceStatusWire::Completed,
+                    Some("beta report".to_owned()),
+                ),
+            ],
+            "both instances completed with their own reports"
+        );
+
+        // Each `agent_result` returned its instance's report to the
+        // supervisor (children use the non-streaming endpoint, so every
+        // streaming request is the supervisor's).
+        let requests = fake.stream_requests();
+        assert_eq!(requests.len(), 5, "two spawns + two results + final text");
+        for (index, id, report) in [
+            (3, "explorer-1", "alpha report"),
+            (4, "explorer-2", "beta report"),
+        ] {
+            let results = tool_results(&requests[index]);
+            assert!(
+                results
+                    .iter()
+                    .any(|(status, text)| *status == ToolStatus::Ok
+                        && text.contains(id)
+                        && text.contains(report)),
+                "agent_result({id}) returned `{report}`: {results:?}"
+            );
+        }
+    }
+
+    /// M5-1 scenario 2 (report contract): the child's final assistant text
+    /// becomes the `agent_result` report *verbatim* — multi-line and longer
+    /// than the completion-notification preview, proving the report channel
+    /// neither flattens nor truncates.
+    #[tokio::test]
+    async fn child_final_text_becomes_the_agent_result_report_verbatim() {
+        const REPORT: &str = "findings: the vault holds 42 entries.\n\
+            \n\
+            - entry 7 points at crates/mag-core/src/engine.rs:1\n\
+            - the remaining entries are unremarkable filler padding that pushes\n\
+            this report well past the two-hundred-character notification preview.\n\
+            conclusion: probe complete; nothing left unresolved.";
+        let fake = FakeLlmClient::scripted_routes(vec![
+            RequestRoute::system_contains(
+                "subagent",
+                vec![StreamScript::Complete(text_stream_with_usage(
+                    &[REPORT],
+                    usage(),
+                ))],
+            ),
+            RequestRoute::any(vec![
+                StreamScript::Complete(tool_use_stream(
+                    "agent",
+                    "call-1",
+                    json!({ "task": "write the report" }),
+                )),
+                StreamScript::Complete(tool_use_stream(
+                    "agent_result",
+                    "call-2",
+                    json!({ "id": "general-purpose-1" }),
+                )),
+                StreamScript::Complete(text_stream_with_usage(&["relayed"], usage())),
+            ]),
+        ]);
+        let (_dir, engine) = engine_with_client(
+            r#"
+[agents.default]
+model = "model-d"
+"#,
+            registry(),
+            fake.clone(),
+        );
+        let session = engine
+            .create_session(session_config("default", "fake-chat"))
+            .await
+            .expect("create session");
+        let mut events = engine.subscribe(Some(session));
+        engine
+            .send_message(session, UserInput::text("report please"))
+            .await
+            .expect("send message");
+        let collected = collect_events_until(&mut events, |collected| {
+            !instance_finishes(collected).is_empty()
+                && collected
+                    .iter()
+                    .any(|event| matches!(event, ServiceEvent::RunFinished { .. }))
+        })
+        .await;
+
+        // The finish event carries the verbatim report...
+        assert_eq!(
+            instance_finishes(&collected),
+            vec![(
+                "general-purpose-1".to_owned(),
+                AgentInstanceStatusWire::Completed,
+                Some(REPORT.to_owned()),
+            )],
+            "the finish event report is the child's final text verbatim"
+        );
+
+        // ...and so does the `agent_result` payload fed back to the
+        // supervisor (the request's last tool result is the one its step
+        // added; the earlier spawn result also reads `running`).
+        let requests = fake.stream_requests();
+        assert_eq!(requests.len(), 3, "spawn + result + final text");
+        let results = tool_results(&requests[2]);
+        let payload = results
+            .last()
+            .map(|(_, text)| text)
+            .expect("the agent_result tool result");
+        let payload: Value = serde_json::from_str(payload).expect("agent_result payload is JSON");
+        assert_eq!(payload["id"].as_str(), Some("general-purpose-1"));
+        assert_eq!(payload["status"].as_str(), Some("completed"));
+        assert_eq!(
+            payload["report"].as_str(),
+            Some(REPORT),
+            "the agent_result report is verbatim"
+        );
+    }
+
+    /// M5-1 scenario 3 (approval bubbling): a gated tool inside the child
+    /// pops on the root session's event stream with the instance origin
+    /// (`delegate` = instance id, `depth` = 1); the interface's approval
+    /// resumes the child, and the approved tool's result genuinely lands in
+    /// the child's follow-up request. (Module-level counterpart: M3-3's
+    /// `child_approval_bubbles_to_root_with_origin_and_resumes`; here the
+    /// full Engine + session event stream + `respond_interaction` path.)
+    #[tokio::test]
+    async fn child_tool_approval_bubbles_to_the_root_session_and_resumes() {
+        let tools = registry().register(Arc::new(StubTool {
+            name: "shell",
+            output: "shell output",
+            permission: Some(PermissionSpec::new(ToolCategory::Shell, ToolRisk::Medium)),
+        }));
+        let fake = FakeLlmClient::scripted_routes(vec![
+            RequestRoute::system_contains(
+                "subagent",
+                vec![
+                    StreamScript::Complete(tool_use_stream(
+                        "shell",
+                        "child-shell-1",
+                        json!({ "cmd": "ls" }),
+                    )),
+                    StreamScript::Complete(text_stream_with_usage(
+                        &["report after approval"],
+                        usage(),
+                    )),
+                ],
+            ),
+            RequestRoute::any(vec![
+                StreamScript::Complete(tool_use_stream(
+                    "agent",
+                    "call-1",
+                    json!({ "task": "run the shell" }),
+                )),
+                StreamScript::Complete(text_stream_with_usage(&["supervisor final"], usage())),
+            ]),
+        ]);
+        let (_dir, engine) = engine_with_client(
+            r#"
+[agents.default]
+model = "model-d"
+"#,
+            tools,
+            fake.clone(),
+        );
+        let session = engine
+            .create_session(session_config("default", "fake-chat"))
+            .await
+            .expect("create session");
+        let mut events = engine.subscribe(Some(session));
+        engine
+            .send_message(session, UserInput::text("delegate the shell work"))
+            .await
+            .expect("send message");
+
+        // The child's approval pops on the root session's stream; the
+        // supervisor's own turn may already have finished by then.
+        let asked = collect_events_until(&mut events, |collected| {
+            collected
+                .iter()
+                .any(|event| matches!(event, ServiceEvent::InteractionRequested { .. }))
+        })
+        .await;
+        let (request_id, origin) = asked
+            .iter()
+            .find_map(|event| match event {
+                ServiceEvent::InteractionRequested {
+                    request_id,
+                    origin,
+                    kind,
+                    ..
+                } => {
+                    assert!(
+                        matches!(kind, mag_service::InteractionKindWire::Approval { .. }),
+                        "the child's pause is an approval: {kind:?}"
+                    );
+                    Some((*request_id, origin.clone()))
+                }
+                _ => None,
+            })
+            .expect("the child's approval popped on the root stream");
+        assert_eq!(origin.delegate.as_deref(), Some("general-purpose-1"));
+        assert_eq!(origin.depth, 1);
+        assert!(!origin.is_root());
+
+        engine
+            .respond_interaction(
+                session,
+                request_id,
+                mag_service::InteractionResponseWire::Approval {
+                    step_id: mag_service::StepIdWire::new(uuid::Uuid::nil()),
+                    call_id: mag_service::ToolCallIdWire::new(uuid::Uuid::nil()),
+                    decision: mag_service::ApprovalDecisionWire::Approve,
+                    message: None,
+                },
+            )
+            .await
+            .expect("approve the child's shell call");
+
+        // The approved child resumes and completes with its report; the
+        // supervisor's own turn also completes (its `RunFinished` may have
+        // landed in either phase).
+        let run_already_finished = asked
+            .iter()
+            .any(|event| matches!(event, ServiceEvent::RunFinished { .. }));
+        let rest = collect_events_until(&mut events, |collected| {
+            !instance_finishes(collected).is_empty()
+                && (run_already_finished
+                    || collected
+                        .iter()
+                        .any(|event| matches!(event, ServiceEvent::RunFinished { .. })))
+        })
+        .await;
+        assert_eq!(
+            instance_finishes(&rest),
+            vec![(
+                "general-purpose-1".to_owned(),
+                AgentInstanceStatusWire::Completed,
+                Some("report after approval".to_owned()),
+            )],
+            "the approved child resumed and completed"
+        );
+
+        // The approved tool genuinely ran: its result folds into the
+        // child's follow-up request.
+        let chat_requests = fake.chat_requests();
+        assert_eq!(
+            chat_requests.len(),
+            2,
+            "the child's shell call + its report"
+        );
+        let results = tool_results(&chat_requests[1]);
+        assert!(
+            results
+                .iter()
+                .any(|(status, text)| *status == ToolStatus::Ok && text == "shell output"),
+            "the approved shell executed and fed the child: {results:?}"
+        );
+    }
+
+    /// M5-1 scenario 4 (cancel cascade): cancelling the supervisor's run
+    /// while it is blocked inside `agent_result` returns control
+    /// immediately (the tool's cancel preemption, M3-4) and terminalizes
+    /// every still-running instance (M3-5 cascade). Without the preemption
+    /// the run would outlive the cancel and `RunError(Cancelled)` would
+    /// never arrive within the backstop.
+    #[tokio::test]
+    async fn supervisor_cancel_preempts_a_blocked_agent_result_and_cascades() {
+        let park_gate = StreamGate::new();
+        let tools = registry().register(Arc::new(ParkTool {
+            name: "park",
+            // Never opened: the child outlives the supervisor's run.
+            gate: park_gate,
+        }));
+        let fake = FakeLlmClient::scripted_routes(vec![
+            RequestRoute::system_contains(
+                "subagent",
+                vec![StreamScript::Complete(tool_use_stream(
+                    "park",
+                    "child-1",
+                    json!({}),
+                ))],
+            ),
+            RequestRoute::any(vec![
+                StreamScript::Complete(tool_use_stream(
+                    "agent",
+                    "call-1",
+                    json!({ "task": "hold the line" }),
+                )),
+                StreamScript::Complete(tool_use_stream(
+                    "agent_result",
+                    "call-2",
+                    json!({ "id": "general-purpose-1" }),
+                )),
+            ]),
+        ]);
+        let (_dir, engine) = engine_with_client(
+            r#"
+[agents.default]
+model = "model-d"
+"#,
+            tools,
+            fake.clone(),
+        );
+        let session = engine
+            .create_session(session_config("default", "fake-chat"))
+            .await
+            .expect("create session");
+        let mut events = engine.subscribe(Some(session));
+        engine
+            .send_message(session, UserInput::text("delegate and wait"))
+            .await
+            .expect("send message");
+
+        let spawned = collect_events_until(&mut events, |collected| {
+            !instance_starts(collected).is_empty()
+        })
+        .await;
+        assert_eq!(
+            instance_starts(&spawned),
+            vec![(
+                "general-purpose-1".to_owned(),
+                "general-purpose".to_owned(),
+                1
+            )],
+        );
+
+        // Both sides provably in flight: the child is parked inside its
+        // gated tool (its request is in), and the supervisor is blocked
+        // inside `agent_result` (its second request is in).
+        poll_until(|| fake.chat_requests().len() == 1 && fake.stream_requests().len() == 2).await;
+
+        engine.cancel(session).await.expect("cancel the run");
+
+        let settled = collect_events_until(&mut events, |collected| {
+            collected.iter().any(|event| {
+                matches!(event, ServiceEvent::RunError { kind, .. } if *kind == mag_service::RunErrorKind::Cancelled)
+            }) && instance_finishes(collected)
+                .iter()
+                .any(|(_, status, _)| *status == AgentInstanceStatusWire::Cancelled)
+        })
+        .await;
+        assert_eq!(
+            instance_finishes(&settled),
+            vec![(
+                "general-purpose-1".to_owned(),
+                AgentInstanceStatusWire::Cancelled,
+                None,
+            )],
+            "the cascade cancelled the still-running instance"
+        );
+    }
+
+    /// M5-1 scenario 5 (external/local mix): one turn spawns an external
+    /// ACP instance (a fake process configured through
+    /// `[external_agents]`) and a local instance side by side; both
+    /// complete with their own reports, each retrievable through
+    /// `agent_result`, and the external process is reclaimed once its
+    /// instance terminates. (The external lifecycle alone is covered by
+    /// M4-1's module tests; this is the mixed Engine-level path.)
+    #[cfg(all(unix, feature = "external-acp"))]
+    #[tokio::test]
+    async fn local_and_external_instances_run_side_by_side() {
+        let acp_dir = TempConfigDir::new();
+        let script = fake_acp_script(&acp_dir);
+        let log = acp_dir.0.join("fake-acp.log");
+        let toml = format!(
+            r#"
+[agents.default]
+model = "model-d"
+
+[external_agents.peer]
+kind = "acp"
+command = ["{}", "{}", "mag-e2e-acp-session"]
+"#,
+            toml_string(&script),
+            toml_string(&log),
+        );
+        let fake = FakeLlmClient::scripted_routes(vec![
+            RequestRoute::system_contains(
+                "subagent",
+                vec![StreamScript::Complete(text_stream_with_usage(
+                    &["local report"],
+                    usage(),
+                ))],
+            ),
+            RequestRoute::any(vec![
+                StreamScript::Complete(tool_use_stream(
+                    "agent",
+                    "call-1",
+                    json!({ "type": "peer", "task": "inspect remotely" }),
+                )),
+                StreamScript::Complete(tool_use_stream(
+                    "agent",
+                    "call-2",
+                    json!({ "task": "local job" }),
+                )),
+                StreamScript::Complete(tool_use_stream(
+                    "agent_result",
+                    "call-3",
+                    json!({ "id": "peer-1" }),
+                )),
+                StreamScript::Complete(tool_use_stream(
+                    "agent_result",
+                    "call-4",
+                    json!({ "id": "general-purpose-1" }),
+                )),
+                StreamScript::Complete(text_stream_with_usage(&["both in"], usage())),
+            ]),
+        ]);
+        let (_dir, engine) = engine_with_client(&toml, registry(), fake.clone());
+        let session = engine
+            .create_session(session_config("default", "fake-chat"))
+            .await
+            .expect("create session");
+        let mut events = engine.subscribe(Some(session));
+        engine
+            .send_message(session, UserInput::text("run both kinds"))
+            .await
+            .expect("send message");
+
+        // Both instance kinds start side by side as direct children.
+        let spawned = collect_events_until(&mut events, |collected| {
+            instance_starts(collected).len() == 2
+        })
+        .await;
+        assert_eq!(
+            instance_starts(&spawned),
+            vec![
+                ("peer-1".to_owned(), "peer".to_owned(), 1),
+                (
+                    "general-purpose-1".to_owned(),
+                    "general-purpose".to_owned(),
+                    1
+                ),
+            ],
+            "the external and local instances started side by side"
+        );
+
+        let finished = collect_events_until(&mut events, |collected| {
+            collected
+                .iter()
+                .any(|event| matches!(event, ServiceEvent::RunFinished { .. }))
+        })
+        .await;
+        let mut finishes = instance_finishes(&finished);
+        finishes.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            finishes,
+            vec![
+                (
+                    "general-purpose-1".to_owned(),
+                    AgentInstanceStatusWire::Completed,
+                    Some("local report".to_owned()),
+                ),
+                (
+                    "peer-1".to_owned(),
+                    AgentInstanceStatusWire::Completed,
+                    Some("external summary".to_owned()),
+                ),
+            ],
+            "both instances completed with their own reports"
+        );
+
+        // Both reports reached the supervisor through `agent_result`.
+        let requests = fake.stream_requests();
+        assert_eq!(requests.len(), 5, "two spawns + two results + final text");
+        for (index, id, report) in [
+            (3, "peer-1", "external summary"),
+            (4, "general-purpose-1", "local report"),
+        ] {
+            let results = tool_results(&requests[index]);
+            assert!(
+                results
+                    .iter()
+                    .any(|(status, text)| *status == ToolStatus::Ok
+                        && text.contains(id)
+                        && text.contains(report)),
+                "agent_result({id}) returned `{report}`: {results:?}"
+            );
+        }
+
+        // The external instance ran a real ACP process through the
+        // handshake, and the terminal sweep reclaimed it afterwards.
+        let log_text = fs::read_to_string(&log).expect("fake ACP log");
+        assert!(
+            log_text.contains(r#""method":"initialize""#)
+                && log_text.contains(r#""method":"session/new""#)
+                && log_text.contains(r#""method":"session/prompt""#),
+            "the ACP process was driven: {log_text}"
+        );
+        assert!(
+            log_text.contains("inspect remotely"),
+            "the task reached the peer: {log_text}"
+        );
+        poll_until(|| {
+            fs::read_to_string(&log)
+                .map(|text| {
+                    text.contains(r#""method":"session/cancel""#)
+                        || text.contains("SESSION_CANCELLED")
+                })
+                .unwrap_or(false)
+        })
+        .await;
+    }
+
+    /// M5-1 scenario 6 (definition loading): the four definition sources —
+    /// builtin, `$XDG_CONFIG_HOME/mag/agents` (user), `<cwd>/.mag/agents`
+    /// (project), and the TOML `[agents]` layer — merge into the session's
+    /// spawnable registry. Same-name definitions resolve user < project <
+    /// TOML, the `agent` description enumerates the merged set, and a spawn
+    /// runs the winning (TOML) body.
+    #[tokio::test]
+    async fn agent_definitions_load_from_all_sources_and_toml_wins() {
+        // User layer: `$XDG_CONFIG_HOME/mag/agents` (see `EnvGuard`'s note
+        // on why the temporary override cannot disturb parallel tests).
+        let xdg = TempConfigDir::new();
+        let user_agents = xdg.0.join("mag").join("agents");
+        fs::create_dir_all(&user_agents).expect("create user agents dir");
+        fs::write(
+            user_agents.join("foo.md"),
+            "---\nname: foo\ndescription: user foo\n---\nUSER BODY MARKER\n",
+        )
+        .expect("write user foo definition");
+        fs::write(
+            user_agents.join("m5e1-scout.md"),
+            "---\ndescription: user scout\n---\nuser scout body\n",
+        )
+        .expect("write user scout definition");
+        let _env = EnvGuard::set_path("XDG_CONFIG_HOME", &xdg.0);
+
+        // Project layer: `<cwd>/.mag/agents`, losing the same-name race to
+        // the TOML layer below.
+        let project = TempConfigDir::new();
+        let project_agents = project.0.join(".mag").join("agents");
+        fs::create_dir_all(&project_agents).expect("create project agents dir");
+        fs::write(
+            project_agents.join("foo.md"),
+            "---\nname: foo\ndescription: project foo\n---\nPROJECT BODY MARKER\n",
+        )
+        .expect("write project foo definition");
+
+        let fake = FakeLlmClient::scripted_routes(vec![
+            RequestRoute::system_contains(
+                "subagent",
+                vec![StreamScript::Complete(text_stream_with_usage(
+                    &["foo report"],
+                    usage(),
+                ))],
+            ),
+            RequestRoute::any(vec![
+                StreamScript::Complete(tool_use_stream(
+                    "agent",
+                    "call-1",
+                    json!({ "type": "foo", "task": "check the layers" }),
+                )),
+                StreamScript::Complete(text_stream_with_usage(&["done"], usage())),
+            ]),
+        ]);
+        let (_dir, engine) = engine_with_client(
+            r#"
+[agents.default]
+model = "model-d"
+
+[agents.foo]
+model = "model-f"
+role = "toml foo"
+system_prompt = "TOML BODY MARKER"
+"#,
+            registry(),
+            fake.clone(),
+        );
+        let mut config = session_config("default", "fake-chat");
+        config.cwd = Some(project.0.clone());
+        let session = engine.create_session(config).await.expect("create session");
+        let mut events = engine.subscribe(Some(session));
+        engine
+            .send_message(session, UserInput::text("use foo"))
+            .await
+            .expect("send message");
+        // The child runs independently of the supervisor's turn here (no
+        // `agent_result` wait), so both terminal events may arrive in
+        // either order.
+        let collected = collect_events_until(&mut events, |collected| {
+            !instance_finishes(collected).is_empty()
+                && collected
+                    .iter()
+                    .any(|event| matches!(event, ServiceEvent::RunFinished { .. }))
+        })
+        .await;
+
+        // The spawn resolves the merged `foo` and runs it to completion.
+        assert_eq!(
+            instance_starts(&collected),
+            vec![("foo-1".to_owned(), "foo".to_owned(), 1)],
+            "the merged `foo` spawned as a direct child"
+        );
+        assert_eq!(
+            instance_finishes(&collected),
+            vec![(
+                "foo-1".to_owned(),
+                AgentInstanceStatusWire::Completed,
+                Some("foo report".to_owned()),
+            )],
+        );
+
+        // The merged table is enumerated on the supervisor's `agent` tool:
+        // TOML wins `foo`, the user-only definition is listed, the builtin
+        // types remain, and the losing layers are invisible.
+        let requests = fake.stream_requests();
+        let agent = requests[0]
+            .tools
+            .iter()
+            .find(|tool| tool.name == "agent")
+            .expect("the agent tool is advertised");
+        for expected in [
+            "foo: toml foo",
+            "m5e1-scout: user scout",
+            "general-purpose",
+            "explorer",
+        ] {
+            assert!(
+                agent.description.contains(expected),
+                "the description enumerates `{expected}`: {}",
+                agent.description
+            );
+        }
+        for overridden in ["user foo", "project foo"] {
+            assert!(
+                !agent.description.contains(overridden),
+                "the overridden layer is invisible: {}",
+                agent.description
+            );
+        }
+
+        // The spawned child runs the winning (TOML) definition: its model
+        // and its body, not the user/project bodies.
+        let chat_requests = fake.chat_requests();
+        assert_eq!(chat_requests.len(), 1);
+        assert_eq!(chat_requests[0].model, "model-f");
+        let system = chat_requests[0]
+            .system
+            .as_deref()
+            .expect("the child carries a system prompt");
+        assert!(
+            system.contains("TOML BODY MARKER"),
+            "the TOML body wins: {system}"
+        );
+        assert!(
+            !system.contains("PROJECT BODY MARKER") && !system.contains("USER BODY MARKER"),
+            "the losing bodies stay out: {system}"
         );
     }
 }

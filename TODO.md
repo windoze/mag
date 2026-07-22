@@ -1416,7 +1416,7 @@ mag-core --no-default-features`（含 `--all-targets`）✅；external 4 测试�
 
 ## M5 — e2e 加固 + 文档
 
-### M5-1 [TODO] mag-core：端到端集成测试
+### M5-1 [DONE] mag-core：端到端集成测试
 
 **目标**：补齐跨模块 e2e 场景（`engine.rs` 测试风格，`engine_with_config` :4329 基建）。
 
@@ -1435,7 +1435,76 @@ mag-core --no-default-features`（含 `--all-targets`）✅；external 4 测试�
 
 **验证**：全部新测试绿且 < 1 分钟/个；门禁序列全绿。
 
-### M5-2 [TODO] 文档更新：CLI.md agents 章节 + dyn-agents.md 状态
+**完成记录**（2026-07-22）：
+
+- 改动（仅 `crates/mag-core/src/engine.rs`，无生产代码改动、无新依赖）：`mod instances`
+  新增 6 个 engine 级 e2e 测试（真 `Engine` + `ConfigService` 配置 + 会话事件流全链路，
+  FakeLlmClient scripted_routes 按内容路由 supervisor/child 请求），模块文档更新；
+  `StubTool` 补 `permission` 字段（场景 3 的 gated shell 需要，与 `external_sources` 同款）；
+  新测试基建均为模块内私有：`collect_events_until`（累计事件断言）、`drain_ready`
+  （非阻塞排空）、`poll_until`（5s 兜底轮询）、`tool_results`、`instance_starts`/
+  `instance_finishes`（事件提取）、`EnvGuard`（env 变量 save/restore）、cfg 门控的
+  `fake_acp_script`/`toml_string`。
+- 场景覆盖对应关系（每场景一测试，全离线，6 测试合计约 2s）：
+  1. 并行多实例 → `two_explorer_instances_run_concurrently_and_report_through_agent_result`：
+     一个 turn 内两次 `agent` 调用 spawn 两个 explorer；并发实证为结构性断言——两 child 各自
+     完成首次 LLM 请求并停在共享 gated `read_file`（explorer 只读面 ∩ 注册表）内、且此刻无
+     任何 Finished 事件（supervisor 阻塞在 `agent_result` 中）；开闸后两报告乱序完成、各自
+     经 `agent_result` 取回（请求 4/5 的 tool result 逐一断言）。同类型两 child 无法按
+     system prompt 区分，路由用 `user_text_contains`（开场任务简报）——M3-3 的
+     scripted_routes 够用，**无需增强**。
+  2. 报告契约 → `child_final_text_becomes_the_agent_result_report_verbatim`：child 最终
+     assistant 文本（多行、约 280 字符、刻意超过通知摘要的 200 字符截断线）逐字等于
+     Finished 事件 report 与 `agent_result` JSON payload 的 report 字段（serde 解析后等值
+     断言，排除扁平化/截断）。
+  3. 审批冒泡 → `child_tool_approval_bubbles_to_the_root_session_and_resumes`：模块级对应
+     M3-3 `child_approval_bubbles_to_root_with_origin_and_resumes`（本测试为全链路版：真
+     Engine、`respond_interaction` 服务调用、会话事件流）；断言 origin
+     （delegate=general-purpose-1、depth=1、非 root）、kind=Approval、批准后 child 续跑完成
+     且 shell 结果进入 child 后续请求；supervisor RunFinished 与冒泡事件的两种合法时序均
+     容忍。
+  4. cancel 级联 → `supervisor_cancel_preempts_a_blocked_agent_result_and_cascades`：
+     M3-5 `supervisor_run_cancel_cascades_to_running_instances` 的加强腿——supervisor 阻塞在
+     `agent_result` 内（stream 请求数 == 2 确证）时 cancel，验证 M3-4 的 cancel 抢占在
+     engine 级生效（无抢占则 RunError(Cancelled) 在 5s 兜底内永不到达）+ 运行中实例级联
+     Cancelled。
+  5. external/local 混合 → `local_and_external_instances_run_side_by_side`（
+     `#[cfg(all(unix, feature = "external-acp"))]`）：external 生命周期单测在 M4-1 模块级
+     （4 个），本测试补任务单要求的混合场景——`[external_agents.peer]`（TOML 投影）经
+     fake-acp 进程 + local general-purpose 同 turn 并存，各自完成、报告取回、ACP 握手三帧
+     与任务文本到达对端、终态 sweep 回收进程（session/cancel 或 SESSION_CANCELLED 轮询
+     断言）；测试后 `pgrep fake-acp` 无残留。
+  6. 定义加载 e2e → `agent_definitions_load_from_all_sources_and_toml_wins`：tempdir 项目
+     `.mag/agents/foo.md` + 用户目录（`EnvGuard` 临时指 `XDG_CONFIG_HOME` 到 tempdir，含
+     同名 foo 与独有 m5e1-scout）+ TOML `[agents.foo]` 同名覆盖；断言 `agent` 工具
+     description 枚举（TOML 版 foo 描述在、user/project 版不可见、m5e1-scout 在、内置
+     两类型在）与 spawn 行为（foo-1 完成、child 请求 model=model-f、system 含 TOML body
+     不含 user/project body）。
+- 门禁结果（全部实跑）：`cargo fmt --all -- --check` ✅；聚焦测试
+  `cargo test -p mag-core engine::instances` ✅（11 passed，含 6 新测试，2.05s）；
+  `cargo clippy --all-targets -- -D warnings` ✅（0 warning）；
+  `cargo test --workspace` ✅（全套件 ok，0 failed）；
+  `cargo doc --no-deps --workspace` ✅（mag-config 1 个既有 rustdoc warning，同 M3-1 起
+  记录，与本任务无关）；`cargo check -p mag-core --no-default-features --all-targets` ✅
+  （cfg 门控的场景 5 在 feature off 下编译干净）。
+- flaky 复跑：6 个新测试 `--exact` 连跑 3 遍全绿（各 2.02s）；时序同步全部走
+  gate/poll_until（5s 兜底，卡住即 bug），无裸 sleep 时序断言。
+- 偏差：
+  1. **两个 CLI e2e 的 delegation 腿不在本任务补齐，留给 M5-R**：M3-5 偏差 5 把它们指向
+     M5-1，评估结论是不合适——CLI 对 `AgentInstanceStarted/Finished` 尚无渲染（`_ => {}`），
+     CLI 级可断言面只有"实例生命周期事件经真实 CLI 路径不炸"；且 CLI 测试的 FakeLlmClient
+     是平铺 FIFO，supervisor/child 请求交错下需先移植 scripted_routes 内容路由才能确定性
+     脚本化（约 150-200 行另一 crate 测试基建），超出本任务 mag-core engine 级定位。M5-R
+     若认为该 smoke 有价值，按"CLI 测试 FakeLlmClient 加内容路由 + 一个 spawn turn 的
+     [finished] 断言"实施。
+  2. 场景 6 的用户目录层经 `XDG_CONFIG_HOME` 进程级 env 注入（driver 直读
+     `default_user_agents_dir()`，无其他注入点）：定义名用 e2e 专有名（`foo`/
+     `m5e1-scout`），并发测试在同窗口建会话只会在其 `agent` 描述里多出追加行，既有断言全
+     为 `contains` 型，零冲突；`EnvGuard` drop 恢复原值。
+  3. 测试暴露并修正两处脚本坑（属测试自身修正，非生产行为变化）：scenario 1 的 gated
+     `read_file` 与 `registry()` 既有同名 stub 冲突改裸注册表；scenario 2 的
+     `agent_result` 断言取请求**最后一个** tool result（spawn 的立即返回也是
+     `status:"running"` 的 JSON，取首个会张冠李戴——M3-4 测试基建已有同结论）。
 
 **目标**：
 1. `docs/CLI.md`：§4.2 配置示例与结构图（:219-279）更新——`[agents.<name>]`/`[external_agents]`
