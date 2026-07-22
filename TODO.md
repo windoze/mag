@@ -1352,11 +1352,65 @@ child 面，防提权意图落空），已最小修复随本 review 提交；另
   --workspace` ✅（mag-config 1 个既有 rustdoc warning，同 M3-1..M3-6 记录）；新 4 测试
   复跑一遍仍全绿，测试后 `ps` 无 fake-acp 进程残留。
 
-### M4-R [TODO] M4 review：external 实例化
+### M4-R [DONE] M4 review：external 实例化
 
 **内容**：review M4 diff——进程生命周期（无泄漏：completed/failed/cancelled 三态后无子进程
 残留）；feature gate 边界；origin 归因；与设计 §6 逐条核对。
 **验证**：门禁序列全绿；问题修复并附完成记录。
+
+**完成记录**（2026-07-22，review 范围 `5a4fa80..1b26754`，未改代码——未发现需修复的问题）：
+
+1. **进程生命周期 ✅**：回收链路逐环核实——`drive_external` 在任一进程存在之前先返回的两条
+   早退路径（空 command、`ManagedExternalAgent::build` 失败）无泄漏窗口；进程只能由
+   `run_external_once` 内部拉起，agent-lib 侧三终态全覆盖（`delegate.rs:530` 未提交 outcome
+   →drive 自扫；`delegate.rs:665` completed→wrapper 补扫；spawn 后 handshake 失败 →
+   transport drop 时 `kill_on_drop` 兜底，`connection.rs:104-120`）；sweep 为 detached
+   `tokio::spawn`，mag registry 随驱动任务 drop 不影响其在飞 sweep。测试后 `pgrep fake-acp`
+   无残留。已知边界（agent-lib 既有、非 M4 回归）：驱动任务被整体 drop（会话 teardown）时只有
+   `kill_on_drop` 杀直接子进程，孙进程依赖正常 sweep 的进程组终止。
+2. **cancel 桥接 ✅**：`CancelHandle` 只在 registry `cancel`/`cancel_all` **赢得**首终态迁移后
+   才 fire（`instances.rs:258-265`），而驱动自身的 `complete` 只在 drive 返回后发生——故
+   select 在飞期间观察到终态必是 cancel 胜出，论证成立。`await_terminal` 为
+   check→enable→re-check→wait 无竞态范式，基于 `Notify`，无轮询、无泄漏 watcher；`biased`
+   让已就绪的 drive 优先，竞态残余由 registry 首终态胜出 + `drive_instance` 读回状态兜底。
+   fire token 后 `drive.await` 有界（agent-lib 读循环与 cancellation `select!`，hang 测试实证）。
+3. **feature gate ✅**：off 时 `cargo check -p mag-core --no-default-features`（含
+   `--all-targets`）干净；spawn 同步拒绝报文明确（指明 rebuild 启用 `external-acp`、默认
+   开启）；off 时 spawn 同步拒绝 ⇒ 无 external 实例可注册 ⇒ `drive_external` stub 运行期
+   不可达，论证成立。
+4. **origin 归因 ✅**：agent-lib 内层 `DelegationInteractionRouter`（delegate=定义名）标注后
+   经 mag `OriginRouter.fulfill` 的 `with_origin` **整体覆盖**（`interaction.rs:105` 替换语义），
+   最终 origin=(实例 id, 实例 depth)；测试实证 delegate="peer-1"、depth=1、kind=Permission、
+   应答回到对端（fake 收到 `"id":100`）。
+5. **偏差复核**：
+   - ① `BudgetLimits::unbounded()` **结论：v1 可接受，§7 未被实质违反**。BudgetLimits 的
+     step/token 维度对黑盒 external 不可观测，agent-lib 自有一次性调用同样传 unbounded；
+     §7"定义可声明 budget"在定义模型中本无 external 字段可映射。兜底实况：120s 是 ACP
+     transport 的**每读 idle 超时**（`AcpConfig::timeout` → `SpawnedAcpAgent.read_timeout`，
+     M4-1 记录"120s 请求超时"措辞在此更正）——静默对端每读最多挂 120s → SessionLost →
+     Failed + sweep；不需要的运行由协作式 cancel 终止。**残余缺口**：持续有输出但永不完成
+     的对端无 wall-clock 上限，留作 §11 已知限制（M5-2/F-R 收录）。
+   - ② 空 command Failed 映射保留，但偏差前提更正：TOML 投影**有**校验（`agent_def.rs:850`
+     空 command 跳过 + `io.rs:156` 加载期拒绝空 argv），md 解析亦强制非空——该 Failed 映射
+     经两条真实配置路径均不可达，属无害纵深防御，不动。
+   - ③ fake-acp argv 传参核实无误：adapter `next_request_id` 从 0 预增（`adapter.rs:287`），
+     initialize=1/session/new=2/session/prompt=3 与脚本硬编码一致；`"id":100` 为对端自发
+     请求的独立 id 空间。
+6. **设计 §6 逐条 ✅**：按实例拉起（每实例独立 registry+进程）✅；md 正文作 task 框架模板
+   拼在 task 前（`external_task`，测试实证 `Task frame template.\n\ninspect the vault`）✅；
+   多实例=多进程（per-instance 组装 + pid/counter 唯一 worktree root）✅；权限请求 origin
+   冒泡 root ✅（见 4）；分层 prompt 不适用（body 只进 task 文本）、报告=对端最终消息 ✅；
+   TOML `[external_agents]` 与 md `kind: acp` 同为注册表来源（M2-2 投影）✅。
+7. **测试质量 ✅**：4 测试断言到位——事件全字段等值断言、ACP 握手三帧、模板拼接、sweep 的
+   session/cancel 到达 fake（进程退出的实证：fake 收到 cancel 即写标记并 `exit 0`，crash 测试
+   以 drive 在 5s 内返回 Err 反证进程已退）；无 flaky 因子（全部 `await_until`/`wait_terminal`
+   5s 兜底、无裸 sleep；`cfg(all(unix, feature = "external-acp"))` 显式门控）；复跑 2 遍全绿
+   （0.95s/0.71s）。
+
+**门禁**：`cargo fmt --all -- --check` ✅；`cargo clippy --all-targets -- -D warnings` ✅
+（0 warning）；`cargo test --workspace` ✅（全套件 ok、0 failed）；`cargo doc --no-deps
+--workspace` ✅（mag-config 1 个既有 rustdoc warning，同 M3 起记录）；`cargo check -p
+mag-core --no-default-features`（含 `--all-targets`）✅；external 4 测试复跑 2 遍 ✅。
 
 ---
 
