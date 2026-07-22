@@ -1803,4 +1803,4 @@ acp 例）；TOML DTO→DO→`project()` 往返（tests/snapshot.rs
 `docs/CLI.md` §4.2 frontmatter 字段表同步；ts-rs 生成物 `AgentDto.ts` 重生成
 （`allow_subagents?: boolean`，diff 受控仅此一处）。
 
-**涉及 commit**：本条目随特性 commit 提交，hash 由后续 docs commit 回填。
+**涉及 commit**：`48aa558`
