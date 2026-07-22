@@ -1577,11 +1577,55 @@ fmt + workspace test）。
   2. §4.4 表格由 4 行扩为 5 行（subagent 定义独立一行），§6 测试策略相应由「四行」改为
      「每行」。
 
-### M5-R [TODO] M5 review：e2e 与文档
+### M5-R [DONE] M5 review：e2e 与文档
 
 **内容**：review M5 diff——测试覆盖与场景清单一一对应、无 flaky（连跑 3 遍）；文档与实现
 一致（抽查工具名、字段名、路径）。
 **验证**：门禁序列全绿；问题修复并附完成记录。
+
+**完成记录**（2026-07-22）：
+
+review 范围 `f725317..HEAD`（`45df2fd` + `9d1d200` + `2185d3c`）。逐项结论：
+
+1. **测试覆盖 ✅**：6 个 e2e 与 M5-1 场景清单一一对应（并发 → :5479、报告契约 → :5625、
+   审批冒泡 → :5718、cancel 级联 → :5858、local/external 混合 → :5953、定义加载 → :6104，
+   均 `crates/mag-core/src/engine.rs`）。断言深度抽查全部成立：并发实证是结构性的（两
+   child 各停在共享 gated `read_file` 且此刻零 Finished，开闸后乱序完成、报告逐一回到
+   对应 `agent_result`）；报告逐字（多行 ~280 字符，Finished 事件与 `agent_result` JSON
+   payload 双路等值断言，取请求最后一个 tool result 避开 spawn 的 running JSON）；origin
+   三项断言（delegate=general-purpose-1、depth=1、非 root）+ 批准后 shell 结果确入 child
+   后续请求；cancel 级联（supervisor 阻塞在 `agent_result` 内 stream 请求数 == 2 确证，
+   RunError(Cancelled) + 实例 Cancelled 双断言）；进程回收（ACP 握手三帧 + 任务文本到达
+   对端 + session/cancel 或 SESSION_CANCELLED 轮询断言）；定义优先级（description 枚举
+   四来源、TOML 版 model/body 生效、user/project 版 body 不可见）。
+2. **无 flaky ✅**：本 review 实跑 `cargo test -p mag-core --lib engine::instances` 连跑
+   3 遍，11 passed × 3（各约 2.02s）；时序同步全走 gate/`poll_until`（5s 兜底）/`collect_
+   events_until`，无裸 sleep 时序断言；跑后 `pgrep fake-acp` 无残留。
+3. **文档与实现一致 ✅**（M5-2 已抽查，本 review 复核关键点）：工具名
+   `agent`/`agent_result`/`agent_cancel`；frontmatter 字段表 8 字段与
+   `mag-config/src/agent_def.rs:24-33` KNOWN_FIELDS 逐一相符；四来源优先级
+   TOML>项目>用户>内置与 `DefinitionSource` 派生 `Ord`（agent_def.rs:37-52）一致；CLI
+   origin 前缀 `[from <id>@depth<n>]` 与 `mag-cli/src/lib.rs:1552-1557` `origin_prefix`
+   实际格式一致；§5A supersede 注记抽查 A2（facade reconfigure 仍有效）核实——
+   `driver.rs:751` 实调 `self.agent.reconfigure(request)`（apply_config turn 边界路径），
+   注记准确。
+4. **CLI e2e delegation 腿（M5-1 偏差 1）处置：不补，结论记录于此**。理由：
+   (a) 可断言面只有渲染——mag-cli 对 `AgentInstanceStarted/Finished` 走 `_ => {}`
+   （设计 §11 明确实例 UI 展示后补），一个 spawn turn 在 CLI 级只能断言
+   `[tool …] name=agent` 通用 trace 与 `[finished]`，而通用 tool trace 渲染已被既有
+   `ask_user` 腿覆盖；(b) 机制实质（spawn/drive/result/cancel/通知）已由 M5-1 的 6 个
+   engine 级 e2e + M3/M4 模块测试覆盖，CLI 路径无实例专属装配（`Engine::with_config_
+   service` 共享构造，实例上下文在 driver 内），M3-5 已断言三工具在 CLI 驱动面上架；
+   (c) 成本高——CLI 测试的 FakeLlmClient 是平铺 FIFO，supervisor stream 请求与 child
+   chat 请求交错下必须先移植 scripted_routes 内容路由（约 150-200 行另一 crate 测试
+   基建，且与 mag-core test_support 有漂移风险）。判断 smoke 价值不抵成本；待实例
+   UI 展示落地时（§11）随渲染面一并补 CLI e2e。
+5. **`9d1d200` 修复完整 ✅**：M5-2 标题已恢复为独立节（TODO.md:1509，M5-2 完成时标
+   [DONE]），其「目标/验证」正文与完成记录无残缺，M5-1 完成记录末尾无吞并痕迹。
+6. **门禁（全部实跑）**：`cargo fmt --all -- --check` ✅；`cargo clippy --all-targets
+   -- -D warnings` ✅；`cargo test --workspace` ✅（32 目标全 ok、0 failed、exit 0）；
+   `cargo doc --no-deps --workspace` ✅（mag-config 1 个既有 rustdoc warning，同 M3-1
+   起记录）。review 无代码改动。
 
 ---
 
