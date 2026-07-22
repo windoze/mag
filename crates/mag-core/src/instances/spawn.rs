@@ -1544,7 +1544,10 @@ mod tests {
             // drive task's losing `complete` added none.
             assert_eq!(
                 rig.registry.drain_notifications(),
-                ["agent instance general-purpose-1 cancelled".to_owned()]
+                [crate::instances::InstanceNotification {
+                    id: "general-purpose-1".to_owned(),
+                    text: "agent instance general-purpose-1 cancelled".to_owned(),
+                }]
             );
         });
     }

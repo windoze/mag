@@ -12,8 +12,9 @@
 //! local-instance drive task, and the origin interaction router live in the
 //! [`spawn`] submodule (M3-3); the session driver wires the trio into the
 //! supervisor's tool surface and cascades session/run cancellation into
-//! [`AgentInstanceRegistry::cancel_all`] (M3-5); the completion-notification
-//! drain is wired into the driver in M3-6.
+//! [`AgentInstanceRegistry::cancel_all`] (M3-5), and drains terminal
+//! notifications into the supervisor's pivot channel / next-turn input
+//! prefix (M3-6).
 
 pub(crate) mod spawn;
 
@@ -28,6 +29,21 @@ use tokio::sync::Notify;
 /// Report/error characters kept in a completion-notification preview
 /// (task spec: the first 200 characters).
 const NOTIFICATION_PREVIEW_CHARS: usize = 200;
+
+/// One terminal-state notification of an agent instance, queued for the
+/// supervisor's completion-notification drain (M3-6): while a run is in
+/// flight the driver injects it through the facade's pivot channel with a
+/// `PivotSource::Host { label: "agent:<id>" }` attribution; notifications
+/// left over when the run ends are prefixed onto the next turn's user input.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct InstanceNotification {
+    /// Id of the instance that reached a terminal state (the pivot-label
+    /// attribution, `agent:<id>`).
+    pub(crate) id: String,
+    /// Human-readable single-line notification text (report/error preview
+    /// included, built by [`AgentInstanceRegistry::push_notification`]).
+    pub(crate) text: String,
+}
 
 /// Lifecycle status of one agent instance (`docs/dyn-agents.md` §5.2:
 /// `running → completed / failed / cancelled`).
@@ -157,9 +173,9 @@ struct RegistryInner {
     counters: Mutex<BTreeMap<String, u64>>,
     /// All instances keyed by id (BTreeMap keeps `list()` deterministic).
     instances: Mutex<BTreeMap<String, Arc<Instance>>>,
-    /// Human-readable terminal notifications, drained by the driver into the
-    /// supervisor's pivot channel / next-turn input prefix (M3-6).
-    notifications: Mutex<VecDeque<String>>,
+    /// Terminal notifications, drained by the driver into the supervisor's
+    /// pivot channel / next-turn input prefix (M3-6).
+    notifications: Mutex<VecDeque<InstanceNotification>>,
 }
 
 impl AgentInstanceRegistry {
@@ -264,10 +280,9 @@ impl AgentInstanceRegistry {
         }
     }
 
-    /// Drains all pending completion notifications (M3-6 consumer).
-    // Consumed by the M3-6 notification drain; only tests call it until then.
-    #[allow(dead_code)]
-    pub(crate) fn drain_notifications(&self) -> Vec<String> {
+    /// Drains all pending completion notifications (oldest first), consumed
+    /// by the session driver's pivot drain / next-turn input prefix (M3-6).
+    pub(crate) fn drain_notifications(&self) -> Vec<InstanceNotification> {
         self.inner
             .notifications
             .lock()
@@ -276,7 +291,7 @@ impl AgentInstanceRegistry {
             .collect()
     }
 
-    /// Pushes the human-readable terminal notification for `instance`.
+    /// Pushes the terminal notification for `instance`.
     fn push_notification(&self, instance: &Instance, status: &InstanceStatus) {
         let text = match status {
             InstanceStatus::Completed { report } => {
@@ -296,7 +311,10 @@ impl AgentInstanceRegistry {
             .notifications
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push_back(text);
+            .push_back(InstanceNotification {
+                id: instance.id.clone(),
+                text,
+            });
     }
 }
 
@@ -321,6 +339,16 @@ mod tests {
     fn spawn_instance(registry: &AgentInstanceRegistry, agent_type: &str) -> Arc<Instance> {
         let id = registry.next_id(agent_type);
         registry.register(Instance::new(id, agent_type.to_owned(), 1))
+    }
+
+    /// Drains notifications and keeps only their texts (most assertions only
+    /// care about the rendered line).
+    fn drained_texts(registry: &AgentInstanceRegistry) -> Vec<String> {
+        registry
+            .drain_notifications()
+            .into_iter()
+            .map(|notification| notification.text)
+            .collect()
     }
 
     #[test]
@@ -379,7 +407,7 @@ mod tests {
             }
         );
         assert_eq!(
-            registry.drain_notifications(),
+            drained_texts(&registry),
             ["agent instance explorer-1 completed: all done".to_owned()]
         );
 
@@ -409,12 +437,16 @@ mod tests {
         ));
 
         let [notification] = registry.drain_notifications().try_into().unwrap();
+        assert_eq!(notification.id, "explorer-1");
         let expected_preview = format!("line one {}", "x".repeat(200 - "line one ".len()));
         assert_eq!(
-            notification,
+            notification.text,
             format!("agent instance explorer-1 completed: {expected_preview}...")
         );
-        assert!(!notification.contains('\n'), "single-line notification");
+        assert!(
+            !notification.text.contains('\n'),
+            "single-line notification"
+        );
     }
 
     #[tokio::test]
@@ -435,7 +467,7 @@ mod tests {
             .await
             .expect("done waiter is woken");
         assert_eq!(
-            registry.drain_notifications(),
+            drained_texts(&registry),
             ["agent instance explorer-1 cancelled".to_owned()]
         );
     }
@@ -462,7 +494,7 @@ mod tests {
             "losing cancel does not fire the handle"
         );
         assert_eq!(
-            registry.drain_notifications(),
+            drained_texts(&registry),
             ["agent instance explorer-1 completed: findings".to_owned()]
         );
     }
@@ -509,7 +541,7 @@ mod tests {
                 .expect("done waiter is woken");
         }
         assert_eq!(
-            registry.drain_notifications(),
+            drained_texts(&registry),
             [
                 "agent instance explorer-1 failed: boom".to_owned(),
                 "agent instance explorer-2 cancelled".to_owned(),

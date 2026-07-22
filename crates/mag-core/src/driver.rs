@@ -25,23 +25,28 @@ use std::convert::Infallible;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex, PoisonError,
+    Arc, Mutex, OnceLock, PoisonError,
     atomic::{AtomicU64, Ordering},
 };
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_lib::{
     agent::{
         ApprovalDecision, BudgetLimits, Interaction, InteractionHandler, InteractionResponse,
-        RequirementResult, RunContext, StepId, TraceNodeId, WorktreeRef,
+        PivotMessage, PivotSource, RequirementResult, RunContext, StepId, TraceNodeId, WorktreeRef,
     },
     client::LlmClient,
+    conversation::MessageId,
     facade::{
         Agent, AgentRunStream, AgentSnapshot, Approval, ApprovalPolicy, CancelHandle,
         DelegationMessage as FacadeDelegationMessage, DelegationTrace as FacadeDelegationTrace,
         FacadeError, ModelRef, ReconfigRequest, Tool, ToolContext, ToolResult, ToolSetId,
         ToolSetRef, ToolTrace as FacadeToolTrace, UsageSummary, WireRunEvent, WireRunOutput,
+    },
+    model::{
+        content::ContentBlock,
+        message::{Message, Role},
     },
 };
 use mag_config::{
@@ -65,7 +70,7 @@ use crate::{
     assembly::{ApprovalOverrides, SessionBinding},
     engine::approval::IpcApproval,
     instances::{
-        AgentInstanceRegistry,
+        AgentInstanceRegistry, InstanceNotification,
         spawn::{InstanceSpawnContext, SharedSpawnState, agent_tools},
     },
     persistence::Persistence,
@@ -151,6 +156,11 @@ pub(crate) struct SessionDriver {
     /// The session's configured working directory, retained so `apply_config`
     /// can re-load the project-level definition directory (M3-5).
     cwd: Option<PathBuf>,
+    /// Instance notifications drained from the registry but not yet landed on
+    /// a pivot window (M3-6): retried at every stream poll while the run is in
+    /// flight, and — unlike user pivots — never dropped at the run's end; the
+    /// leftovers are prefixed onto the next turn's user input.
+    pending_notifications: VecDeque<InstanceNotification>,
     run_counter: AtomicU64,
     /// Mints fresh tool-set identities for `apply_config` reconfigurations.
     tool_set_counter: AtomicU64,
@@ -258,6 +268,7 @@ impl SessionDriver {
             system_prompt: binding.system_prompt().map(str::to_owned),
             spawn_ctx,
             cwd: config.cwd.clone(),
+            pending_notifications: VecDeque::new(),
             run_counter: AtomicU64::new(1),
             tool_set_counter: AtomicU64::new(1),
         })
@@ -371,6 +382,7 @@ impl SessionDriver {
             system_prompt: binding.system_prompt().map(str::to_owned),
             spawn_ctx,
             cwd: config.cwd.clone(),
+            pending_notifications: VecDeque::new(),
             run_counter: AtomicU64::new(1),
             tool_set_counter: AtomicU64::new(1),
         })
@@ -422,6 +434,17 @@ impl SessionDriver {
     /// terminal event is emitted, and the outcome is returned so the session
     /// actor can drop any pivot that raced the run's end with the same reason.
     ///
+    /// Agent-instance completion notifications share the drain but not the
+    /// drop (M3-6, `docs/dyn-agents.md` §5.2): after every poll the driver
+    /// also pulls the session registry's terminal notifications and injects
+    /// each through [`AgentRunStream::interject_pivot`] as a host-sourced
+    /// pivot (`PivotSource::Host { label: "agent:<id>" }`). A notification
+    /// that never reaches an open pivot window before the run ends is *not*
+    /// dropped — it stays buffered in the driver and is folded into the next
+    /// turn's user input as a `[agent 实例通知]` prefix block, so a terminal
+    /// instance is announced even when the run offered no window (a
+    /// pure-text turn has none) or no run was in flight at all.
+    ///
     /// Right after the terminal event is emitted — with the run's mutable
     /// stream borrow released and the facade agent at rest — the turn-complete
     /// hook fires exactly once (`docs/CLI.md` §4.5): every registered
@@ -441,9 +464,16 @@ impl SessionDriver {
         // turn-complete hook without touching the mutably borrowed agent.
         let turn_complete = self.turn_complete.clone();
         self.queue_system_prompt_overlay(session_id);
+        // Instance notifications left over from an idle gap (or unlanded
+        // from the previous run) ride into the conversation as a prefix
+        // block on this turn's user input (M3-6).
+        let (text, drained_notifications) = self.take_pending_notifications(text);
         let mut stream = match self.agent.stream_with_cancel(text, cancel.clone()).await {
             Ok(stream) => stream,
             Err(error) => {
+                // The turn never started, so the prefixed notifications were
+                // not committed either: keep them for the next turn.
+                self.pending_notifications.extend(drained_notifications);
                 let outcome = if cancel.is_cancelled() {
                     TurnOutcome::Cancelled
                 } else {
@@ -490,8 +520,16 @@ impl SessionDriver {
                     }
                     // After every poll the run may be parked on a step boundary
                     // with the facade's pivot window open: try landing the
-                    // queued pivots before the next poll drives past it.
-                    drain_pivots(session_id, &mut stream, pivots, events);
+                    // queued pivots and instance notifications before the next
+                    // poll drives past it.
+                    drain_pivots(
+                        session_id,
+                        &mut stream,
+                        pivots,
+                        &self.spawn_ctx.registry,
+                        &mut self.pending_notifications,
+                        events,
+                    );
                 }
                 // A cancelled run surfaces from the facade as a stream error;
                 // report it through the dedicated cancellation outcome rather
@@ -531,6 +569,9 @@ impl SessionDriver {
 
         // Any pivot still queued at the end of the run never reached a step
         // boundary: report it dropped with the run's terminal reason.
+        // Buffered instance notifications are deliberately *not* dropped —
+        // they outlive the run in `pending_notifications` and are prefixed
+        // onto the next turn's user input (M3-6).
         drop_pivots(session_id, pivots, events, outcome.pivot_drop_reason());
 
         let terminal = match &outcome {
@@ -568,6 +609,30 @@ impl SessionDriver {
     fn notify_turn_complete(&self, session_id: SessionId, completion: TurnCompletion) {
         self.turn_complete
             .notify(&TurnSummary::new(session_id, completion));
+    }
+
+    /// Drains the instance notifications no pivot channel could carry (M3-6)
+    /// and folds them into `text` as a `[agent 实例通知]` prefix block.
+    ///
+    /// Returns the folded input together with the drained notifications so
+    /// the early-error path of [`run_turn`](Self::run_turn) can restore them
+    /// when the turn never started (an unstarted turn commits nothing, so an
+    /// already-drained notification must not be lost with the folded text).
+    fn take_pending_notifications(&mut self, text: String) -> (String, Vec<InstanceNotification>) {
+        let mut drained: Vec<InstanceNotification> = self.pending_notifications.drain(..).collect();
+        drained.extend(self.spawn_ctx.registry.drain_notifications());
+        if drained.is_empty() {
+            return (text, drained);
+        }
+        let mut prefixed = String::from(INSTANCE_NOTIFICATION_PREFIX_HEADER);
+        for notification in &drained {
+            prefixed.push_str("- ");
+            prefixed.push_str(&notification.text);
+            prefixed.push('\n');
+        }
+        prefixed.push('\n');
+        prefixed.push_str(&text);
+        (prefixed, drained)
     }
 
     /// Applies the runtime configuration snapshot to this session's agent at a
@@ -874,22 +939,39 @@ const PIVOT_DROP_RUN_FAILED: &str = "run failed before the pivot could be applie
 /// [`Event::PivotDropped`] reason for a run that was cancelled.
 const PIVOT_DROP_RUN_CANCELLED: &str = "run cancelled before the pivot could be applied";
 
-/// Drains the run's pivot queue, attempting [`AgentRunStream::interject`] on
-/// each queued pivot (`docs/CLI.md` §3.2).
+/// Header of the block [`SessionDriver::take_pending_notifications`] prefixes
+/// onto the next turn's user input, carrying the instance notifications no
+/// pivot channel could deliver (M3-6).
+const INSTANCE_NOTIFICATION_PREFIX_HEADER: &str = "[agent 实例通知]\n";
+
+/// Drains the run's pivot queue and the session's instance-notification
+/// queue, attempting [`AgentRunStream::interject`] on each queued user pivot
+/// and [`AgentRunStream::interject_pivot`] on each instance notification
+/// (`docs/CLI.md` §3.2, `docs/dyn-agents.md` §5.2).
 ///
 /// Called after every stream poll, which is exactly when the run may be
 /// parked on a step boundary with the facade's pivot window open. A pivot
 /// accepted by the facade is announced as [`Event::PivotApplied`].
 /// [`FacadeError::InvalidState`] means the window is not (or no longer) open —
-/// a side-effect-free, retry-safe rejection — so the pivot returns to the
-/// front of the queue and is retried after the next poll. Any other error is
-/// permanent: the pivot leaves the queue as [`Event::PivotDropped`].
+/// a side-effect-free, retry-safe rejection — so the item returns to the
+/// front of its queue and is retried after the next poll. Any other error is
+/// permanent: the item leaves the queue as [`Event::PivotDropped`].
+///
+/// Instance notifications still buffered when the run ends are *not*
+/// dropped, unlike user pivots: they stay in `pending_notifications` and are
+/// prefixed onto the next turn's user input (M3-6).
 fn drain_pivots(
     session_id: SessionId,
     stream: &mut AgentRunStream<'_>,
     pivots: &PivotQueue,
+    registry: &AgentInstanceRegistry,
+    pending_notifications: &mut VecDeque<InstanceNotification>,
     events: &EventBus,
 ) {
+    // Pull freshly terminal instances into the retry buffer first; the
+    // registry queue is the only producer, and the buffer keeps FIFO order
+    // across polls.
+    pending_notifications.extend(registry.drain_notifications());
     while let Some(text) = pivots.pop_front() {
         match stream.interject(text.as_str()) {
             Ok(()) => {
@@ -907,6 +989,70 @@ fn drain_pivots(
             }
         }
     }
+    while let Some(notification) = pending_notifications.pop_front() {
+        match stream.interject_pivot(instance_notification_pivot(&notification)) {
+            Ok(()) => {
+                let _ = events.emit(Event::PivotApplied { id: session_id });
+            }
+            Err(FacadeError::InvalidState(_)) => {
+                pending_notifications.push_front(notification);
+                break;
+            }
+            Err(error) => {
+                let _ = events.emit(Event::PivotDropped {
+                    id: session_id,
+                    reason: format!("instance notification pivot rejected: {error}"),
+                });
+            }
+        }
+    }
+}
+
+/// Builds the host-sourced pivot message carrying one instance completion
+/// notification into the supervisor's conversation (M3-6): the notification
+/// enters history as a user message attributed to
+/// `PivotSource::Host { label: "agent:<id>" }`.
+fn instance_notification_pivot(notification: &InstanceNotification) -> PivotMessage {
+    PivotMessage::new(
+        host_pivot_message_id(),
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: notification.text.clone(),
+                extra: Default::default(),
+            }],
+        },
+        PivotSource::Host {
+            label: format!("agent:{}", notification.id),
+        },
+    )
+    .expect("a notification pivot is a user-role message")
+}
+
+/// Mints the conversation message id for a host-sourced notification pivot.
+///
+/// The facade's own id source is internal and unreachable from mag, so the
+/// id is externally allocated — exactly the use case [`PivotMessage`] exposes
+/// for host pivots. The high half carries a process-unique tag (nanoseconds
+/// since the epoch), placing the id outside the facade's small-counter space
+/// exactly like a UUIDv7: it can never collide with a facade-minted id, and a
+/// restored agent's `continuing_after` re-seed scan ignores it (agent-lib
+/// `facade/ids.rs`). The low half is a process-wide counter for uniqueness
+/// within the process.
+fn host_pivot_message_id() -> MessageId {
+    /// Nanoseconds-since-epoch tag keeping ids unique across process runs.
+    static PROCESS_TAG: OnceLock<u64> = OnceLock::new();
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let tag = PROCESS_TAG.get_or_init(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos() as u64)
+            .unwrap_or(1)
+    });
+    let ordinal = COUNTER.fetch_add(1, Ordering::Relaxed);
+    MessageId::new(Uuid::from_u128(
+        (u128::from(*tag) << 64) | u128::from(ordinal),
+    ))
 }
 
 /// Reports every pivot still queued for a finished run as

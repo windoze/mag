@@ -4558,7 +4558,9 @@ mod instances {
     //! M3-5 integration tests: the `agent` / `agent_result` / `agent_cancel`
     //! instance tools wired into the supervisor tool surface
     //! (`docs/dyn-agents.md` §5.1), their per-tool approval tiers, and the
-    //! supervisor-run cancel cascade into the session's instance registry.
+    //! supervisor-run cancel cascade into the session's instance registry —
+    //! plus the M3-6 completion-notification delivery (in-run pivot channel
+    //! and idle next-turn input prefix, §5.2).
 
     use std::{
         fs,
@@ -4574,6 +4576,7 @@ mod instances {
         facade::{ToolContext, ToolResult},
         model::{
             content::ContentBlock,
+            message::{Message, Role},
             tool::{Tool, ToolStatus},
             usage::Usage,
         },
@@ -4650,21 +4653,24 @@ mod instances {
 
     /// A stub tool parked on a [`StreamGate`] until the test opens it: holds a
     /// spawned child instance mid-run so a supervisor cancel lands while the
-    /// instance is provably still running (M3-5 cancel cascade).
+    /// instance is provably still running (M3-5 cancel cascade), or parks
+    /// either side of the supervisor/child pair to sequence the M3-6
+    /// completion-notification timing deterministically.
     #[derive(Debug)]
     struct ParkTool {
+        name: &'static str,
         gate: Arc<StreamGate>,
     }
 
     #[async_trait]
     impl ToolPlugin for ParkTool {
         fn name(&self) -> &str {
-            "park"
+            self.name
         }
 
         fn declaration(&self) -> Tool {
             Tool {
-                name: "park".to_owned(),
+                name: self.name.to_owned(),
                 description: "park until released".to_owned(),
                 input_schema: json!({ "type": "object", "properties": {} }),
             }
@@ -4759,6 +4765,19 @@ mod instances {
             .tools
             .iter()
             .map(|tool| tool.name.as_str())
+            .collect()
+    }
+
+    /// Concatenates the text blocks of one message (for notification
+    /// assertions against the recorded LLM requests).
+    fn message_text(message: &Message) -> String {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
             .collect()
     }
 
@@ -4918,6 +4937,7 @@ approval = "deny"
     async fn supervisor_run_cancel_cascades_to_running_instances() {
         let park_gate = StreamGate::new();
         let tools = registry().register(Arc::new(ParkTool {
+            name: "park",
             gate: park_gate.clone(),
         }));
         let fake = FakeLlmClient::scripted_routes(vec![
@@ -5012,5 +5032,251 @@ model = "model-d"
                 other => panic!("unexpected event after cancel: {other:?}"),
             }
         }
+    }
+
+    /// M3-6 pivot channel: an instance that completes while the supervisor's
+    /// run is in flight is announced through the pivot channel — the
+    /// notification is injected as a host-sourced pivot and reaches the
+    /// supervisor's follow-up LLM request as a user message.
+    #[tokio::test]
+    async fn instance_completion_pivots_into_the_running_supervisor() {
+        let supervisor_gate = StreamGate::new();
+        let child_gate = StreamGate::new();
+        let tools = registry()
+            .register(Arc::new(ParkTool {
+                name: "park_supervisor",
+                gate: supervisor_gate.clone(),
+            }))
+            .register(Arc::new(ParkTool {
+                name: "park_child",
+                gate: child_gate.clone(),
+            }));
+        let fake = FakeLlmClient::scripted_routes(vec![
+            // The child's requests carry the subagent skeleton system prompt;
+            // it parks inside its own gated tool until the test releases it,
+            // so its completion provably lands mid-run of the supervisor.
+            RequestRoute::system_contains(
+                "subagent",
+                vec![
+                    StreamScript::Complete(tool_use_stream("park_child", "child-1", json!({}))),
+                    StreamScript::Complete(text_stream_with_usage(&["child findings"], usage())),
+                ],
+            ),
+            RequestRoute::any(vec![
+                StreamScript::Complete(tool_use_stream(
+                    "agent",
+                    "call-1",
+                    json!({ "task": "scout the repo" }),
+                )),
+                // Park the supervisor inside its own gated tool; the step
+                // boundary after that tool phase closes is the pivot window.
+                StreamScript::Complete(tool_use_stream("park_supervisor", "call-2", json!({}))),
+                StreamScript::Complete(text_stream_with_usage(&["wrapped up"], usage())),
+            ]),
+        ]);
+        let (_dir, engine) = engine_with_client(
+            r#"
+[agents.default]
+model = "model-d"
+"#,
+            tools,
+            fake.clone(),
+        );
+        let session = engine
+            .create_session(session_config("default", "fake-chat"))
+            .await
+            .expect("create session");
+        let mut events = engine.subscribe(Some(session));
+        engine
+            .send_message(session, UserInput::text("delegate and keep working"))
+            .await
+            .expect("send message");
+
+        // Wait until the supervisor is parked inside its gated tool.
+        loop {
+            match next_event(&mut events).await {
+                ServiceEvent::ToolStarted { trace, .. } if trace.name == "park_supervisor" => {
+                    break;
+                }
+                ServiceEvent::RunStarted { .. }
+                | ServiceEvent::AgentInstanceStarted { .. }
+                | ServiceEvent::ToolStarted { .. }
+                | ServiceEvent::ToolFinished { .. }
+                | ServiceEvent::TextDelta { .. } => {}
+                other => panic!("unexpected event before the supervisor parks: {other:?}"),
+            }
+        }
+
+        // Release the child and wait until it is provably terminal: the
+        // registry pushes the completion notification before
+        // `AgentInstanceFinished` is emitted, so the notification is queued
+        // by the time we see it.
+        child_gate.open();
+        loop {
+            match next_event(&mut events).await {
+                ServiceEvent::AgentInstanceFinished {
+                    instance_id,
+                    status,
+                    ..
+                } => {
+                    assert_eq!(instance_id, "general-purpose-1");
+                    assert_eq!(status, AgentInstanceStatusWire::Completed);
+                    break;
+                }
+                ServiceEvent::ToolStarted { .. } | ServiceEvent::ToolFinished { .. } => {}
+                other => panic!("unexpected event before the instance finish: {other:?}"),
+            }
+        }
+
+        // Releasing the parked tool lets the run reach its step boundary,
+        // where the post-poll drain lands the notification through
+        // `interject_pivot` (the same mechanics as the user-pivot tests).
+        supervisor_gate.open();
+        let rest = collect_until_terminal(&mut events).await;
+        assert!(
+            rest.iter()
+                .any(|event| matches!(event, ServiceEvent::PivotApplied { .. })),
+            "the completion notification is applied as a pivot: {rest:?}"
+        );
+        assert!(
+            matches!(rest.last(), Some(ServiceEvent::RunFinished { .. })),
+            "the supervisor run finishes: {rest:?}"
+        );
+
+        // The accepted pivot enters the conversation as a user message, so
+        // the follow-up supervisor request carries the notification text
+        // (child requests go to the non-streaming endpoint, so every
+        // streaming request here is the supervisor's).
+        let requests = fake.stream_requests();
+        assert_eq!(requests.len(), 3, "spawn + park + pivoted final step");
+        let last = requests.last().expect("the pivoted request");
+        assert!(
+            last.messages.iter().any(|message| {
+                message.role == Role::User
+                    && message_text(message)
+                        .contains("agent instance general-purpose-1 completed: child findings")
+            }),
+            "the completion notification enters the supervisor's LLM context: {:?}",
+            last.messages
+        );
+    }
+
+    /// M3-6 idle buffer: an instance that completes *after* the supervisor's
+    /// run ended is announced on the next turn — the leftover notification is
+    /// prefixed onto the user input as a `[agent 实例通知]` block instead of
+    /// being dropped like a user pivot would be.
+    #[tokio::test]
+    async fn instance_completion_after_the_run_prefixes_the_next_turn_input() {
+        let park_gate = StreamGate::new();
+        let tools = registry().register(Arc::new(ParkTool {
+            name: "park",
+            gate: park_gate.clone(),
+        }));
+        let fake = FakeLlmClient::scripted_routes(vec![
+            // The child parks inside the gated `park` tool until the test
+            // releases it — after the supervisor's first run has ended.
+            RequestRoute::system_contains(
+                "subagent",
+                vec![
+                    StreamScript::Complete(tool_use_stream("park", "child-1", json!({}))),
+                    StreamScript::Complete(text_stream_with_usage(&["late findings"], usage())),
+                ],
+            ),
+            RequestRoute::any(vec![
+                StreamScript::Complete(tool_use_stream(
+                    "agent",
+                    "call-1",
+                    json!({ "task": "slow scout" }),
+                )),
+                StreamScript::Complete(text_stream_with_usage(&["supervisor done"], usage())),
+                StreamScript::Complete(text_stream_with_usage(&["ack"], usage())),
+            ]),
+        ]);
+        let (_dir, engine) = engine_with_client(
+            r#"
+[agents.default]
+model = "model-d"
+"#,
+            tools,
+            fake.clone(),
+        );
+        let session = engine
+            .create_session(session_config("default", "fake-chat"))
+            .await
+            .expect("create session");
+        let mut events = engine.subscribe(Some(session));
+        engine
+            .send_message(session, UserInput::text("delegate"))
+            .await
+            .expect("send message");
+
+        // The supervisor's first run ends while the child is still parked;
+        // the completed run leaves its instances alone (no cancel cascade).
+        let first = collect_until_terminal(&mut events).await;
+        assert!(
+            matches!(first.last(), Some(ServiceEvent::RunFinished { .. })),
+            "the first run finishes with the instance still running: {first:?}"
+        );
+        assert!(
+            !first
+                .iter()
+                .any(|event| matches!(event, ServiceEvent::PivotApplied { .. })),
+            "nothing was there to pivot during the first run: {first:?}"
+        );
+
+        // The instance now completes while no run is in flight; the registry
+        // queues the notification before announcing the finish.
+        park_gate.open();
+        loop {
+            match next_event(&mut events).await {
+                ServiceEvent::AgentInstanceFinished {
+                    instance_id,
+                    status,
+                    ..
+                } => {
+                    assert_eq!(instance_id, "general-purpose-1");
+                    assert_eq!(status, AgentInstanceStatusWire::Completed);
+                    break;
+                }
+                ServiceEvent::ToolStarted { .. } | ServiceEvent::ToolFinished { .. } => {}
+                other => panic!("unexpected event while idle: {other:?}"),
+            }
+        }
+
+        // The next turn carries the leftover notification as a prefix block
+        // on the user input.
+        engine
+            .send_message(session, UserInput::text("next question"))
+            .await
+            .expect("send follow-up");
+        let second = collect_until_terminal(&mut events).await;
+        assert!(
+            matches!(second.last(), Some(ServiceEvent::RunFinished { .. })),
+            "the follow-up run finishes: {second:?}"
+        );
+
+        let requests = fake.stream_requests();
+        assert_eq!(requests.len(), 3, "turn 1 (spawn + text) + turn 2 (text)");
+        let follow_up = requests.last().expect("the follow-up request");
+        let user_text = message_text(
+            follow_up
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == Role::User)
+                .expect("the follow-up carries a user message"),
+        );
+        assert!(
+            user_text.starts_with("[agent 实例通知]\n"),
+            "the notification block prefixes the user input: {user_text:?}"
+        );
+        assert!(
+            user_text.contains("- agent instance general-purpose-1 completed: late findings\n"),
+            "the prefix carries the notification line: {user_text:?}"
+        );
+        assert!(
+            user_text.ends_with("next question"),
+            "the original user input follows the prefix block: {user_text:?}"
+        );
     }
 }

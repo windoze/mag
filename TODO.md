@@ -1050,7 +1050,7 @@ register（`tokio::test` 多 task）。门禁全绿。
   6. 附带修复：driver 测试 helper 的 `EventBus` 现与 `IpcApproval` 共享同一实例（原各自
      新建）——root ctx 与审批事件同源。
 
-### M3-6 [TODO] mag-core：完成通知推送（pivot 通道 + 空闲缓冲）
+### M3-6 [DONE] mag-core：完成通知推送（pivot 通道 + 空闲缓冲）
 
 **目标**：实例完成时 supervisor 不干等也能感知。
 
@@ -1075,6 +1075,70 @@ register（`tokio::test` 多 task）。门禁全绿。
 **验证**：测试——① run 中 spawn 实例 + child 完成，断言通知经 pivot 进入 supervisor 后续
 LLM 请求的消息流（FakeLlmClient 记录请求内容可断）；② run 结束后完成的实例，通知在下一次
 `send_message` 的 LLM 请求前缀出现；③ 无通知时行为零变化。门禁全绿。
+
+**完成记录**（2026-07-22）：
+
+- 改动（`crates/mag-core/src/`，无新依赖、未动 agent-lib）：
+  - `instances.rs`：通知项结构化为 `InstanceNotification { id, text }`（`id` 是
+    `PivotSource::Host { label: "agent:<id>" }` 归因所需——纯文本队列无法给出结构化 id，
+    见偏差 1）；`drain_notifications() -> Vec<InstanceNotification>` 的
+    `#[allow(dead_code)]` 移除（本任务消费）；`push_notification` 文本格式不变；模块文档
+    同步（M3-6 由"待接线"改为现状）。
+  - `driver.rs`：
+    - `SessionDriver` 新字段 `pending_notifications: VecDeque<InstanceNotification>`
+      （new/restore 均初始化为空）——从 registry drain 出但尚未落到 pivot 窗口的通知的
+      重试缓冲；run 终态**不 drop**（与 user pivot 的 drop 语义明确区分），随 driver 跨
+      turn 存活。
+    - `drain_pivots` 扩展（新增 `registry` + `pending_notifications` 两参数，保持自由
+      函数——`stream` 持有 `&mut self.agent`，方法化会撞借用）：每次 poll 后先把
+      `registry.drain_notifications()` 并入缓冲（FIFO），再依次尝试 user pivot
+      （`interject`）与实例通知（`interject_pivot` + `PivotSource::Host { label:
+      format!("agent:{id}") }`）；`InvalidState`（窗口未开/本窗口已有一条）推回队首
+      下次 poll 重试，其余错误按永久拒绝发 `PivotDropped`（通知的理由串带
+      "instance notification" 前缀以区分）。
+    - `instance_notification_pivot`：`PivotMessage::new(MessageId, user Message,
+      PivotSource::Host)`——`PivotMessage`/`PivotSource` 经 `agent_lib::agent::` 路径
+      引入（facade 未 re-export，未改 agent-lib）。message id 由
+      `host_pivot_message_id()` 外部分配：高 64 位 = 进程唯一 tag（epoch 纳秒，
+      OnceLock），低 64 位 = 进程级计数器——高位落在 facade 小计数器空间之外（同
+      UUIDv7 待遇），既不与 facade 自配 id 冲突，restore 时 `continuing_after` 重播种
+      扫描也会忽略（agent-lib `facade/ids.rs` 明文支持）；会话历史里重复 id 会被
+      Conversation 软拒绝，此方案使其不可能发生。
+    - `take_pending_notifications`：`run_turn` 开头把缓冲 + registry 的残余通知折成
+      `[agent 实例通知]\n- <text>\n\n<用户输入>` 前缀块；stream 建立失败的早退路径把已
+      drain 的通知放回缓冲（turn 未开始即未提交，通知不随折叠文本丢失）。
+    - `run_turn` rustdoc 增补通知双通道语义段；run 终态注释明确"user pivot drop、
+      通知保留"的分野。
+  - `instances/spawn.rs`：一处测试断言同步为结构化通知（cancel 竞态测试）。
+- 测试（全离线，engine.rs `mod instances` 新增 2 项）：
+  - ① `instance_completion_pivots_into_the_running_supervisor`：双 gate 时序——
+    supervisor 停在 gated `park_supervisor` 工具内、child 停在 gated `park_child`
+    工具内（`ParkTool` 泛化出 `name` 字段，M3-5 cancel 测试构造点同步）；先放
+    child 完成（`AgentInstanceFinished` 发出即通知已入队），再放 supervisor 到
+    step 边界；断言 `PivotApplied`、run 正常收尾、第 3 个 streaming 请求的消息流含
+    user 消息 `agent instance general-purpose-1 completed: child findings`（child 走
+    非流式端点，streaming 请求全属 supervisor）。
+  - ② `instance_completion_after_the_run_prefixes_the_next_turn_input`：child 停在
+    gated 工具内，supervisor turn 1 正常收尾（无级联、无 PivotApplied）；run 空闲后
+    放 child 完成；下一次 `send_message("next question")` 的第 3 个 streaming 请求
+    的最后一条 user 消息以 `[agent 实例通知]\n` 开头、含
+    `- agent instance general-purpose-1 completed: late findings\n`、以原输入结尾。
+  - ③ 零变化：无通知路径只多出两次空 drain；既有 pivot 6 项、driver 20 项、
+    instances::spawn 16 项、registry 9 项全绿即证。
+- 门禁结果：`cargo fmt --all -- --check` ✅；聚焦测试（engine::instances 5、
+  instances 30、driver 20、pivot 6）✅；`cargo clippy --all-targets -- -D warnings`
+  ✅（0 warning）；`cargo test --workspace` ✅（32 套件 377 passed 0 failed）；
+  `cargo doc --no-deps --workspace` ✅（mag-config 1 个既有 rustdoc warning，同
+  M3-1..M3-5 记录，与本任务无关）。
+- 偏差：
+  1. `drain_notifications()` 返回类型由 `Vec<String>` 改为
+      `Vec<InstanceNotification>`（任务单只锚定 API 名，未锚定签名）：pivot 归因
+      `PivotSource::Host { label: format!("agent:{id}") }` 需要结构化 id，从渲染文本
+      回解析会把 driver 耦合到通知文案格式；M3-2 的字符串断言已同步为结构化断言
+      （`complete_notification_previews_and_flattens_long_reports` 现同时钉住 id）。
+  2. 窗口限制的接受范围与任务单一致：仅 streaming 路径、step 边界、每窗口一条、
+     纯文本 turn 无窗口——未落地窗口的通知不丢，转入下一次 turn 的前缀块（测试②
+     覆盖的正是该路径）。
 
 ### M3-R [TODO] M3 review：local 实例运行时
 
