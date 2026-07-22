@@ -8,7 +8,7 @@
 use std::{
     collections::VecDeque,
     fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -110,14 +110,6 @@ impl FakeLlmClient {
             chat_requests: Mutex::new(Vec::new()),
             stream_requests: Mutex::new(Vec::new()),
         })
-    }
-
-    /// Returns the requests made through the non-streaming child-agent endpoint.
-    fn chat_requests(&self) -> Vec<ChatRequest> {
-        self.chat_requests
-            .lock()
-            .expect("chat requests lock")
-            .clone()
     }
 
     /// Returns the requests made through the streaming supervisor endpoint.
@@ -444,30 +436,19 @@ async fn finish_cli(
         .expect("CLI run succeeded");
 }
 
-/// Baseline config with one local `researcher` delegate and ask_user available.
+/// Baseline config with the bound default entry and ask_user available.
 const LOCAL_CONFIG: &str = r#"
 [agents.default]
 model = "model-main"
-
-[agents.researcher]
-model = "model-researcher"
-role = "Researches topics."
-tools = []
-
-[tools.ask_researcher]
-approval = "allow"
 "#;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn engine_cli_runs_dialog_ask_user_local_delegate_and_config_reload() {
+async fn engine_cli_runs_dialog_ask_user_and_config_reload() {
     let dir = TempDir::new("dialog");
     let fake = FakeLlmClient::scripted(vec![
         text_stream(&["hello from engine"]),
         tool_use_stream("ask_user", "ask-1", json!({ "question": "Name?" })),
         text_stream(&["user said Ada"]),
-        tool_use_stream("ask_researcher", "del-1", json!({ "task": "research" })),
-        text_stream(&["research summary"]),
-        text_stream(&["local final"]),
         text_stream(&["reloaded final"]),
     ]);
     let engine = engine_with_config(
@@ -489,13 +470,6 @@ async fn engine_cli_runs_dialog_ask_user_local_delegate_and_config_reload() {
     stdin.write_all(b"Ada\n").await.expect("answer ask_user");
     read_until(&mut stdout, &mut output, "user said Ada").await;
     read_until_count(&mut stdout, &mut output, "[finished", 2).await;
-
-    stdin
-        .write_all(b"delegate local\n")
-        .await
-        .expect("send local delegation");
-    read_until(&mut stdout, &mut output, "local final").await;
-    read_until_count(&mut stdout, &mut output, "[finished", 3).await;
 
     fs::write(
         dir.config_path(),
@@ -519,11 +493,10 @@ async fn engine_cli_runs_dialog_ask_user_local_delegate_and_config_reload() {
         .await
         .expect("send after apply");
     read_until(&mut stdout, &mut output, "reloaded final").await;
-    read_until_count(&mut stdout, &mut output, "[finished", 4).await;
+    read_until_count(&mut stdout, &mut output, "[finished", 3).await;
 
     finish_cli(stdin, run).await;
 
-    assert_eq!(fake.chat_requests().len(), 1, "local delegate ran once");
     let stream_requests = fake.stream_requests();
     let first_tools: Vec<&str> = stream_requests[0]
         .tools
@@ -531,16 +504,20 @@ async fn engine_cli_runs_dialog_ask_user_local_delegate_and_config_reload() {
         .map(|tool| tool.name.as_str())
         .collect();
     assert!(
-        first_tools.contains(&"ask_user") && first_tools.contains(&"ask_researcher"),
-        "CLI drove an Engine with ask_user and local delegation tools: {first_tools:?}"
+        first_tools.contains(&"ask_user"),
+        "CLI drove an Engine with the ask_user tool: {first_tools:?}"
     );
+    for tool in ["agent", "agent_result", "agent_cancel"] {
+        assert!(
+            first_tools.contains(&tool),
+            "the instance tool `{tool}` is on the CLI-driven surface (M3-5): {first_tools:?}"
+        );
+    }
     assert!(
-        output.contains("[delegation started") && output.contains("delegate=researcher"),
-        "local delegation lifecycle is rendered: {output}"
-    );
-    assert!(
-        output.contains("[delegation finished") && output.contains("delegate=researcher"),
-        "local delegation finish is rendered: {output}"
+        !first_tools
+            .iter()
+            .any(|name| name.starts_with("ask_") && *name != "ask_user"),
+        "no legacy delegate start tool remains: {first_tools:?}"
     );
     assert_eq!(
         stream_requests
@@ -665,122 +642,29 @@ async fn engine_cli_pivots_and_cancels_real_engine_runs() {
     finish_cli(stdin, run).await;
 }
 
-#[cfg(unix)]
-fn fake_acp_script(dir: &TempDir) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-
-    let path = dir.0.join("fake-acp.sh");
-    fs::write(
-        &path,
-        r#"#!/bin/sh
-set -eu
-if [ "$#" -ge 1 ]; then MAG_FAKE_ACP_LOG="$1"; fi
-: "${MAG_FAKE_ACP_LOG:?}"
-if [ "$#" -ge 2 ]; then session="$2"; else session="mag-fake-acp-session"; fi
-while IFS= read -r line; do
-  printf '%s\n' "$line" >> "$MAG_FAKE_ACP_LOG"
-  case "$line" in
-    *'"method":"initialize"'*)
-      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}'
-      ;;
-    *'"method":"session/new"'*)
-      printf '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"%s"}}\n' "$session"
-      ;;
-    *'"method":"session/prompt"'*)
-      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"external summary"}}}}\n' "$session"
-      printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
-      ;;
-    *'"method":"session/cancel"'*)
-      printf '%s\n' 'SESSION_CANCELLED' >> "$MAG_FAKE_ACP_LOG"
-      exit 0
-      ;;
-  esac
-done
-"#,
-    )
-    .expect("write fake ACP script");
-    let mut permissions = fs::metadata(&path)
-        .expect("fake ACP metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&path, permissions).expect("chmod fake ACP script");
-    path
-}
-
-#[cfg(unix)]
-fn toml_string(value: &Path) -> String {
-    value
-        .to_string_lossy()
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-}
-
-#[cfg(unix)]
-fn external_config(script: &Path, log: &Path) -> String {
-    format!(
-        r#"
-[agents.default]
-model = "model-main"
-
-[external_agents.peer]
-kind = "acp"
-command = ["{}", "{}", "mag-fake-acp-session"]
-capabilities = ["streaming"]
-
-[external_agents.peer.env]
-MAG_FAKE_ACP_LOG = "{}"
-
-[tools.ask_peer]
-approval = "allow"
-"#,
-        toml_string(script),
-        toml_string(log),
-        toml_string(log),
-    )
-}
-
+/// The `/resume` command recovers the current session and keeps it drivable
+/// (the external ACP delegation leg of the retired static path is gone with
+/// M3-5; the rebuilt external runtime's e2e lands with M4).
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn engine_cli_runs_external_acp_delegate_and_resume_command() {
-    let dir = TempDir::new("external-resume");
-    let script = fake_acp_script(&dir);
-    let log = dir.0.join("fake-acp.log");
+async fn engine_cli_resume_command_recovers_the_session() {
+    let dir = TempDir::new("resume-command");
     let fake = FakeLlmClient::scripted(vec![
-        tool_use_stream("ask_peer", "peer-1", json!({ "task": "inspect" })),
-        text_stream(&["external final"]),
+        text_stream(&["first final"]),
         text_stream(&["resumed final"]),
     ]);
-    let engine = engine_with_config(
-        &dir,
-        &external_config(&script, &log),
-        fake,
-        ToolRegistry::with_builtins(),
-    );
+    let engine = engine_with_config(&dir, LOCAL_CONFIG, fake, ToolRegistry::with_builtins());
     let (mut stdin, mut stdout, run) = spawn_cli(engine);
     let mut output = String::new();
 
     read_until(&mut stdout, &mut output, "[session ").await;
     let session_id = first_session_id(&output);
     stdin
-        .write_all(b"delegate external\n")
+        .write_all(b"first turn\n")
         .await
-        .expect("send external delegation");
-    read_until(&mut stdout, &mut output, "external final").await;
+        .expect("send first turn");
+    read_until(&mut stdout, &mut output, "first final").await;
     read_until_count(&mut stdout, &mut output, "[finished", 1).await;
-    assert!(
-        output.contains("[delegation started") && output.contains("delegate=peer"),
-        "external delegation start is rendered: {output}"
-    );
-    assert!(
-        output.contains("[delegation finished") && output.contains("delegate=peer"),
-        "external delegation finish is rendered: {output}"
-    );
-
-    let log_text = fs::read_to_string(&log).expect("fake ACP log");
-    assert!(
-        log_text.contains(r#""method":"session/prompt""#),
-        "external ACP process was prompted: {log_text}"
-    );
 
     stdin
         .write_all(format!("/resume {session_id}\n").as_bytes())

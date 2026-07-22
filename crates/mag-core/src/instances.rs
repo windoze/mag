@@ -10,10 +10,12 @@
 //! ever inject parameters (`TODO.md` dependency-boundary rule). The `agent`
 //! spawn tool, its `agent_result` / `agent_cancel` companions (M3-4), the
 //! local-instance drive task, and the origin interaction router live in the
-//! [`spawn`] submodule (M3-3); the completion-notification drain is wired into
-//! the driver in M3-6.
+//! [`spawn`] submodule (M3-3); the session driver wires the trio into the
+//! supervisor's tool surface and cascades session/run cancellation into
+//! [`AgentInstanceRegistry::cancel_all`] (M3-5); the completion-notification
+//! drain is wired into the driver in M3-6.
 
-mod spawn;
+pub(crate) mod spawn;
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -162,9 +164,6 @@ struct RegistryInner {
 
 impl AgentInstanceRegistry {
     /// Creates an empty registry.
-    // Constructed by the session wiring in M3-5; only tests build one until
-    // then.
-    #[allow(dead_code)]
     pub(crate) fn new() -> Self {
         Self::default()
     }
@@ -251,8 +250,6 @@ impl AgentInstanceRegistry {
 
     /// Cancels every still-running instance (session end / supervisor-run
     /// cancel cascade, M3-5). Already-terminal instances are left untouched.
-    // Consumed by the M3-5 cancel cascade; only tests call it until then.
-    #[allow(dead_code)]
     pub(crate) fn cancel_all(&self) {
         let candidates: Vec<Arc<Instance>> = self
             .list()

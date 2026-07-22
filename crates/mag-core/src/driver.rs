@@ -22,6 +22,8 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::convert::Infallible;
+use std::num::NonZeroU32;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex, PoisonError,
     atomic::{AtomicU64, Ordering},
@@ -29,14 +31,6 @@ use std::sync::{
 
 use std::time::Duration;
 
-#[cfg(feature = "external-acp")]
-use agent_lib::{
-    agent::external::{
-        AcpAdapter, AcpConfig, ExternalSessionRegistry, ExternalSessionShutdown, GitWorktreeManager,
-    },
-    agent::{AgentId, ExternalSessionHandler, ExternalSessionRequest},
-    facade::{ManagedExternalAgent, RegistryExternalSessionHandler},
-};
 use agent_lib::{
     agent::{
         ApprovalDecision, BudgetLimits, Interaction, InteractionHandler, InteractionResponse,
@@ -46,14 +40,14 @@ use agent_lib::{
     facade::{
         Agent, AgentRunStream, AgentSnapshot, Approval, ApprovalPolicy, CancelHandle,
         DelegationMessage as FacadeDelegationMessage, DelegationTrace as FacadeDelegationTrace,
-        FacadeError, LocalSubagent, ModelRef, ReconfigRequest, Tool, ToolContext, ToolResult,
-        ToolSetId, ToolSetRef, ToolTrace as FacadeToolTrace, UsageSummary, WireRunEvent,
-        WireRunOutput,
+        FacadeError, ModelRef, ReconfigRequest, Tool, ToolContext, ToolResult, ToolSetId,
+        ToolSetRef, ToolTrace as FacadeToolTrace, UsageSummary, WireRunEvent, WireRunOutput,
     },
 };
-#[cfg(feature = "external-acp")]
-use async_trait::async_trait;
-use mag_config::{ApprovalPolicyKind, ConfigSnapshot};
+use mag_config::{
+    AgentDefinitionRegistry, ApprovalPolicyKind, ConfigSnapshot, default_user_agents_dir,
+    project_agents_dir,
+};
 use mag_service::{
     DelegationMessageWire, DelegationStatusWire, DelegationTrace, Event, RunErrorKind,
     RunId as WireRunId, RunOutput, SessionBudget, SessionConfig, SessionId, ToolCallIdWire,
@@ -66,12 +60,14 @@ use mag_tools::{
 use serde_json::Value;
 use uuid::Uuid;
 
-#[cfg(feature = "external-acp")]
-use crate::assembly::ExternalDelegateBinding;
 use crate::{
     EventBus,
-    assembly::{ApprovalOverrides, DelegateBinding, SessionBinding},
+    assembly::{ApprovalOverrides, SessionBinding},
     engine::approval::IpcApproval,
+    instances::{
+        AgentInstanceRegistry,
+        spawn::{InstanceSpawnContext, SharedSpawnState, agent_tools},
+    },
     persistence::Persistence,
     turn_complete::{TurnCompleteHub, TurnCompletion, TurnSummary},
 };
@@ -126,71 +122,6 @@ impl PivotQueue {
     }
 }
 
-/// Registry-backed ACP session handler with child agent-id tracking.
-///
-/// agent-lib keys live external sessions by the external child [`AgentId`]
-/// minted for each delegation drive, not by mag's root session id. The raw
-/// [`RegistryExternalSessionHandler`] sees that id on every
-/// [`ExternalSessionRequest`], so this wrapper records it and delegates all real
-/// IO to the registry handler. [`SessionDriver::cleanup_external_sessions`] then
-/// sweeps exactly those completed child sessions when the mag session ends.
-#[cfg(feature = "external-acp")]
-#[derive(Debug)]
-struct TrackedExternalSessionHandler {
-    inner: Arc<RegistryExternalSessionHandler>,
-    agent_ids: Mutex<Vec<AgentId>>,
-}
-
-#[cfg(feature = "external-acp")]
-impl TrackedExternalSessionHandler {
-    fn new(inner: Arc<RegistryExternalSessionHandler>) -> Self {
-        Self {
-            inner,
-            agent_ids: Mutex::new(Vec::new()),
-        }
-    }
-
-    fn remember(&self, agent_id: AgentId) {
-        let mut ids = self
-            .agent_ids
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if !ids.contains(&agent_id) {
-            ids.push(agent_id);
-        }
-    }
-
-    async fn cleanup_seen(&self) -> Vec<ExternalSessionShutdown> {
-        let ids = self
-            .agent_ids
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        let mut dispositions = Vec::new();
-        for agent_id in ids {
-            dispositions.extend(self.inner.registry().cleanup_agent(agent_id).await);
-        }
-        dispositions
-    }
-}
-
-#[cfg(feature = "external-acp")]
-#[async_trait]
-impl ExternalSessionHandler for TrackedExternalSessionHandler {
-    async fn fulfill(
-        &self,
-        request: &ExternalSessionRequest,
-        ctx: &RunContext,
-    ) -> RequirementResult {
-        self.remember(request.agent_id);
-        self.inner.fulfill(request, ctx).await
-    }
-
-    async fn cleanup_agent(&self, agent_id: AgentId) -> Vec<ExternalSessionShutdown> {
-        self.inner.registry().cleanup_agent(agent_id).await
-    }
-}
-
 /// One session's stateful facade [`Agent`] plus a run-id source.
 ///
 /// The facade [`Agent`] holds the session's conversation, so reusing one driver
@@ -211,11 +142,15 @@ pub(crate) struct SessionDriver {
     /// Config-controlled system prompt target, queued as a mutable overlay at
     /// the next turn start so it can be replaced or cleared by `apply_config`.
     system_prompt: Option<String>,
-    /// Registry-backed external ACP handlers owned by this session. Completed
-    /// external sessions stay live for reuse until the host explicitly sweeps
-    /// them; the session actor calls [`cleanup_external_sessions`] before drop.
-    #[cfg(feature = "external-acp")]
-    external_handlers: Vec<Arc<TrackedExternalSessionHandler>>,
+    /// The root supervisor's instance spawn context (depth `0`,
+    /// `docs/dyn-agents.md` §5): the session's instance registry, the shared
+    /// spawn state (definition table + supervisor model), and every handle the
+    /// `agent` tool trio captured when it was appended to the tool surface.
+    /// Held for the cancel cascade and the `apply_config` definition rebuild.
+    spawn_ctx: Arc<InstanceSpawnContext>,
+    /// The session's configured working directory, retained so `apply_config`
+    /// can re-load the project-level definition directory (M3-5).
+    cwd: Option<PathBuf>,
     run_counter: AtomicU64,
     /// Mints fresh tool-set identities for `apply_config` reconfigurations.
     tool_set_counter: AtomicU64,
@@ -244,16 +179,19 @@ impl SessionDriver {
     /// interface-supplied session root (for ACP, the client's `cwd`,
     /// `docs/ACP.md` §3.2/§6); a `None` cwd keeps the facade default `"."`.
     ///
-    /// Every [`DelegateBinding`](crate::assembly::DelegateBinding) on the
-    /// binding (each configured `agents.<name>` entry except the bound one) is
-    /// registered as a local worker delegate, so the facade advertises one
-    /// model-routed `ask_<name>` tool per delegate (`docs/CLI.md` §5 P7; see
-    /// [`delegate_worker`]).
+    /// The surface also carries the `agent` / `agent_result` / `agent_cancel`
+    /// instance tools (`docs/dyn-agents.md` §5.1, M3-5), built over the
+    /// session's root [`InstanceSpawnContext`]: the session's instance
+    /// registry, the four-layer definition table (builtin → user dir →
+    /// project dir at the session cwd → the binding's TOML layer), the shared
+    /// LLM client, and the supervisor's model. Spawning is asynchronous, so a
+    /// delegated run drives on the same handles as the supervisor itself.
     ///
     /// # Errors
     ///
     /// Returns any [`FacadeError`] raised while assembling the agent (for
     /// example an invalid model/provider configuration).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config: &SessionConfig,
         client: Arc<dyn LlmClient>,
@@ -262,19 +200,37 @@ impl SessionDriver {
         turn_complete: TurnCompleteHub,
         binding: &SessionBinding,
         overrides: &ApprovalOverrides,
+        session_id: SessionId,
+        events: EventBus,
     ) -> Result<Self, FacadeError> {
         let user_interaction = Arc::new(IpcUserInteractionBridge::new(
             approval.clone() as Arc<dyn InteractionHandler>
         )) as Arc<dyn UserInteractionBridge>;
-        let (facade_tools, policy) = tool_surface(&tools, binding, overrides, user_interaction);
+        let model = binding
+            .model()
+            .map(str::to_owned)
+            .unwrap_or_else(|| config.model.clone());
+        let spawn_ctx = Arc::new(root_spawn_context(
+            config,
+            client.clone(),
+            tools.clone(),
+            approval.clone(),
+            binding,
+            overrides,
+            session_id,
+            events,
+            ModelRef::new(
+                model.clone(),
+                NonZeroU32::new(DEFAULT_MAX_TOKENS).expect("non-zero default"),
+                None,
+                None,
+            ),
+        ));
+        let (facade_tools, policy) =
+            tool_surface(&tools, binding, overrides, user_interaction, &spawn_ctx);
         let mut builder = Agent::builder()
             .client(client)
-            .model(
-                binding
-                    .model()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| config.model.clone()),
-            )
+            .model(model)
             .max_tokens(DEFAULT_MAX_TOKENS)
             .max_steps(DEFAULT_MAX_STEPS)
             .interaction_handler(approval as Arc<dyn InteractionHandler>);
@@ -287,19 +243,12 @@ impl SessionDriver {
         for tool in facade_tools {
             builder = builder.tool(tool);
         }
-        for delegate in binding.delegates() {
-            let worker = delegate_worker(&tools, delegate, overrides)?;
-            builder = builder.subagent(delegate.name().to_owned(), worker);
-        }
-        #[cfg(feature = "external-acp")]
-        let mut external_handlers = Vec::new();
-        #[cfg(feature = "external-acp")]
-        for delegate in binding.external_delegates() {
-            let (agent, handler) = external_acp_delegate(config, delegate)?;
-            external_handlers.push(handler);
-            builder = builder.external_agent(delegate.name().to_owned(), agent);
-        }
         let agent = builder.approval(policy).build()?;
+        // Correct the spawn-context model to the built agent's authoritative
+        // one (identical by construction here, authoritative on restore).
+        spawn_ctx
+            .shared
+            .set_supervisor_model(agent.state().current_model().clone());
 
         Ok(Self {
             agent,
@@ -307,8 +256,8 @@ impl SessionDriver {
             turn_complete,
             agent_name: binding.agent_name().to_owned(),
             system_prompt: binding.system_prompt().map(str::to_owned),
-            #[cfg(feature = "external-acp")]
-            external_handlers,
+            spawn_ctx,
+            cwd: config.cwd.clone(),
             run_counter: AtomicU64::new(1),
             tool_set_counter: AtomicU64::new(1),
         })
@@ -332,25 +281,20 @@ impl SessionDriver {
     /// omits the budget limits, so a restored session enforces the same
     /// [`SessionBudget`] it was created with.
     ///
-    /// The binding's delegates are re-registered through
-    /// [`AgentRestoreBuilder::subagent`](agent_lib::facade::AgentRestoreBuilder::subagent)
-    /// exactly as [`new`](Self::new) registers them: a snapshot persists each
-    /// delegate's data-only recipe but never its approval policy (a runtime
-    /// handle), so re-registering re-supplies the configured tiers and keeps a
-    /// restored session's tool surface and approval behaviour identical to a
-    /// freshly built one instead of silently falling back to agent-lib's
-    /// default allow tier.
-    ///
-    /// Re-registration alone would leave a delegate the configuration dropped
-    /// between snapshot and restore registered — resurrected approval-free
-    /// under agent-lib's default merge semantics. The restore therefore also
-    /// enables
-    /// [`AgentRestoreBuilder::prune_unregistered_delegates`](agent_lib::facade::AgentRestoreBuilder::prune_unregistered_delegates):
-    /// the current configuration is the authority over which delegates may
-    /// exist, so a persisted delegate the binding no longer re-registers
-    /// (local or managed external) is pruned together with its synthesized
-    /// `ask_<name>` declaration, which never reaches the restored tool
-    /// surface.
+    /// The `agent` tool trio is re-injected exactly as in [`new`](Self::new):
+    /// instances are ephemeral and never persisted (`docs/dyn-agents.md`
+    /// §5.2), so a restored session starts with a fresh instance registry and
+    /// a freshly merged definition table. A snapshot written before the static
+    /// delegation path was retired (M3-5) may still carry persisted delegate
+    /// recipes and their synthesized `ask_<name>` declarations; restore never
+    /// re-registers any delegate, and
+    /// [`AgentRestoreBuilder::prune_unregistered_delegates`](agent_lib::facade::AgentRestoreBuilder::prune_unregistered_delegates)
+    /// is kept precisely so those legacy entries are dropped — silently —
+    /// instead of being resurrected under agent-lib's default merge semantics
+    /// with an approval-free fallback policy (with zero re-registrations the
+    /// prune is a pure one-way sweep of the old roster; agent-lib's surface
+    /// offers no other way to keep a legacy snapshot both restorable and
+    /// delegate-free).
     ///
     /// # Errors
     ///
@@ -358,7 +302,7 @@ impl SessionDriver {
     /// a snapshot whose state cannot be deserialized).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn restore(
-        _config: &SessionConfig,
+        config: &SessionConfig,
         client: Arc<dyn LlmClient>,
         tools: Arc<ToolRegistry>,
         approval: Arc<IpcApproval>,
@@ -367,11 +311,33 @@ impl SessionDriver {
         turn_complete: TurnCompleteHub,
         binding: &SessionBinding,
         overrides: &ApprovalOverrides,
+        session_id: SessionId,
+        events: EventBus,
     ) -> Result<Self, FacadeError> {
         let user_interaction = Arc::new(IpcUserInteractionBridge::new(
             approval.clone() as Arc<dyn InteractionHandler>
         )) as Arc<dyn UserInteractionBridge>;
-        let (facade_tools, policy) = tool_surface(&tools, binding, overrides, user_interaction);
+        let spawn_ctx = Arc::new(root_spawn_context(
+            config,
+            client.clone(),
+            tools.clone(),
+            approval.clone(),
+            binding,
+            overrides,
+            session_id,
+            events,
+            ModelRef::new(
+                binding
+                    .model()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| config.model.clone()),
+                NonZeroU32::new(DEFAULT_MAX_TOKENS).expect("non-zero default"),
+                None,
+                None,
+            ),
+        ));
+        let (facade_tools, policy) =
+            tool_surface(&tools, binding, overrides, user_interaction, &spawn_ctx);
         let mut builder = Agent::restore()
             .snapshot(snapshot)
             .client(client)
@@ -382,29 +348,20 @@ impl SessionDriver {
         for tool in facade_tools {
             builder = builder.tool(tool);
         }
-        for delegate in binding.delegates() {
-            let worker = delegate_worker(&tools, delegate, overrides)?;
-            builder = builder.subagent(delegate.name().to_owned(), worker);
-        }
-        #[cfg(feature = "external-acp")]
-        let mut external_handlers = Vec::new();
-        #[cfg(feature = "external-acp")]
-        for delegate in binding.external_delegates() {
-            let (agent, handler) = external_acp_delegate(_config, delegate)?;
-            external_handlers.push(handler);
-            builder = builder.external_agent(delegate.name().to_owned(), agent);
-        }
-        // The current configuration is the authority over which delegates may
-        // exist: a persisted delegate the binding no longer re-registers (it
-        // was removed from the configuration between snapshot and restore) is
-        // pruned together with its synthesized `ask_<name>` declaration,
-        // instead of being resurrected with agent-lib's default auto-allow
-        // approval policy (agent-lib
-        // [`AgentRestoreBuilder::prune_unregistered_delegates`]).
+        // Restore never re-registers a delegate (the static delegation path is
+        // retired, M3-5): with an empty re-registered set the prune drops
+        // every persisted legacy delegate recipe together with its
+        // synthesized `ask_<name>` declaration, so an old snapshot restores
+        // cleanly and its delegates silently disappear.
         let agent = builder
             .prune_unregistered_delegates()
             .approval(policy)
             .build()?;
+        // The restored snapshot's model is the authoritative supervisor model
+        // children inherit.
+        spawn_ctx
+            .shared
+            .set_supervisor_model(agent.state().current_model().clone());
 
         Ok(Self {
             agent,
@@ -412,8 +369,8 @@ impl SessionDriver {
             turn_complete,
             agent_name: binding.agent_name().to_owned(),
             system_prompt: binding.system_prompt().map(str::to_owned),
-            #[cfg(feature = "external-acp")]
-            external_handlers,
+            spawn_ctx,
+            cwd: config.cwd.clone(),
             run_counter: AtomicU64::new(1),
             tool_set_counter: AtomicU64::new(1),
         })
@@ -495,6 +452,10 @@ impl SessionDriver {
                         message: error.to_string(),
                     }
                 };
+                // Same cancel cascade as the in-flight path below.
+                if matches!(outcome, TurnOutcome::Cancelled) {
+                    self.spawn_ctx.registry.cancel_all();
+                }
                 drop_pivots(session_id, pivots, events, outcome.pivot_drop_reason());
                 let terminal = match &outcome {
                     TurnOutcome::Cancelled => Event::RunError {
@@ -560,6 +521,14 @@ impl SessionDriver {
         // intact) so the next `run_turn` on this driver can proceed.
         drop(stream);
 
+        // Cancel cascade (`docs/dyn-agents.md` §5.2): a cancelled supervisor
+        // run cancels every still-running instance it spawned; a completed or
+        // failed run leaves its instances alone (spawning is asynchronous, so
+        // an instance may legitimately outlive the turn that started it).
+        if matches!(outcome, TurnOutcome::Cancelled) {
+            self.spawn_ctx.registry.cancel_all();
+        }
+
         // Any pivot still queued at the end of the run never reached a step
         // boundary: report it dropped with the run's terminal reason.
         drop_pivots(session_id, pivots, events, outcome.pivot_drop_reason());
@@ -614,25 +583,32 @@ impl SessionDriver {
     ///
     /// - `model` → [`ReconfigRequest::SetModel`] (only when it actually
     ///   changed; `max_tokens`/`temperature` keep their current values since
-    ///   the config schema carries no LLM sampling parameters yet).
+    ///   the config schema carries no LLM sampling parameters yet). The spawn
+    ///   context's shared supervisor model follows once the queued request
+    ///   lands at the next turn start, so instances spawned from that turn on
+    ///   inherit the new model.
     /// - `tools` → [`ReconfigRequest::ReplaceToolSet`] with the declarations
     ///   of the enabled entries, projected from this driver's executable
-    ///   [`ToolRegistry`] (only when the effective name set changed). A config
-    ///   tool name with no registered plugin is skipped with a warn log. The
-    ///   projection deliberately covers only non-delegate tools: the facade
-    ///   re-synthesizes the `ask_<name>` delegation declarations from the
-    ///   currently registered delegates on every tool-set reconfigure
-    ///   (agent-lib tool-set reconfig resynthesis), so applying a narrowed
-    ///   `tools` list can never strip the delegation surface. An agent entry
+    ///   [`ToolRegistry`], plus the `agent` / `agent_result` / `agent_cancel`
+    ///   instance-tool declarations (`docs/dyn-agents.md` §5.1: the instance
+    ///   surface survives any surface narrowing, exactly as the delegation
+    ///   declarations did on the retired static path). A config tool name
+    ///   with no registered plugin is skipped with a warn log. An agent entry
     ///   with no tool list imposes no constraint and leaves the current
-    ///   surface untouched; an explicit `tools = []` clears the non-delegate
-    ///   surface (an empty replacement set passes facade admission — its
-    ///   backing check is vacuous) while the delegation declarations remain.
+    ///   surface untouched; an explicit `tools = []` clears the plugin
+    ///   surface while the instance tools remain.
     /// - `system_prompt` → this driver's config-controlled overlay target. The
     ///   target is queued as [`ReconfigRequest::SetSystemPromptOverlay`] right
     ///   before the next turn starts instead of being stored in the agent's
     ///   immutable base prompt, so apply can replace or clear it without
     ///   appending to stale text.
+    ///
+    /// The definition table is rebuilt on every apply (M3-5): the TOML layer
+    /// is re-projected from the applied snapshot and re-merged over the
+    /// builtin/user/project layers (the two directory layers are re-read, so
+    /// edited definition files are picked up too). Definitions only affect
+    /// *later* spawns; running instances keep driving with the context they
+    /// captured.
     ///
     /// Out of scope on the current agent-lib reconfigure surface (documented
     /// for M3-R): the approval policy is baked into the agent at build time
@@ -645,7 +621,31 @@ impl SessionDriver {
             self.system_prompt = agent_config.system_prompt().map(str::to_owned);
         }
         let requests = self.reconfig_requests(session_id, snapshot);
+        // Mirror the queued `SetModel` (if any) into the shared spawn state:
+        // the facade drains its reconfig queue at the next turn boundary, and
+        // the model this mirrors is built from the same values as the request,
+        // so instances spawned from the next run on inherit exactly the
+        // supervisor's new effective model. (Facade admission of `SetModel`
+        // only rejects blank models / non-finite temperatures / provider-extras
+        // mismatches, none of which this driver can produce.)
+        if let Some(model) = requests.iter().find_map(|request| match request {
+            ReconfigRequest::SetModel { model } => Some(model.clone()),
+            _ => None,
+        }) {
+            self.spawn_ctx.shared.set_supervisor_model(model);
+        }
         self.apply_reconfig_items(session_id, requests);
+        // Rebuild the definition table in the shared spawn state
+        // (`docs/dyn-agents.md` §3.2, M3-5): the TOML layer is re-projected
+        // from the applied snapshot and re-merged, so the next spawn at any
+        // depth sees the new table. (The supervisor model half follows at the
+        // next turn start, when an applied `SetModel` actually lands.)
+        self.spawn_ctx
+            .shared
+            .set_definitions(assemble_agent_definitions(
+                self.cwd.as_deref(),
+                AgentDefinitionRegistry::from_toml_snapshot(snapshot, &self.agent_name),
+            ));
     }
 
     /// Applies each reconfigure request independently.
@@ -745,6 +745,13 @@ impl SessionDriver {
                     ),
                 }
             }
+            // The instance tools are facade-level (no registry plugin backs
+            // them), so the projection names them explicitly: a narrowed
+            // `tools` list must never strip the session's instance surface
+            // (`docs/dyn-agents.md` §5.1), and rebuilding the trio here also
+            // refreshes the `agent` description with the definition table
+            // this apply just swapped in.
+            declarations.extend(agent_tools(&self.spawn_ctx).iter().map(Tool::declaration));
             let current_names: BTreeSet<&str> = self
                 .agent
                 .state()
@@ -794,35 +801,15 @@ impl SessionDriver {
         let value = self.run_counter.fetch_add(1, Ordering::Relaxed);
         WireRunId::new(Uuid::from_u128(u128::from(value)))
     }
+}
 
-    /// Explicitly sweeps completed managed external sessions before the owning
-    /// mag session is dropped (`docs/CLI.md` §5 P7, decision D3).
-    ///
-    /// agent-lib automatically force-closes cancelled/failed external drives;
-    /// completed drives are retained for reuse and require the host to sweep the
-    /// registry. The session actor calls this on graceful actor shutdown so a
-    /// deleted mag session leaves no ACP child process behind.
-    pub(crate) async fn cleanup_external_sessions(&mut self, session_id: SessionId) {
-        #[cfg(feature = "external-acp")]
-        {
-            if self.external_handlers.is_empty() {
-                return;
-            }
-            for handler in &self.external_handlers {
-                let dispositions = handler.cleanup_seen().await;
-                if !dispositions.is_empty() {
-                    tracing::info!(
-                        %session_id,
-                        external_sessions = dispositions.len(),
-                        "cleaned up managed external ACP sessions"
-                    );
-                }
-            }
-        }
-        #[cfg(not(feature = "external-acp"))]
-        {
-            let _ = session_id;
-        }
+impl Drop for SessionDriver {
+    /// Session end cancel cascade (`docs/dyn-agents.md` §5.2): instances are
+    /// ephemeral and never outlive their session, so every still-running
+    /// instance is cancelled when the driver drops. Already-terminal
+    /// instances keep their outcomes.
+    fn drop(&mut self) {
+        self.spawn_ctx.registry.cancel_all();
     }
 }
 
@@ -961,6 +948,79 @@ fn budget_limits(budget: &SessionBudget) -> BudgetLimits {
     )
 }
 
+/// Assembles the session's root (depth `0`) [`InstanceSpawnContext`]
+/// (`docs/dyn-agents.md` §5, M3-5): a fresh instance registry, the four-layer
+/// definition table merged from the binding's TOML layer, and the supervisor's
+/// own client / tools / approval / event handles the spawned instances share.
+/// `supervisor_model` seeds the shared cell and is corrected to the built
+/// agent's authoritative model right after construction.
+#[allow(clippy::too_many_arguments)]
+fn root_spawn_context(
+    config: &SessionConfig,
+    client: Arc<dyn LlmClient>,
+    tools: Arc<ToolRegistry>,
+    approval: Arc<IpcApproval>,
+    binding: &SessionBinding,
+    overrides: &ApprovalOverrides,
+    session_id: SessionId,
+    events: EventBus,
+    supervisor_model: ModelRef,
+) -> InstanceSpawnContext {
+    InstanceSpawnContext {
+        registry: AgentInstanceRegistry::new(),
+        shared: SharedSpawnState::new(
+            assemble_agent_definitions(config.cwd.as_deref(), binding.agent_definitions().clone()),
+            supervisor_model,
+        ),
+        client,
+        tools,
+        overrides: overrides.clone(),
+        interaction: approval,
+        events,
+        session_id,
+        worktree: config.cwd.as_ref().map_or_else(
+            || WorktreeRef::new("."),
+            |cwd| WorktreeRef::new(cwd.clone()),
+        ),
+        depth: 0,
+    }
+}
+
+/// Merges the session's agent-definition table from its four sources
+/// (`docs/dyn-agents.md` §3.2): builtin, the user-level directory
+/// ([`default_user_agents_dir`]), the project-level directory
+/// ([`project_agents_dir`], only when the session has a cwd), and the TOML
+/// layer `toml` (resolved by the session binding at spawn, rebuilt from the
+/// applied snapshot at config-apply time). Directory loads are tolerant: a
+/// missing directory is empty and an unreadable one is warned about and
+/// skipped, so a broken setup never takes a session down.
+fn assemble_agent_definitions(
+    cwd: Option<&Path>,
+    toml: AgentDefinitionRegistry,
+) -> AgentDefinitionRegistry {
+    let user = AgentDefinitionRegistry::load_user_dir(&default_user_agents_dir()).unwrap_or_else(
+        |error| {
+            tracing::warn!(%error, "user agent definition directory unreadable; layer skipped");
+            AgentDefinitionRegistry::default()
+        },
+    );
+    let project = cwd.map_or_else(AgentDefinitionRegistry::default, |cwd| {
+        AgentDefinitionRegistry::load_project_dir(&project_agents_dir(cwd)).unwrap_or_else(
+            |error| {
+                tracing::warn!(%error, "project agent definition directory unreadable; layer skipped");
+                AgentDefinitionRegistry::default()
+            },
+        )
+    });
+    AgentDefinitionRegistry::merge(
+        AgentDefinitionRegistry::merge(
+            AgentDefinitionRegistry::merge(AgentDefinitionRegistry::builtin(), user),
+            project,
+        ),
+        toml,
+    )
+}
+
 /// Maps one projected [`WireRunEvent`] into a mag [`Event`].
 ///
 /// A terminal [`WireRunEvent::Done`] is folded into `final_output` and produces
@@ -1048,12 +1108,16 @@ fn map_wire_event(
 ///    `ask_user` consumes it to emit `Question` / `Choice` through the same
 ///    `IpcApproval` path (`docs/CLI.md` §5 P6 / D6), while other tools ignore
 ///    it.
-/// 2. Every registered local or external delegate start tool (`ask_<name>`) is
-///    made an approval point by default (`docs/CLI.md` §5 P7 / TODO M4-3), so
-///    starting a delegation goes through the root session's `IpcApproval`.
+/// 2. The `agent` / `agent_result` / `agent_cancel` instance tools
+///    (`docs/dyn-agents.md` §5.1, M3-5) are appended over the session's root
+///    spawn context. They stay on the policy default tier: spawning is
+///    asynchronous and immediately reversible through `agent_cancel`, so no
+///    derived gate is added (design §7).
 /// 3. `overrides`' per-tool tiers (`[tools.<name>].approval`) replace the
-///    derived tier for their tool, including explicit `ask_<name>` allow/deny
-///    overrides.
+///    derived tier for their tool — including `[tools.agent]` /
+///    `[tools.agent_result]` / `[tools.agent_cancel]` entries, so a
+///    configured `deny` refuses spawns outright and an `ask` gates them
+///    through the root session's `IpcApproval` (M3-5).
 ///
 /// Tier mapping: `ask` → [`ApprovalPolicy::ask_tool`], `allow` →
 /// [`ApprovalPolicy::allow_tool`], `deny` → [`ApprovalPolicy::deny_tool`].
@@ -1066,14 +1130,15 @@ fn tool_surface(
     binding: &SessionBinding,
     overrides: &ApprovalOverrides,
     user_interaction: Arc<dyn UserInteractionBridge>,
+    spawn_ctx: &Arc<InstanceSpawnContext>,
 ) -> (Vec<Tool>, ApprovalPolicy) {
-    let (facade_tools, policy) = project_tool_plugins(
+    let (mut facade_tools, policy) = project_tool_plugins(
         tools,
         binding.tools(),
         overrides.default_tier(),
         user_interaction,
     );
-    let policy = apply_delegate_start_tiers(policy, binding);
+    facade_tools.extend(agent_tools(spawn_ctx));
     let policy = apply_per_tool_tiers(policy, overrides);
     (facade_tools, policy)
 }
@@ -1092,7 +1157,7 @@ fn tool_surface(
 ///
 /// Per-tool `[tools.<name>]` tiers are deliberately **not** applied here:
 /// callers layer them on after any further derived tiers (the supervisor
-/// applies delegate-start tiers first so an explicit `[tools.ask_<name>]`
+/// appends the instance tools first so an explicit `[tools.agent]`-style
 /// entry keeps the final say; the instance path applies them directly).
 pub(crate) fn project_tool_plugins(
     tools: &ToolRegistry,
@@ -1129,176 +1194,9 @@ pub(crate) fn project_tool_plugins(
     (facade_tools, policy)
 }
 
-/// Builds one local worker delegate (`LocalSubagent`) from its resolved
-/// binding (`docs/CLI.md` §5 P7).
-///
-/// The worker stays data-first per agent-lib's
-/// [`Agent::worker`](agent_lib::facade::Agent::worker) semantics: it carries
-/// only tool *declarations* (no executable closures — a fulfilled delegation
-/// gates a declared child tool on the worker's approval policy and answers an
-/// approved call with the facade's declaration-only `UnknownTool` result,
-/// which the child model sees as an ordinary tool error), never an LLM client
-/// — the child runtime assembled per delegation shares the **supervisor's**
-/// client, so a delegate entry's own `provider` is not consumable on the
-/// current agent-lib surface (recorded for M4-R).
-///
-/// Surface derivation mirrors [`tool_surface`]:
-///
-/// - `tools` constrains the declaration list to the named registry plugins
-///   (an absent list exposes every registered plugin's declaration); a bound
-///   name with no registered plugin is warned about and skipped.
-/// - The approval policy starts from the configured default tier, gates each
-///   projected plugin declaring a [`permission`](ToolPlugin::permission)
-///   behind `ask`, and applies the `[tools.<name>].approval` overrides — so a
-///   paused child tool pops to the root session's [`IpcApproval`] with the
-///   delegate's origin attribution (`docs/CLI.md` §3.3, decision D5).
-/// - `model` pins an explicit worker model; without one the worker inherits
-///   the supervisor's model (agent-lib R4).
-///
-/// # Errors
-///
-/// Returns any [`FacadeError`] raised by the worker builder (currently
-/// infallible, kept for signature stability).
-fn delegate_worker(
-    tools: &ToolRegistry,
-    delegate: &DelegateBinding,
-    overrides: &ApprovalOverrides,
-) -> Result<LocalSubagent, FacadeError> {
-    let mut policy = base_policy(overrides.default_tier());
-    let mut declarations = Vec::new();
-    for plugin in tools.plugins() {
-        if let Some(allowed) = delegate.tools()
-            && !allowed.iter().any(|name| name == plugin.name())
-        {
-            continue;
-        }
-        if plugin.permission().is_some() {
-            policy = policy.ask_tool(plugin.name());
-        }
-        declarations.push(plugin.declaration());
-    }
-    if let Some(allowed) = delegate.tools() {
-        for name in allowed {
-            if !tools.plugins().iter().any(|p| p.name() == name) {
-                tracing::warn!(
-                    delegate = delegate.name(),
-                    tool = name.as_str(),
-                    "delegate entry names a tool not present in the tool registry; skipped"
-                );
-            }
-        }
-    }
-    policy = apply_per_tool_tiers(policy, overrides);
-
-    let mut worker = Agent::worker()
-        .description(delegate.description())
-        .tool_declarations(declarations)
-        .approval(policy);
-    if let Some(system) = delegate.system_prompt() {
-        worker = worker.system(system.to_owned());
-    }
-    if let Some(model) = delegate.model() {
-        worker = worker.model(model.to_owned());
-    }
-    worker.build()
-}
-
-/// Builds one managed external ACP delegate from its resolved configuration
-/// (`docs/CLI.md` §5 P7, decision D3).
-///
-/// The facade-facing spec is created through [`ManagedExternalAgent::acp`], which
-/// advertises the delegate as an `ask_<name>` tool. The registry-backed session
-/// handler is attached immediately and uses an [`AcpConfig`] carrying the same
-/// launch line plus the configuration's environment overrides. We construct the
-/// handler directly over the ACP adapter because agent-lib's one-call default
-/// helper has no surface for mag's per-source env overrides; the composition is
-/// the same registry-backed handler the helper returns for ACP.
-#[cfg(feature = "external-acp")]
-fn external_acp_delegate(
-    config: &SessionConfig,
-    delegate: &ExternalDelegateBinding,
-) -> Result<(ManagedExternalAgent, Arc<TrackedExternalSessionHandler>), FacadeError> {
-    let (binary, args) = split_external_command(delegate.command());
-    if binary.as_os_str().is_empty() {
-        tracing::warn!(
-            delegate = delegate.name(),
-            capabilities = ?delegate.capabilities(),
-            "external ACP delegate has no command; delegation will fail when invoked"
-        );
-    }
-
-    let mut acp_config =
-        AcpConfig::new(binary.clone(), args.clone()).with_timeout(Duration::from_secs(120));
-    for (key, value) in delegate.env() {
-        acp_config = acp_config.with_env(key.clone(), value.clone());
-    }
-    if let Some(cwd) = &config.cwd {
-        acp_config = acp_config.with_working_dir(cwd.clone());
-    }
-    let worktrees = Arc::new(GitWorktreeManager::new().with_root(external_worktree_root()));
-    let registry = Arc::new(ExternalSessionRegistry::with_worktree_manager(
-        Arc::new(AcpAdapter::new(acp_config)),
-        worktrees,
-    ));
-    let handler = Arc::new(RegistryExternalSessionHandler::new(registry));
-    let tracked = Arc::new(TrackedExternalSessionHandler::new(handler));
-
-    let mut builder = ManagedExternalAgent::acp(binary, args).session_handler(tracked.clone());
-    if let Some(cwd) = &config.cwd {
-        builder = builder.worktree(cwd.clone());
-    }
-    Ok((builder.build()?, tracked))
-}
-
-/// Splits an argv-form external-agent command into binary + args.
-#[cfg(feature = "external-acp")]
-fn split_external_command(command: &[String]) -> (std::path::PathBuf, Vec<String>) {
-    match command.split_first() {
-        Some((binary, args)) => (binary.into(), args.to_vec()),
-        None => (std::path::PathBuf::new(), Vec::new()),
-    }
-}
-
-#[cfg(feature = "external-acp")]
-fn external_worktree_root() -> std::path::PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "mag-external-worktrees-{}-{unique}",
-        std::process::id()
-    ))
-}
-
-/// Requires approval before any model-routed delegate start tool (`ask_<name>`)
-/// runs (`docs/CLI.md` §5 P7, TODO M4-3).
-///
-/// This covers both local LLM subagents and managed external ACP agents. The
-/// call happens before [`apply_per_tool_tiers`], so an explicit
-/// `[tools.ask_<name>] approval = "allow" | "deny" | "ask"` entry remains the
-/// final policy for that delegate start.
-fn apply_delegate_start_tiers(
-    mut policy: ApprovalPolicy,
-    binding: &SessionBinding,
-) -> ApprovalPolicy {
-    for delegate in binding.delegates() {
-        policy = policy.ask_tool(delegate_start_tool_name(delegate.name()));
-    }
-    #[cfg(feature = "external-acp")]
-    for delegate in binding.external_delegates() {
-        policy = policy.ask_tool(delegate_start_tool_name(delegate.name()));
-    }
-    policy
-}
-
-/// Returns the model-routed delegation tool name synthesized by agent-lib for a
-/// delegate registered as `name`.
-fn delegate_start_tool_name(name: &str) -> String {
-    format!("ask_{name}")
-}
-
 /// Applies the configured `[tools.<name>].approval` tiers on top of `policy`
-/// (shared by the main agent's [`tool_surface`], each delegate worker, and the
-/// dynamic-instance spawn path of `docs/dyn-agents.md` §7).
+/// (shared by the main agent's [`tool_surface`] and the dynamic-instance
+/// spawn path of `docs/dyn-agents.md` §7).
 pub(crate) fn apply_per_tool_tiers(
     mut policy: ApprovalPolicy,
     overrides: &ApprovalOverrides,
@@ -1814,9 +1712,10 @@ mod tests {
             routing: mag_service::RoutingMode::ModelRouted,
             budget: None,
         };
+        let events = EventBus::new();
         let approval = std::sync::Arc::new(IpcApproval::new(
             session_id(),
-            EventBus::new(),
+            events.clone(),
             std::sync::Arc::new(AskFrontendDecider),
         ));
         super::SessionDriver::new(
@@ -1827,6 +1726,8 @@ mod tests {
             TurnCompleteHub::default(),
             &SessionBinding::resolve(&config, None),
             &ApprovalOverrides::default(),
+            session_id(),
+            events,
         )
         .expect("build session driver")
     }
@@ -1841,6 +1742,216 @@ mod tests {
     fn new_without_cwd_keeps_default_worktree() {
         let worktree = worktree_for_cwd(None);
         assert_eq!(worktree, serde_json::json!("."));
+    }
+
+    /// M3-5 main wiring: a freshly built session advertises the `agent` tool
+    /// trio on its surface, and the `agent` description enumerates the builtin
+    /// definitions (the merged table's lowest layer).
+    #[test]
+    fn new_exposes_the_agent_instance_tools() {
+        let driver = driver_for_test(FakeLlmClient::scripted(Vec::new()));
+
+        let tools = driver.agent.state().current_tool_set().tools();
+        let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+        for tool in ["agent", "agent_result", "agent_cancel"] {
+            assert!(names.contains(&tool), "{tool} on the surface: {names:?}");
+        }
+        let agent = tools
+            .iter()
+            .find(|tool| tool.name == "agent")
+            .expect("the agent tool is advertised");
+        for expected in ["general-purpose", "explorer"] {
+            assert!(
+                agent.description.contains(expected),
+                "the agent description enumerates `{expected}`: {}",
+                agent.description
+            );
+        }
+    }
+
+    /// M3-5 config apply: the TOML definition layer is rebuilt from the
+    /// applied snapshot and re-merged, so a definition added by the apply
+    /// becomes spawnable for later spawns; the shared supervisor model follows
+    /// an applied `SetModel` once it lands at the next turn start.
+    #[test]
+    fn apply_config_rebuilds_the_definition_table_for_later_spawns() {
+        driver_test_runtime().block_on(async {
+            use mag_config::{ConfigDto, ConfigSnapshot};
+
+            let client =
+                FakeLlmClient::scripted(vec![text_stream_with_usage(&["ok"], usage(1, 1))]);
+            let mut driver = driver_for_test(client.clone());
+            assert!(
+                driver.spawn_ctx.shared.definition("researcher").is_none(),
+                "no researcher definition before the apply"
+            );
+            let dto = ConfigDto::parse_str(
+                r#"
+[agents.default]
+model = "model-b"
+
+[agents.researcher]
+role = "Researches topics."
+"#,
+            )
+            .expect("config parses");
+            let snapshot = ConfigSnapshot::resolve(&dto, 1).expect("config resolves");
+
+            driver.apply_config(session_id(), &snapshot);
+
+            let definition = driver
+                .spawn_ctx
+                .shared
+                .definition("researcher")
+                .expect("researcher definition after the apply");
+            assert_eq!(definition.description, "Researches topics.");
+            assert_eq!(
+                driver.spawn_ctx.shared.supervisor_model().model(),
+                "model-b",
+                "the shared supervisor model mirrors the queued SetModel"
+            );
+
+            // The queued SetModel lands at the next turn start with exactly
+            // the mirrored value.
+            drive_one_turn(&mut driver).await;
+            let requests = client.stream_requests();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].model, "model-b");
+        });
+    }
+
+    /// M3-5 restore compatibility: a snapshot persisted before the static
+    /// delegation path was retired carries delegate recipes and their
+    /// synthesized `ask_<name>` declarations. Restore must neither fail nor
+    /// resurrect them: the legacy delegate is pruned and its declaration
+    /// leaves the surface, while the instance tools are re-injected.
+    #[test]
+    fn restore_sweeps_legacy_delegates_from_an_old_snapshot() {
+        let driver = driver_for_test(FakeLlmClient::scripted(Vec::new()));
+        let snapshot = driver.agent.snapshot().expect("committed snapshot");
+        let snapshot = legacy_snapshot_with_delegate(snapshot);
+
+        let restored = restored_driver(snapshot);
+
+        let names: Vec<&str> = restored
+            .agent
+            .state()
+            .current_tool_set()
+            .tools()
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        for tool in ["agent", "agent_result", "agent_cancel"] {
+            assert!(
+                names.contains(&tool),
+                "{tool} on the restored surface: {names:?}"
+            );
+        }
+        assert!(
+            !names.contains(&"ask_legacy"),
+            "the legacy delegate start tool is pruned, not resurrected: {names:?}"
+        );
+        assert!(
+            restored.agent.subagents().is_empty(),
+            "the legacy delegate itself is pruned from the roster"
+        );
+    }
+
+    /// Injects a legacy local delegate recipe and its synthesized
+    /// `ask_legacy` declaration into a snapshot, mimicking what a pre-M3-5
+    /// session persisted (the declaration lived in the initial tool set — the
+    /// serialized record omits `current_tool_set` while it matches the
+    /// initial set; the recipe lived in the delegate roster). Typed shapes
+    /// are reused from the snapshot itself so the fixture tracks agent-lib's
+    /// serialized form.
+    fn legacy_snapshot_with_delegate(
+        snapshot: agent_lib::facade::AgentSnapshot,
+    ) -> agent_lib::facade::AgentSnapshot {
+        let mut json = serde_json::to_value(&snapshot).expect("serialize snapshot");
+        let spec = json["agent_state"]["spec"].clone();
+        let tool_set_id = json["agent_state"]["spec"]["initial_tools"]["id"].clone();
+        let ask_decl = serde_json::json!({
+            "name": "ask_legacy",
+            "description": "Start the legacy delegate.",
+            "input_schema": {
+                "type": "object",
+                "properties": { "task": { "type": "string" } },
+            },
+        });
+        json.pointer_mut("/agent_state/spec/initial_tools/tools")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("snapshot carries the initial tool set")
+            .push(ask_decl);
+        json["delegates"]
+            .as_array_mut()
+            .expect("delegate roster")
+            .push(serde_json::json!({
+                "name": "legacy",
+                "description": "legacy delegate",
+                "spec": spec,
+                "tools": { "id": tool_set_id, "tools": [] },
+                "inherit_model": true,
+            }));
+        serde_json::from_value(json).expect("deserialize legacy snapshot")
+    }
+
+    /// Builds a driver restored from `snapshot`, mirroring the session actor's
+    /// resume path.
+    fn restored_driver(snapshot: agent_lib::facade::AgentSnapshot) -> super::SessionDriver {
+        use crate::EventBus;
+        use crate::assembly::{ApprovalOverrides, SessionBinding};
+        use crate::engine::approval::{AskFrontendDecider, IpcApproval};
+        use crate::turn_complete::TurnCompleteHub;
+
+        let config = mag_service::SessionConfig {
+            provider: "fake".to_owned(),
+            model: "fake-model".to_owned(),
+            tool_profile: None,
+            cwd: None,
+            routing: mag_service::RoutingMode::ModelRouted,
+            budget: None,
+        };
+        let events = EventBus::new();
+        let approval = std::sync::Arc::new(IpcApproval::new(
+            session_id(),
+            events.clone(),
+            std::sync::Arc::new(AskFrontendDecider),
+        ));
+        super::SessionDriver::restore(
+            &config,
+            FakeLlmClient::scripted(Vec::new()),
+            std::sync::Arc::new(mag_tools::ToolRegistry::with_builtins()),
+            approval,
+            snapshot,
+            config.budget.as_ref(),
+            TurnCompleteHub::default(),
+            &SessionBinding::resolve(&config, None),
+            &ApprovalOverrides::default(),
+            session_id(),
+            events,
+        )
+        .expect("restore session driver")
+    }
+
+    /// M3-5 session-end cancel cascade: dropping the driver cancels every
+    /// still-running instance (instances never outlive their session).
+    #[test]
+    fn drop_cancels_all_running_instances() {
+        use crate::instances::{Instance, InstanceStatus};
+
+        let driver = driver_for_test(FakeLlmClient::scripted(Vec::new()));
+        let registry = driver.spawn_ctx.registry.clone();
+        let instance = registry.register(Instance::new(
+            "general-purpose-1".to_owned(),
+            "general-purpose".to_owned(),
+            1,
+        ));
+        let cancel_handle = instance.cancel_handle();
+
+        drop(driver);
+
+        assert_eq!(instance.status(), InstanceStatus::Cancelled);
+        assert!(cancel_handle.is_cancelled());
     }
 
     /// TODO M3-5 (d): a rejected reconfigure item (here an immutable skill
@@ -1914,7 +2025,17 @@ tools = ["read_file", "shell"]
                 .iter()
                 .map(|tool| tool.name.as_str())
                 .collect();
-            assert_eq!(names, vec!["read_file", "shell"]);
+            assert_eq!(
+                names,
+                vec![
+                    "read_file",
+                    "shell",
+                    "agent",
+                    "agent_result",
+                    "agent_cancel"
+                ],
+                "the narrowed plugins plus the instance tools (M3-5)"
+            );
         });
     }
 
@@ -1951,7 +2072,11 @@ enabled = false
                 .iter()
                 .map(|tool| tool.name.as_str())
                 .collect();
-            assert_eq!(names, vec!["read_file"]);
+            assert_eq!(
+                names,
+                vec!["read_file", "agent", "agent_result", "agent_cancel"],
+                "disabled and unknown tools skipped; the instance tools remain (M3-5)"
+            );
         });
     }
 
@@ -1981,17 +2106,25 @@ enabled = false
                 .collect();
             assert_eq!(
                 names,
-                vec!["read_file", "list_dir", "grep", "shell", "ask_user"]
+                vec![
+                    "read_file",
+                    "list_dir",
+                    "grep",
+                    "shell",
+                    "ask_user",
+                    "agent",
+                    "agent_result",
+                    "agent_cancel",
+                ]
             );
         });
     }
 
-    /// An explicit `tools = []` on the bound entry clears the session's tool
-    /// surface: the replacement set is empty (facade admission is vacuous for
-    /// zero declarations), unlike an absent `tools` key which leaves the
-    /// surface untouched. This driver registers no delegates; with delegates
-    /// the facade would still re-synthesize their `ask_<name>` declarations
-    /// (see the delegation regression test in `engine.rs`).
+    /// An explicit `tools = []` on the bound entry clears the session's
+    /// plugin surface: the replacement set carries only the instance tools
+    /// (`agent` / `agent_result` / `agent_cancel`, `docs/dyn-agents.md` §5.1),
+    /// which always survive a surface narrowing, unlike an absent `tools` key
+    /// which leaves the surface untouched.
     #[test]
     fn apply_config_clears_the_surface_on_an_explicit_empty_tool_list() {
         driver_test_runtime().block_on(async {
@@ -2014,10 +2147,15 @@ tools = []
 
             let requests = client.stream_requests();
             assert_eq!(requests.len(), 1);
-            assert!(
-                requests[0].tools.is_empty(),
-                "explicit empty list exposes no tools: {:?}",
-                requests[0].tools
+            let names: Vec<&str> = requests[0]
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect();
+            assert_eq!(
+                names,
+                vec!["agent", "agent_result", "agent_cancel"],
+                "an explicit empty list exposes no plugins, only the instance tools: {names:?}"
             );
         });
     }

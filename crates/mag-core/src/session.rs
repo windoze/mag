@@ -274,9 +274,9 @@ impl SessionActor {
                 else => break,
             }
         }
-        if let DriverState::Idle(driver) = &mut self.state {
-            driver.cleanup_external_sessions(self.session_id).await;
-        }
+        // The driver (idle or handed back by a finished run) drops here, which
+        // fires the session-end cancel cascade for any still-running agent
+        // instance (`docs/dyn-agents.md` §5.2).
     }
 
     /// Pops the next deferred command, but only while the driver is idle.
@@ -473,6 +473,8 @@ fn session_thread(
             turn_complete,
             &binding,
             &overrides,
+            session_id,
+            event_bus.clone(),
         ),
         None => SessionDriver::new(
             &config,
@@ -482,6 +484,8 @@ fn session_thread(
             turn_complete,
             &binding,
             &overrides,
+            session_id,
+            event_bus.clone(),
         ),
     };
     let (run_done_tx, run_done_rx) = mpsc::unbounded_channel();

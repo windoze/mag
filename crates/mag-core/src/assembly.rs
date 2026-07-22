@@ -16,11 +16,12 @@
 //!   registry is the assembly layer's job, per `ConfigSnapshot::resolve`).
 //! - **Source registry** (`mag-sources`): one [`LlmSource`] per
 //!   `[providers.<name>]` entry plus one reserved [`LocalAgentSlot`] per
-//!   `[external_agents.<name>]` entry (decision D3). The runtime ACP delegation
-//!   wiring consumes the same config entries when each session driver is built.
-//!   ACP delegation is compiled behind this crate's default `external-acp`
-//!   feature; disabling that feature makes any `[external_agents.*]` ACP entry a
-//!   clear assembly error instead of a silent no-op.
+//!   `[external_agents.<name>]` entry (decision D3). The same config entries
+//!   are projected into spawnable agent definitions when each session driver
+//!   is built (`docs/dyn-agents.md` §3.2). ACP delegation is compiled behind
+//!   this crate's default `external-acp` feature; disabling that feature
+//!   makes any `[external_agents.*]` ACP entry a clear assembly error instead
+//!   of a silent no-op.
 //! - **Persistence** from `[session].persist_path` (a directory holding the
 //!   SQLite database file), falling back to a private in-memory store.
 //!
@@ -45,8 +46,8 @@ use agent_lib::{
     model::extras::ProviderId,
 };
 use mag_config::{
-    ApprovalPolicyKind, ConfigSnapshot, ExternalAgentKind, ProviderWire, ResolvedProvider,
-    SecretRef,
+    AgentDefinitionRegistry, ApprovalPolicyKind, ConfigSnapshot, ExternalAgentKind, ProviderWire,
+    ResolvedProvider, SecretRef,
 };
 use mag_service::{SessionBudget, SessionConfig};
 use mag_sources::{
@@ -245,6 +246,16 @@ fn reject_external_agents_without_feature(snapshot: &ConfigSnapshot) -> Result<(
     Ok(())
 }
 
+/// Names of the facade-level agent-instance tools the session driver appends
+/// to every surface (`docs/dyn-agents.md` §5.1, M3-5): `[tools.<name>]`
+/// entries for them are legitimate even though no registry plugin bears the
+/// name.
+const INSTANCE_TOOL_NAMES: [&str; 3] = [
+    crate::instances::spawn::AGENT_TOOL_NAME,
+    crate::instances::spawn::AGENT_RESULT_TOOL_NAME,
+    crate::instances::spawn::AGENT_CANCEL_TOOL_NAME,
+];
+
 /// Builds the tool registry for an engine assembled from `snapshot`
 /// (`docs/CLI.md` §4.2): the built-in minimal tool set minus every
 /// `[tools.<name>]` entry with `enabled = false`.
@@ -252,7 +263,11 @@ fn reject_external_agents_without_feature(snapshot: &ConfigSnapshot) -> Result<(
 /// A `[tools.<name>]` entry naming no registered plugin is warned about and
 /// ignored — the approval half of such an entry can never match a projected
 /// tool either, so ignoring it entirely keeps assembly robust against
-/// forward-written configuration.
+/// forward-written configuration. The `agent` / `agent_result` /
+/// `agent_cancel` instance tools ( `docs/dyn-agents.md` §5.1) are exempt from
+/// that warning: they are facade-level tools the session driver appends to
+/// every surface, so `[tools.agent]`-style entries legitimately name no
+/// registry plugin while their `approval` tiers still apply (M3-5).
 pub(crate) fn assemble_tool_registry(snapshot: &ConfigSnapshot) -> ToolRegistry {
     let builtins = ToolRegistry::with_builtins();
     let mut registry = ToolRegistry::new();
@@ -267,7 +282,9 @@ pub(crate) fn assemble_tool_registry(snapshot: &ConfigSnapshot) -> ToolRegistry 
         }
     }
     for name in snapshot.tools().keys() {
-        if !builtins.plugins().iter().any(|p| p.name() == name) {
+        if !builtins.plugins().iter().any(|p| p.name() == name)
+            && !INSTANCE_TOOL_NAMES.contains(&name.as_str())
+        {
             tracing::warn!(
                 tool = name.as_str(),
                 "tool override names no registered tool plugin; entry ignored"
@@ -280,8 +297,9 @@ pub(crate) fn assemble_tool_registry(snapshot: &ConfigSnapshot) -> ToolRegistry 
 /// Builds the `mag-sources` registry from `snapshot` (`docs/CLI.md` §4.2/§4.6):
 /// one [`LlmSource`] per provider entry and one reserved [`LocalAgentSlot`]
 /// per external-agent entry. The slots make external ACP sources listable; the
-/// live ACP delegation runtime is attached by [`SessionBinding`] and the session
-/// driver from the same snapshot entries.
+/// same entries are projected into spawnable agent definitions by
+/// [`SessionBinding`] and merged into the session driver's definition table
+/// (`docs/dyn-agents.md` §3.2).
 pub(crate) fn assemble_source_registry(snapshot: &ConfigSnapshot) -> SourceRegistry {
     let mut registry = SourceRegistry::new();
     for (name, provider) in snapshot.providers() {
@@ -440,105 +458,13 @@ pub(crate) struct SessionBinding {
     /// Effective per-run budget: explicit wire budget, else the bound entry's,
     /// else the `[session]` default; `None` when all are unset.
     budget: Option<SessionBudget>,
-    /// Local subagent delegates for the session's main agent: every configured
-    /// `agents.<name>` entry except the bound one (`docs/CLI.md` §5 P7).
-    delegates: Vec<DelegateBinding>,
-    /// Managed external ACP delegates (`external_agents.<name>`, decision D3).
-    #[cfg(feature = "external-acp")]
-    external_delegates: Vec<ExternalDelegateBinding>,
-}
-
-/// A local subagent delegate resolved from one `agents.<name>` entry
-/// (`docs/CLI.md` §5 P7: model-routed `ask_<name>` delegation).
-///
-/// Every configured agent entry except the session's own bound entry becomes a
-/// worker delegate of the session's main agent, registered through agent-lib's
-/// [`Agent::worker`](agent_lib::facade::Agent::worker) semantics: the facade
-/// synthesizes one `ask_<name>` tool per delegate and drives the child on the
-/// supervisor's shared LLM client. The delegate's model, system prompt, and
-/// tool declaration surface come from its resolved entry; its approval tiers
-/// are re-derived from the same `[approval]` / `[tools.<name>]` configuration
-/// as the main agent's by the driver.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct DelegateBinding {
-    name: String,
-    /// Human-readable description advertised to the supervising model on the
-    /// `ask_<name>` tool; falls back to a generic label derived from the name
-    /// when the entry sets no `role`.
-    description: String,
-    /// Explicitly pinned delegate model; `None` inherits the supervisor's
-    /// model (agent-lib R4 semantics).
-    model: Option<String>,
-    system_prompt: Option<String>,
-    /// Enabled tool names constraining the delegate's declaration surface;
-    /// `None` is unconstrained (every registered tool's declaration).
-    tools: Option<Vec<String>>,
-}
-
-/// A managed external ACP delegate resolved from one `external_agents.<name>`
-/// entry (`docs/CLI.md` §5 P7, decision D3).
-///
-/// The launch line is kept in argv form: the first element is the ACP binary and
-/// the remainder are arguments. Environment overrides are applied to the ACP
-/// process by the driver when it builds the registry-backed session handler.
-#[cfg(feature = "external-acp")]
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ExternalDelegateBinding {
-    name: String,
-    command: Vec<String>,
-    env: BTreeMap<String, String>,
-    capabilities: Vec<String>,
-}
-
-impl DelegateBinding {
-    /// The delegate (and `ask_<name>` tool suffix) name.
-    pub(crate) fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// The description advertised to the supervising model.
-    pub(crate) fn description(&self) -> &str {
-        &self.description
-    }
-
-    /// The pinned delegate model, when the entry sets one (`None` inherits).
-    pub(crate) fn model(&self) -> Option<&str> {
-        self.model.as_deref()
-    }
-
-    /// The delegate's system prompt, when the entry sets one.
-    pub(crate) fn system_prompt(&self) -> Option<&str> {
-        self.system_prompt.as_deref()
-    }
-
-    /// The delegate's enabled tool list: `Some(&[])` exposes no tools, `None`
-    /// leaves the declaration surface unconstrained.
-    pub(crate) fn tools(&self) -> Option<&[String]> {
-        self.tools.as_deref()
-    }
-}
-
-#[cfg(feature = "external-acp")]
-impl ExternalDelegateBinding {
-    /// The delegate (and `ask_<name>` tool suffix) name.
-    pub(crate) fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// The configured ACP launch command in argv form.
-    pub(crate) fn command(&self) -> &[String] {
-        &self.command
-    }
-
-    /// Environment overrides for the ACP child process.
-    pub(crate) fn env(&self) -> &BTreeMap<String, String> {
-        &self.env
-    }
-
-    /// Capability labels advertised by configuration.
-    pub(crate) fn capabilities(&self) -> &[String] {
-        &self.capabilities
-    }
+    /// The TOML layer of the session's agent-definition table
+    /// (`docs/dyn-agents.md` §3.2 source 4): every other configured
+    /// `agents.<name>` entry as a local definition plus every
+    /// `external_agents.<name>` ACP entry as an external one. The session
+    /// driver merges it over the builtin/user/project layers; the bound entry
+    /// itself is excluded.
+    agent_definitions: AgentDefinitionRegistry,
 }
 
 impl SessionBinding {
@@ -553,9 +479,7 @@ impl SessionBinding {
                 tools: None,
                 system_prompt: None,
                 budget: config.budget,
-                delegates: Vec::new(),
-                #[cfg(feature = "external-acp")]
-                external_delegates: Vec::new(),
+                agent_definitions: AgentDefinitionRegistry::default(),
             };
         };
 
@@ -587,43 +511,10 @@ impl SessionBinding {
             .or_else(|| entry.and_then(|agent| agent.budget()).map(session_budget))
             .or_else(|| snapshot.session_defaults().budget().map(session_budget));
 
-        // Every other configured agent entry becomes a local subagent delegate
-        // of the session's main agent (`docs/CLI.md` §5 P7); iteration over the
-        // `BTreeMap` keeps the registration order deterministic.
-        let delegates = snapshot
-            .agents()
-            .values()
-            .filter(|agent| agent.name() != agent_name)
-            .map(|agent| DelegateBinding {
-                name: agent.name().to_owned(),
-                description: agent
-                    .role()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| format!("Local subagent `{}`", agent.name())),
-                model: agent.model().map(str::to_owned),
-                system_prompt: agent.system_prompt().map(str::to_owned),
-                tools: agent.tools_list().map(|tools| {
-                    tools
-                        .iter()
-                        .filter(|tool| tool.is_enabled())
-                        .map(|tool| tool.name().to_owned())
-                        .collect()
-                }),
-            })
-            .collect();
-
-        #[cfg(feature = "external-acp")]
-        let external_delegates = snapshot
-            .external_agents()
-            .values()
-            .filter(|external| matches!(external.effective_kind(), ExternalAgentKind::Acp))
-            .map(|external| ExternalDelegateBinding {
-                name: external.name().to_owned(),
-                command: external.command().to_vec(),
-                env: external.env().cloned().unwrap_or_default(),
-                capabilities: external.capabilities().to_vec(),
-            })
-            .collect();
+        // Every other configured agent entry and every external ACP entry
+        // becomes a spawnable agent definition (`docs/dyn-agents.md` §3.2);
+        // the bound entry is excluded from its own table.
+        let agent_definitions = AgentDefinitionRegistry::from_toml_snapshot(snapshot, &agent_name);
 
         Self {
             agent_name,
@@ -631,9 +522,7 @@ impl SessionBinding {
             tools,
             system_prompt: entry.and_then(|agent| agent.system_prompt().map(str::to_owned)),
             budget,
-            delegates,
-            #[cfg(feature = "external-acp")]
-            external_delegates,
+            agent_definitions,
         }
     }
 
@@ -667,19 +556,12 @@ impl SessionBinding {
         self.budget
     }
 
-    /// The local subagent delegates resolved for the session's main agent
-    /// (`docs/CLI.md` §5 P7); empty for an engine without a configuration
-    /// backend.
-    pub(crate) fn delegates(&self) -> &[DelegateBinding] {
-        &self.delegates
-    }
-
-    /// Managed external ACP delegates resolved from `external_agents.<name>`
-    /// (`docs/CLI.md` §5 P7, decision D3); empty for an engine without a
-    /// configuration backend.
-    #[cfg(feature = "external-acp")]
-    pub(crate) fn external_delegates(&self) -> &[ExternalDelegateBinding] {
-        &self.external_delegates
+    /// The TOML layer of the session's agent-definition table
+    /// (`docs/dyn-agents.md` §3.2 source 4); empty for an engine without a
+    /// configuration backend. The session driver merges it over the
+    /// builtin/user/project layers and rebuilds it on `apply_config` (M3-5).
+    pub(crate) fn agent_definitions(&self) -> &AgentDefinitionRegistry {
+        &self.agent_definitions
     }
 }
 
@@ -1186,12 +1068,18 @@ default_agent = "main"
         );
 
         // Empty provider binds the configured default agent, which is not
-        // listed as its own delegate.
+        // listed in its own definition table.
         let binding = SessionBinding::resolve(&session_config("", "wire-model"), Some(&snapshot));
         assert_eq!(binding.agent_name(), "main");
         assert_eq!(binding.model(), Some("model-m"));
-        let names: Vec<&str> = binding.delegates().iter().map(|d| d.name()).collect();
-        assert_eq!(names, vec!["default"]);
+        assert!(
+            binding.agent_definitions().get("main").is_none(),
+            "the bound entry is excluded from its own definition table"
+        );
+        assert!(
+            binding.agent_definitions().get("default").is_some(),
+            "the other entry is a spawnable definition"
+        );
 
         // An unknown name falls back to the configured default agent.
         let binding =
@@ -1231,12 +1119,15 @@ tools = []
     }
 
     /// Every configured `agents.<name>` entry except the session's bound one
-    /// resolves into a local subagent delegate (`docs/CLI.md` §5 P7): the
-    /// delegate carries the entry's model/system/tools/role, a missing `role`
-    /// falls back to a name-derived description, and disabled tools are
-    /// filtered out exactly as on the bound entry.
+    /// projects into the binding's TOML definition layer
+    /// (`docs/dyn-agents.md` §3.2 source 4): the definition carries the
+    /// entry's model/system/tools/role, a missing `role` falls back to a
+    /// name-derived description, and disabled tools are filtered out exactly
+    /// as on the bound entry.
     #[test]
-    fn session_binding_resolves_delegates_from_the_other_agent_entries() {
+    fn session_binding_projects_definitions_from_the_other_agent_entries() {
+        use mag_config::{AgentKindDef, DefinitionSource};
+
         let snapshot = snapshot(
             r#"
 [agents.default]
@@ -1255,35 +1146,52 @@ enabled = false
 "#,
         );
 
-        // Bound to `default`: `researcher` and `helper` are delegates.
+        // Bound to `default`: `researcher` and `helper` are definitions.
         let binding = SessionBinding::resolve(&session_config("default", "m"), Some(&snapshot));
-        let delegates = binding.delegates();
-        assert_eq!(delegates.len(), 2);
-        assert_eq!(delegates[0].name(), "helper");
-        assert_eq!(delegates[0].model(), None, "no model pins: inherit");
-        assert_eq!(delegates[0].tools(), None, "no tools key: unconstrained");
-        assert_eq!(delegates[0].description(), "Local subagent `helper`");
-        assert_eq!(delegates[1].name(), "researcher");
-        assert_eq!(delegates[1].model(), Some("model-r"));
-        assert_eq!(delegates[1].system_prompt(), Some("Research thoroughly."));
+        let definitions = binding.agent_definitions();
+        assert_eq!(definitions.len(), 2);
+        let helper = definitions.get("helper").expect("helper definition");
+        assert_eq!(helper.description, "Local subagent `helper`");
         assert_eq!(
-            delegates[1].description(),
-            "Researches topics and reports findings.",
-            "the entry's role becomes the advertised description"
+            helper.kind,
+            AgentKindDef::Local {
+                model: None,
+                tools: None,
+                max_steps: None,
+            },
+            "no model/tools keys: inherit and unconstrained"
         );
+        assert_eq!(helper.source, DefinitionSource::Toml);
+        let researcher = definitions
+            .get("researcher")
+            .expect("researcher definition");
         assert_eq!(
-            delegates[1].tools(),
-            Some(&["read_file".to_owned()][..]),
-            "disabled tools are filtered from the delegate surface"
+            researcher.description,
+            "Researches topics and reports findings."
+        );
+        assert_eq!(researcher.body, "Research thoroughly.");
+        assert_eq!(
+            researcher.kind,
+            AgentKindDef::Local {
+                model: Some("model-r".to_owned()),
+                tools: Some(vec!["read_file".to_owned()]),
+                max_steps: None,
+            },
+            "disabled tools are filtered from the definition surface"
+        );
+        assert!(
+            definitions.get("default").is_none(),
+            "the bound entry is excluded from its own definition table"
         );
 
-        // Bound to `researcher`: `default` itself becomes a delegate.
+        // Bound to `researcher`: `default` itself becomes a definition.
         let binding = SessionBinding::resolve(&session_config("researcher", "m"), Some(&snapshot));
-        let names: Vec<&str> = binding.delegates().iter().map(|d| d.name()).collect();
-        assert_eq!(names, vec!["default", "helper"]);
+        assert!(binding.agent_definitions().get("default").is_some());
+        assert!(binding.agent_definitions().get("helper").is_some());
+        assert!(binding.agent_definitions().get("researcher").is_none());
 
-        // No configuration backend: no delegates.
+        // No configuration backend: no definitions.
         let binding = SessionBinding::resolve(&session_config("default", "m"), None);
-        assert!(binding.delegates().is_empty());
+        assert!(binding.agent_definitions().is_empty());
     }
 }

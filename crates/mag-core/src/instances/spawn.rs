@@ -36,7 +36,12 @@
 //! first-terminal-wins transition plus the cooperative cancel handle — and
 //! answers the instance's state after the call.
 
-use std::{convert::Infallible, fmt::Write as _, sync::Arc, time::Duration};
+use std::{
+    convert::Infallible,
+    fmt::Write as _,
+    sync::{Arc, PoisonError, RwLock},
+    time::Duration,
+};
 
 use agent_lib::{
     agent::{
@@ -105,28 +110,101 @@ your task brief.
   state your conclusions, the changes you made, the key file references
   (`path:line`), and anything left unresolved.";
 
+/// Session-wide spawn state shared by every [`InstanceSpawnContext`] of one
+/// session: the merged agent-definition table and the supervisor's effective
+/// model (`docs/dyn-agents.md` §3.2/§7).
+///
+/// Both pieces are hot-swappable behind one lock: the session driver rebuilds
+/// the definition table at config-apply time (the TOML definition layer is
+/// re-projected and re-merged), and the supervisor model follows the built
+/// agent's authoritative value at build and at every turn start (an applied
+/// `SetModel` reconfiguration lands at the turn boundary). The root
+/// supervisor's context and every child context derived from it share the
+/// same cell, so a rebuilt table takes effect for the next spawn at any depth
+/// (definitions only affect *later* spawns, M3-5).
+#[derive(Clone, Debug)]
+pub(crate) struct SharedSpawnState {
+    inner: Arc<RwLock<SpawnStateInner>>,
+}
+
+/// The swappable pair behind [`SharedSpawnState`].
+#[derive(Clone, Debug)]
+struct SpawnStateInner {
+    /// Merged definition table the `agent` tool's `type` resolves against.
+    definitions: AgentDefinitionRegistry,
+    /// The supervisor's effective model; a definition without `model`
+    /// inherits it, and `max_tokens` always aligns with it.
+    supervisor_model: ModelRef,
+}
+
+impl SharedSpawnState {
+    /// Creates the shared cell from the assembled definition table and the
+    /// supervisor's model.
+    pub(crate) fn new(definitions: AgentDefinitionRegistry, supervisor_model: ModelRef) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(SpawnStateInner {
+                definitions,
+                supervisor_model,
+            })),
+        }
+    }
+
+    /// Replaces only the definition table (config apply, M3-5).
+    pub(crate) fn set_definitions(&self, definitions: AgentDefinitionRegistry) {
+        self.lock().definitions = definitions;
+    }
+
+    /// Replaces only the supervisor model (post-build correction to the
+    /// built agent's authoritative model, and the turn-start follow of an
+    /// applied `SetModel`).
+    pub(crate) fn set_supervisor_model(&self, supervisor_model: ModelRef) {
+        self.lock().supervisor_model = supervisor_model;
+    }
+
+    /// Returns a clone of the definition named `name` (the `agent` tool's
+    /// `type` parameter).
+    pub(crate) fn definition(&self, name: &str) -> Option<AgentDefinition> {
+        self.lock().definitions.get(name).cloned()
+    }
+
+    /// Enumerates every definition for the `agent` tool's description.
+    pub(crate) fn describe_for_tool(&self) -> String {
+        self.lock().definitions.describe_for_tool()
+    }
+
+    /// Returns the supervisor's current effective model.
+    pub(crate) fn supervisor_model(&self) -> ModelRef {
+        self.lock().supervisor_model.clone()
+    }
+
+    /// Locks the cell, recovering the guard from a poisoned lock (the
+    /// codebase's unified poison-recovery policy). The guard is never held
+    /// across an `.await`.
+    fn lock(&self) -> std::sync::RwLockWriteGuard<'_, SpawnStateInner> {
+        self.inner.write().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 /// Everything the `agent` tool needs to spawn and drive one instance, shared
 /// behind an [`Arc`] between the tool handler and every drive task it starts.
 ///
 /// One context belongs to one *spawning* agent: the session's root supervisor
-/// holds the depth-`0` context (assembled by the session driver in M3-5), and
+/// holds the depth-`0` context (assembled by the session driver, M3-5), and
 /// each spawned instance gets [`child_context`](Self::child_context) — the
 /// same shared handles at depth + 1 — for its own `agent` tool, which is how
 /// nesting (§5.4) and the depth cap are implemented. The client, tool
-/// registry, approval overrides, interaction handler, and event bus are the
-/// supervisor's own handles, so a child runs on the same LLM client, tool
-/// surface, approval authority, and session event stream as its parent.
+/// registry, approval overrides, interaction handler, event bus, and shared
+/// spawn state are the supervisor's own handles, so a child runs on the same
+/// LLM client, tool surface, approval authority, definition table, and
+/// session event stream as its parent.
 #[derive(Clone)]
 pub(crate) struct InstanceSpawnContext {
     /// Instance table shared session-wide.
     pub(crate) registry: AgentInstanceRegistry,
-    /// Merged definition table the `type` parameter resolves against.
-    pub(crate) definitions: AgentDefinitionRegistry,
+    /// Swappable definition table and supervisor model, shared session-wide.
+    pub(crate) shared: SharedSpawnState,
     /// LLM client shared with the supervisor (children never build their own).
     pub(crate) client: Arc<dyn LlmClient>,
-    /// The supervisor's effective model; a definition without `model`
-    /// inherits it, and `max_tokens` always aligns with it.
-    pub(crate) supervisor_model: ModelRef,
     /// Tool plugins the child surface is projected from (the session's
     /// registry, `docs/dyn-agents.md` §7).
     pub(crate) tools: Arc<ToolRegistry>,
@@ -164,9 +242,8 @@ impl std::fmt::Debug for InstanceSpawnContext {
         formatter
             .debug_struct("InstanceSpawnContext")
             .field("registry", &self.registry)
-            .field("definitions", &self.definitions)
+            .field("shared", &self.shared)
             .field("client", &"<dyn LlmClient>")
-            .field("supervisor_model", &self.supervisor_model)
             .field("tools", &self.tools)
             .field("overrides", &self.overrides)
             .field("events", &self.events)
@@ -180,12 +257,10 @@ impl std::fmt::Debug for InstanceSpawnContext {
 /// The instance tools available on one spawning agent's tool surface: the
 /// [`AGENT_TOOL_NAME`] spawn tool (M3-3) plus the [`AGENT_RESULT_TOOL_NAME`] /
 /// [`AGENT_CANCEL_TOOL_NAME`] companions (M3-4), so the supervisor and every
-/// child surface gain the trio together (§5.1). The child surface reserves
-/// the same extension point: [`drive_local`] appends `agent_tools` of the
+/// child surface gain the trio together (§5.1). The session driver appends
+/// them to the supervisor's surface (M3-5); the child surface reserves the
+/// same extension point: [`drive_local`] appends `agent_tools` of the
 /// instance's own context after its projected plugins.
-// Wired into the session tool surface in M3-5; until then only tests and the
-// child-surface assembly below consume this.
-#[allow(dead_code)]
 pub(crate) fn agent_tools(ctx: &Arc<InstanceSpawnContext>) -> Vec<Tool> {
     vec![
         agent_tool(ctx),
@@ -207,7 +282,7 @@ fn agent_tool(ctx: &Arc<InstanceSpawnContext>) -> Tool {
          instance id and status `running`; the instance runs concurrently. Collect its report \
          with `agent_result`, cancel it with `agent_cancel`, or watch for the completion \
          notification.\n\n{}",
-        ctx.definitions.describe_for_tool()
+        ctx.shared.describe_for_tool()
     );
     let schema = json!({
         "type": "object",
@@ -259,10 +334,10 @@ fn spawn_instance(ctx: &Arc<InstanceSpawnContext>, args: Value) -> ToolResult {
         Some(_) => return ToolResult::error("`description` must be a string"),
     };
 
-    let Some(definition) = ctx.definitions.get(agent_type) else {
+    let Some(definition) = ctx.shared.definition(agent_type) else {
         return ToolResult::error(format!(
             "unknown agent type `{agent_type}`\n\n{}",
-            ctx.definitions.describe_for_tool()
+            ctx.shared.describe_for_tool()
         ));
     };
     if ctx.depth >= MAX_INSTANCE_DEPTH {
@@ -290,12 +365,7 @@ fn spawn_instance(ctx: &Arc<InstanceSpawnContext>, args: Value) -> ToolResult {
         description,
         depth,
     });
-    tokio::task::spawn_local(drive_instance(
-        Arc::clone(ctx),
-        definition.clone(),
-        instance,
-        task,
-    ));
+    tokio::task::spawn_local(drive_instance(Arc::clone(ctx), definition, instance, task));
     ToolResult::text(json!({ "id": id, "status": "running" }).to_string())
 }
 
@@ -673,14 +743,15 @@ async fn drive_local(
     let policy = apply_per_tool_tiers(policy, &ctx.overrides);
     surface.extend(agent_tools(&ctx.child_context()));
 
+    let supervisor_model = ctx.shared.supervisor_model();
     let mut builder = Agent::builder()
         .client(Arc::clone(&ctx.client))
         .model(
             model
                 .clone()
-                .unwrap_or_else(|| ctx.supervisor_model.model().to_owned()),
+                .unwrap_or_else(|| supervisor_model.model().to_owned()),
         )
-        .max_tokens(ctx.supervisor_model.max_tokens().get())
+        .max_tokens(supervisor_model.max_tokens().get())
         .max_steps(max_steps.unwrap_or(DEFAULT_INSTANCE_MAX_STEPS))
         .system(layered_system_prompt(&definition.body))
         .worktree(ctx.worktree.clone())
@@ -734,7 +805,8 @@ mod tests {
 
     use super::{
         AGENT_CANCEL_TOOL_NAME, AGENT_RESULT_TOOL_NAME, AGENT_TOOL_NAME, InstanceSpawnContext,
-        MAX_INSTANCE_DEPTH, SUBAGENT_SKELETON, agent_tools, layered_system_prompt,
+        MAX_INSTANCE_DEPTH, SUBAGENT_SKELETON, SharedSpawnState, agent_tools,
+        layered_system_prompt,
     };
     use crate::{
         EventBus, EventStream,
@@ -781,14 +853,16 @@ mod tests {
         let registry = AgentInstanceRegistry::new();
         let ctx = Arc::new(InstanceSpawnContext {
             registry: registry.clone(),
-            definitions,
-            client: client.clone() as Arc<dyn LlmClient>,
-            supervisor_model: ModelRef::new(
-                "supervisor-model",
-                NonZeroU32::new(64).expect("non-zero"),
-                None,
-                None,
+            shared: SharedSpawnState::new(
+                definitions,
+                ModelRef::new(
+                    "supervisor-model",
+                    NonZeroU32::new(64).expect("non-zero"),
+                    None,
+                    None,
+                ),
             ),
+            client: client.clone() as Arc<dyn LlmClient>,
             tools: Arc::new(tools),
             overrides: ApprovalOverrides::default(),
             interaction: ipc.clone(),
@@ -806,8 +880,8 @@ mod tests {
         }
     }
 
-    /// A supervisor facade agent whose only tool is `agent` (the surface the
-    /// session driver will assemble in M3-5).
+    /// A supervisor facade agent whose only tool is `agent` (mirroring the
+    /// surface the session driver assembles, M3-5).
     fn supervisor_agent(rig: &TestRig) -> Agent {
         let mut builder = Agent::builder()
             .client(rig.client.clone() as Arc<dyn LlmClient>)

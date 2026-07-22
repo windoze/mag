@@ -863,7 +863,7 @@ register（`tokio::test` 多 task）。门禁全绿。
      `StreamGate` 的 stub 工具用法（其 rustdoc 预留的第二种用途）卡住 child 的工具执行
      来控制完成时机。
 
-### M3-5 [TODO] mag-core：driver 接线 + 静态委派退役 + 审批 tier + cancel 级联
+### M3-5 [DONE] mag-core：driver 接线 + 静态委派退役 + 审批 tier + cancel 级联
 
 **目标**：把三工具接入 supervisor 工具面，删除旧静态委派路径，迁移审批语义。
 
@@ -902,6 +902,153 @@ register（`tokio::test` 多 task）。门禁全绿。
 - 既有测试（除本任务删除/改写的 delegation 旧测试外）全绿；新增：session 启动后 supervisor
   工具面含三工具；`[tools.agent] approval="deny"` 时 spawn 被拒；restore 旧 snapshot 不崩。
 - 门禁序列全绿。
+
+**完成记录**（2026-07-22）：
+
+- 改动（`crates/mag-core/src/`，另 `crates/mag/tests/engine_cli.rs`；无新依赖）：
+  - `driver.rs`：
+    - `SessionDriver` 新状态：`spawn_ctx: Arc<InstanceSpawnContext>`（depth=0 root ctx：
+      会话级 `AgentInstanceRegistry::new()`、`SharedSpawnState`（四层定义表 + supervisor
+      `ModelRef`）、共享 `Arc<dyn LlmClient>` clone、`Arc<ToolRegistry>`、
+      `ApprovalOverrides`、`Arc<IpcApproval>`、EventBus、session_id、worktree（session cwd，
+      缺省 `"."`））+ `cwd` 字段（apply_config 重读 project 定义目录用）。build 后回读
+      `agent.state().current_model()` 校正 cell（restore 时快照模型才是权威值）。
+    - `tool_surface` 追加 `agent_tools(root_ctx)`（插件投影之后、per-tool tiers 之前——
+      三工具默认继承策略默认 tier，无 derived gate（§7）；`[tools.agent]` 等经既有
+      `apply_per_tool_tiers` 生效）。`assemble_agent_definitions`（新自由函数）：
+      builtin → user dir（`default_user_agents_dir`）→ project dir（`project_agents_dir(cwd)`）
+      → TOML 层逐级 `merge`；目录层 IO 错误 warn + 跳过（缺失目录 = 空层）。
+    - 退役面全删：本地/external delegate 注册循环（new/restore 各一）、`delegate_worker`、
+      `external_acp_delegate`、`split_external_command`、`external_worktree_root`、
+      `apply_delegate_start_tiers` + `delegate_start_tool_name`、
+      `TrackedExternalSessionHandler` + `external_handlers` 字段 +
+      `cleanup_external_sessions`（session.rs 调用点同步删——该机制只服务静态 external
+      委派，随其整体退役）。
+    - **restore 保留 `.prune_unregistered_delegates()`（偏差 1）**：零 re-registration 下它
+      是纯单向旧名册清扫。
+    - cancel 级联：`run_turn` 两条 Cancelled 路径（stream 建立失败的早退 + 循环终态）都
+      `registry.cancel_all()`（Completed/Failed 不级联——spawn 是异步的，实例可合法存活过
+      本 turn）；`impl Drop for SessionDriver` 做 session 结束级联（实例永不跨会话存活）。
+    - `apply_config`：`set_definitions` 重建定义表（**全部四层重建**，目录层重读——见偏差
+      2）；supervisor model 经"镜像排队的 SetModel"更新（facade reconfigure 只排队、turn
+      边界才落地，且 `AgentRunStream` 无 state 访问器、stream 持有 `&mut agent` 无法回读——
+      镜像值与请求同源构造；facade 对 `SetModel` 的 admission 只拒 blank model/非有限
+      temperature/provider_extras 不匹配，本 driver 构造路径三者均不可能）。注释（
+      new/restore/tool_surface/apply_config/`project_tool_plugins`）同步改写。
+    - `reconfig_requests` 的 `ReplaceToolSet` 投影追加三工具声明（`agent_tools(&spawn_ctx)`
+      `.declaration()`）——surface 收窄不再剥离实例面（对齐旧 ask_ 面"收窄不剥 delegation"
+      语义），且顺带用新定义表刷新 `agent` 描述。
+  - `assembly.rs`：`DelegateBinding`/`ExternalDelegateBinding` 及访问器、resolve 的两段
+    delegate 映射全删；`SessionBinding` 改产 `agent_definitions: AgentDefinitionRegistry`
+    （= `from_toml_snapshot(snapshot, bound)` 的 TOML 层，无配置后端时为空）+ 访问器；
+    `assemble_tool_registry` 的"未知名 warn"豁免三工具名（它们是 facade 级工具，
+    `[tools.agent]` 是合法条目）；模块/字段注释同步。
+  - `instances.rs`：`mod spawn` 提 `pub(crate)`；移除 `AgentInstanceRegistry::new` /
+    `cancel_all` 的条目级 `#[allow(dead_code)]`（`drain_notifications` 的保留，M3-6 消费）；
+    模块文档更新。
+  - `instances/spawn.rs`：`InstanceSpawnContext` 的 `definitions` + `supervisor_model` 两
+    字段合并为 `shared: SharedSpawnState`（新类型：`Arc<RwLock>` 可换 cell，poison 恢复，
+    锁不跨 await；`set_definitions`（apply_config）/`set_supervisor_model`（build 校正 +
+    apply 镜像）/`definition()`（clone）/`describe_for_tool()`/`supervisor_model()`）；
+    移除 `agent_tools` 的 `#[allow(dead_code)]`；root 与 child ctx 共享同一 cell（定义表
+    重建对任意深度的后续 spawn 生效）。
+  - `session.rs`：`session_thread` 向 `SessionDriver::new`/`restore` 传 `session_id` +
+    `event_bus.clone()`；删 actor 收尾的 `cleanup_external_sessions` 调用（driver Drop 即
+    级联）。
+- 审批验证结论（任务单第 4 点）：agent-lib `facade/approval.rs` 的 `Approval::ask`
+  decider 返回类型 `ApprovalDecision`（`agent/approval.rs:76`）**只有
+  `Approve / Deny / Timeout / Cancel` 四变体，无 Ask/暂停变体**（暂停语义由
+  `ApprovalKind::Ask` tier 自身表达，decider 只返回决定）→ 本任务只做 per-tool tier，
+  per-type（`agent:<type>`）记入 follow-up（设计 §7 的既定偏差）。per-tool 实测语义：
+  `[tools.agent] approval="deny"` 在 mag 恒注入 interaction handler 下仍**暂停**经
+  IpcApproval，界面答 Deny 后 spawn 被拒（denied tool result 回馈模型，无实例无事件）。
+- external 旧组装参数记录（M4-1 按新机制重建时对照；全部随 `external_acp_delegate`
+  删除）：
+  - spec：`ManagedExternalAgent::acp(binary, args).session_handler(handler)` +
+    `.worktree(cwd)`（session cwd 存在时）；argv 首元素为 binary；
+  - handler：`AcpConfig::new(binary, args).with_timeout(120s)` + 逐项
+    `with_env(k, v)`（delegate env 覆盖）+ `with_working_dir(cwd)`；
+    `ExternalSessionRegistry::with_worktree_manager(Arc::new(AcpAdapter::new(acp_config)),
+    GitWorktreeManager::new().with_root(temp_dir/mag-external-worktrees-{pid}-{counter}))`；
+    `RegistryExternalSessionHandler::new(registry)` 外包 `TrackedExternalSessionHandler`
+    （记录每次 drive 的 child `AgentId`，session 结束逐 id `registry.cleanup_agent` 清扫
+    completed 常驻 session）；
+  - tier：start 工具 `ask_<name>` 默认 ask（`apply_delegate_start_tiers`），
+    `[tools.ask_<name>]` 覆盖最终生效；
+  - 事件：facade `DelegationStarted/Finished/Failed/Message` 经 `map_wire_event` 投影（该
+    投影与 `delegation_trace_from_wire`/`delegation_message_from_wire` 保留——wire 契约
+    与 history 投影的既有形状；facade 在零 delegate 下不再产生这些事件）。
+  - 新机制下 M4-1 应改用 M1-1 的 `run_external_once` 一次性语义（进程随终态回收，无需
+    tracked-handler 常驻清扫）。
+- 测试：
+  - 新增 driver 级 4 项：`new_exposes_the_agent_instance_tools`（surface 含三工具、
+    `agent` 描述枚举 builtin 定义）、`apply_config_rebuilds_the_definition_table_for_later_spawns`
+    （apply 后 researcher 定义可解析 + model cell 镜像 model-b + 下一请求确实落到
+    model-b）、`restore_sweeps_legacy_delegates_from_an_old_snapshot`（向真实快照 JSON
+    注入 legacy delegate 配方 + `ask_legacy` 声明——typed 形状取自快照自身；restore 不
+    崩、surface 无 ask_legacy、`subagents()` 为空、三工具在面）、
+    `drop_cancels_all_running_instances`（Drop 级联：实例转 Cancelled、cancel handle
+    已触发）。
+  - 新增 engine 级 4 项：`supervisor_surface_exposes_the_instance_tools_and_definitions`
+    （session 启动后 surface 含三工具、无 `ask_*`（`ask_user` 除外）、描述枚举
+    general-purpose/explorer/researcher 三层来源）、`agent_spawn_denied_by_the_per_tool_tier`
+    （deny 暂停 → 答 Deny → 无 AgentInstanceStarted、denied result（ToolStatus::Denied）
+    回馈、run 正常收尾）、`supervisor_run_cancel_cascades_to_running_instances`（child
+    卡在 gated stub 工具内确证 Running；cancel → RunError(Cancelled) +
+    AgentInstanceFinished(Cancelled)，顺序不限）、
+    `resume_restores_the_instance_surface_and_spawns_definitions`（persist 模块：重启
+    resume 不崩、surface 有三工具无 ask_*、TOML 层 researcher 定义可 spawn 并
+    Completed(report)——实例可存活过 turn，Finished 事件单独等）。
+  - 旧测试处置：engine.rs `mod delegation` 十个退役测试全删（生命周期/审批 pop/拒绝与
+    批准 start/resume 重注册/apply 保 ask_ 面/prune/external 三件套），保留的 sources
+    listing 测试独立为 `mod external_sources`；`engine/approval.rs` 的
+    `delegate_interaction_pops_to_root_with_origin_and_resumes_on_response` 删（唯一直接
+    用 `builder.subagent` 处；同语义已由 M3-3
+    `child_approval_bubbles_to_root_with_origin_and_resumes` 覆盖），origin 路由两测试
+    （`with_origin` 直接标注，不依赖静态委派）保留；persist 模块历史测试改写为
+    `get_session_history_restores_messages_and_tools_after_restart`（去掉 ask_researcher
+    生产路径——`history.rs` 的 Delegation 投影保留为只读旧数据，但已无活 producer，
+    其 live-producer 覆盖待 M5-1 e2e）；driver.rs 四个 config-apply 断言补三工具名；
+    assembly.rs 两 delegate 测试改写为定义层投影断言；`crates/mag/tests/engine_cli.rs`
+    两测试改写（dialog+reload 保留、delegation 腿删除并补三工具面断言；external+resume
+    改为纯 `/resume` 流程，fake-acp 基建删除——CLI 对 `AgentInstance*` 事件尚无渲染
+    （`_ => {}`），实例面 CLI e2e 待 M5-1）。
+  - `session_binding::explicit_empty_tool_list_builds_a_tool_less_session` 等三个
+    engine 断言补三工具（`tools = []` 现剩三工具——语义文档同步）。
+- 门禁结果：`cargo fmt --all -- --check` ✅；聚焦测试（driver 20、instances::spawn 16 +
+  registry 9、assembly 12、engine::instances 3、engine::persist 6、mag engine_cli 4）✅；
+  `cargo clippy --all-targets -- -D warnings` ✅（0 warning，另 `--no-default-features`
+  check ✅）；`cargo test --workspace` ✅（32 套件 375 passed 0 failed）；
+  `cargo doc --no-deps --workspace` ✅（mag-config 1 个既有 rustdoc warning，同
+  M3-1..M3-4 记录，与本任务无关）。
+- grep 验证（mag workspace，agent-lib 不查）：`.subagent(` 0 命中；`DelegateBinding` 0
+  命中；`ask_` 命中均为活机制（`ask_tool`/`ask_user`/`ApprovalPolicyKind::Ask`）、
+  `history.rs:184` 的保留投影、restore 注释与 legacy 测试夹具；`prune_unregistered` 2
+  命中（driver.rs restore 的调用 + rustdoc，见偏差 1）。
+- 偏差：
+  1. **`.prune_unregistered_delegates()` 保留在 restore**（任务单退役清单与 grep 验证把它
+     列入删除）：实证（agent-lib `facade/agent/snapshot.rs:800-843` rustdoc + restore
+     build 语义）不 re-register 且不 prune 时持久化 delegate 以 auto_allow **复活**（违背
+     "旧 delegate 静默消失"且静默放开审批）；清空 snapshot 字段则 agent_state 里的
+     `ask_<name>` 声明失去执行体，`ensure_restored_tool_surface` 直接 InvalidState（违背
+     "确认不崩"）。prune 是 agent-lib 当前表面上唯一同时满足两者的机制；零
+     re-registration 下它只删不建，不构成静态委派机制的延续。driver.rs:289-294/354-359
+     注释如实记录。
+  2. `apply_config` 重建**全部四层**定义表（任务单写"重建 TOML 层并重 merge"）：单一
+     `assemble_agent_definitions` 代码路径复用于构建与 apply，目录层重读属无害超集
+     （还能拾取定义文件编辑）。
+  3. supervisor model 经 apply_config 镜像排队的 `SetModel`（而非 facade 状态回读）：
+     facade reconfigure 只排队、turn 边界落地，stream 持有 `&mut agent` 且 `AgentRunStream`
+     无 state 访问器；镜像值与请求同源（`ModelRef::new(model, current.max_tokens(),
+     current.temperature(), None)`），facade 对 `SetModel` 的 admission 拒绝情形本
+     driver 均不可能产生。
+  4. supervisor 面 `agent` 工具描述在 build 时烘焙；apply_config 换定义表只影响 handler
+     侧解析（任务单语义即"只影响后续 spawn"），描述文本仅在 `ReplaceToolSet` 触发时
+     （`agents.<name>.tools` 有配）随之刷新——纯展示层限制，记录在案。
+  5. CLI（`mag-cli`）对 `AgentInstanceStarted/Finished` 尚无渲染（`_ => {}` 忽略）；两
+     个 CLI e2e 的 delegation 腿删除而非改写（M5-1 补齐新机制 CLI e2e）。
+  6. 附带修复：driver 测试 helper 的 `EventBus` 现与 `IpcApproval` 共享同一实例（原各自
+     新建）——root ctx 与审批事件同源。
 
 ### M3-6 [TODO] mag-core：完成通知推送（pivot 通道 + 空闲缓冲）
 

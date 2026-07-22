@@ -487,7 +487,7 @@ mod tests {
         convert::Infallible,
         sync::{
             Arc,
-            atomic::{AtomicBool, AtomicUsize, Ordering},
+            atomic::{AtomicUsize, Ordering},
         },
         task::Poll,
     };
@@ -501,7 +501,7 @@ mod tests {
         },
         client::LlmClient,
         conversation::ToolCallId,
-        facade::{Agent, Approval, ApprovalPolicy, CancelHandle, Tool, ToolContext, ToolDecl},
+        facade::{Agent, Approval, CancelHandle, Tool, ToolContext},
         model::usage::Usage,
     };
     use async_trait::async_trait;
@@ -1233,95 +1233,5 @@ mod tests {
             }
             other => panic!("expected delegate-a's approval result, got {other:?}"),
         }
-    }
-
-    /// Builds the data-only `shell` tool declaration a worker advertises.
-    fn shell_decl() -> ToolDecl {
-        ToolDecl {
-            name: "shell".to_owned(),
-            description: "Run a shell command.".to_owned(),
-            input_schema: json!({ "type": "object" }),
-        }
-    }
-
-    #[tokio::test]
-    async fn delegate_interaction_pops_to_root_with_origin_and_resumes_on_response() {
-        let events = EventBus::new();
-        let ipc = Arc::new(IpcApproval::new(
-            session_id(),
-            events.clone(),
-            Arc::new(AskFrontendDecider),
-        ));
-        let mut subscriber = events.subscribe();
-
-        // Scripted two-level scenario (`docs/CLI.md` §3.3): the supervisor
-        // delegates to `reviewer`; the reviewer's first step calls its gated
-        // `shell` tool, pausing through the supervisor-injected `IpcApproval`;
-        // once answered, the reviewer reports back and the supervisor closes
-        // the turn. Scripts pop strictly in this order.
-        let client = FakeLlmClient::scripted(vec![
-            tool_use_stream(
-                "ask_reviewer",
-                "del-1",
-                json!({ "task": "inspect the tree" }),
-            ),
-            tool_use_stream("shell", "child-shell-1", json!({ "cmd": "ls" })),
-            text_stream_with_usage(&["I could not run shell; reporting from memory."], usage()),
-            text_stream_with_usage(&["Final: done."], usage()),
-        ]);
-
-        // The child's policy gates `shell`; its synchronous fallback decider
-        // must never run because the root session's handler answers the pause.
-        let child_decider_consulted = Arc::new(AtomicBool::new(false));
-        let probe = child_decider_consulted.clone();
-        let child_approval = ApprovalPolicy::new(Approval::ask(move |request| {
-            if request.tool_name == "shell" {
-                probe.store(true, Ordering::SeqCst);
-            }
-            ApprovalDecision::Deny
-        }));
-        let reviewer = Agent::worker()
-            .system("You are the REVIEWER.")
-            .tool_declarations(vec![shell_decl()])
-            .approval(child_approval)
-            .build()
-            .expect("worker builds");
-
-        let mut agent = Agent::builder()
-            .client(client.clone() as Arc<dyn LlmClient>)
-            .model("test-model")
-            .max_tokens(64)
-            .approval(Approval::auto_allow())
-            .interaction_handler(ipc.clone() as Arc<dyn InteractionHandler>)
-            .subagent("reviewer", reviewer)
-            .build()
-            .expect("build supervisor agent");
-
-        let mut stream = agent
-            .stream("Delegate an inspection.".to_owned())
-            .await
-            .expect("stream");
-        let (request_id, origin) = drive_until_interaction(&mut stream, &mut subscriber).await;
-
-        // The delegate's pause pops on the root session's event stream with
-        // full attribution: delegate name and depth 1.
-        assert_eq!(origin.delegate.as_deref(), Some("reviewer"));
-        assert_eq!(origin.depth, 1);
-        assert!(!origin.is_root());
-
-        ipc.respond(request_id, approval_response(ApprovalDecisionWire::Deny))
-            .expect("respond deny");
-
-        drain(&mut stream).await;
-        assert!(
-            !child_decider_consulted.load(Ordering::SeqCst),
-            "the child policy gates the call, but the root handler answers it"
-        );
-        assert_eq!(
-            client.chat_requests().len() + client.stream_requests().len(),
-            4,
-            "the answered delegate resumed, reported back, and the supervisor \
-             consumed every scripted step"
-        );
     }
 }
