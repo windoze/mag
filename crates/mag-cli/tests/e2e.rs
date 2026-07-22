@@ -4,6 +4,7 @@
 //! in-memory stdin/stdout pipes. They cover the M6 CLI contracts without a
 //! real terminal, network, credentials, or LLM.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -15,8 +16,8 @@ use mag_service::{
     AgentIdWire, ApprovalDecisionWire, ApprovalRequirementWire, ConfigDto, DelegationMessageWire,
     DelegationStatusWire, DelegationTrace, HistoryEntry, InteractionKindWire, InteractionOrigin,
     InteractionResponseWire, MagService, PermissionCategoryWire, PermissionDecisionWire,
-    PermissionRiskWire, RequestId, RoutingMode, RunId, RunOutput, ServiceError, ServiceEvent,
-    SessionConfig, SessionId, SessionInfo, SourceInfo, SourceKindWire, ToolCallIdWire, UsageInfo,
+    PermissionRiskWire, RequestId, RunId, RunOutput, ServiceError, ServiceEvent,
+    SessionId, SessionInfo, SourceInfo, SourceKindWire, ToolCallIdWire, UsageInfo,
     UserInput,
 };
 use serde_json::json;
@@ -66,7 +67,7 @@ struct ScriptedService {
     reload_config_calls: Arc<Mutex<usize>>,
     apply_config_calls: Arc<Mutex<usize>>,
     create_count: Arc<Mutex<usize>>,
-    create_configs: Arc<Mutex<Vec<SessionConfig>>>,
+    create_agents: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 impl ScriptedService {
@@ -88,7 +89,7 @@ impl ScriptedService {
             reload_config_calls: Arc::new(Mutex::new(0)),
             apply_config_calls: Arc::new(Mutex::new(0)),
             create_count: Arc::new(Mutex::new(0)),
-            create_configs: Arc::new(Mutex::new(Vec::new())),
+            create_agents: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -155,8 +156,8 @@ impl ScriptedService {
         Arc::clone(&self.apply_config_calls)
     }
 
-    fn create_configs(&self) -> Arc<Mutex<Vec<SessionConfig>>> {
-        Arc::clone(&self.create_configs)
+    fn create_agents(&self) -> Arc<Mutex<Vec<Option<String>>>> {
+        Arc::clone(&self.create_agents)
     }
 
     fn emit_interaction_script(&self, id: SessionId) {
@@ -303,21 +304,14 @@ approval = "ask"
     .expect("scripted config parses")
 }
 
-fn scripted_session_config(provider: &str, model: &str) -> SessionConfig {
-    SessionConfig {
-        provider: provider.to_owned(),
-        model: model.to_owned(),
-        tool_profile: None,
-        cwd: None,
-        routing: RoutingMode::default(),
-        budget: None,
-    }
-}
-
 #[async_trait]
 impl MagService for ScriptedService {
-    async fn create_session(&self, config: SessionConfig) -> Result<SessionId, ServiceError> {
-        self.create_configs.lock().expect("lock").push(config);
+    async fn create_session(
+        &self,
+        _cwd: Option<PathBuf>,
+        agent: Option<String>,
+    ) -> Result<SessionId, ServiceError> {
+        self.create_agents.lock().expect("lock").push(agent);
         let mut count = self.create_count.lock().expect("lock");
         *count += 1;
         let id = if *count == 1 { SESSION_A } else { SESSION_B };
@@ -329,11 +323,13 @@ impl MagService for ScriptedService {
         Ok(vec![
             SessionInfo::new(
                 SessionId::parse_str(SESSION_A).expect("valid session id"),
-                scripted_session_config("openai", "gpt-5-codex"),
+                "openai".to_owned(),
+                None,
             ),
             SessionInfo::new(
                 SessionId::parse_str(SESSION_B).expect("valid session id"),
-                scripted_session_config("anthropic", "claude-sonnet"),
+                "anthropic".to_owned(),
+                None,
             ),
         ])
     }
@@ -538,14 +534,8 @@ impl MagService for ScriptedService {
 
 fn options() -> CliOptions {
     CliOptions {
-        session: SessionConfig {
-            provider: "openai".to_owned(),
-            model: "gpt-5-codex".to_owned(),
-            tool_profile: None,
-            cwd: None,
-            routing: RoutingMode::default(),
-            budget: None,
-        },
+        agent: Some("openai".to_owned()),
+        cwd: None,
         resume: None,
         prompt: "mag> ".to_owned(),
     }
@@ -671,16 +661,16 @@ async fn slash_new_creates_and_switches_to_a_new_session() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slash_new_with_agent_passes_the_agent_binding() {
     let service = Arc::new(ScriptedService::new());
-    let create_configs = service.create_configs();
+    let create_agents = service.create_agents();
 
     let output = drive("/new reviewer\n/quit\n", service).await;
 
     assert!(output.contains(SESSION_A), "{output}");
     assert!(output.contains(SESSION_B), "{output}");
-    let create_configs = create_configs.lock().expect("lock").clone();
-    assert_eq!(create_configs.len(), 2);
-    assert_eq!(create_configs[0].provider, "openai");
-    assert_eq!(create_configs[1].provider, "reviewer");
+    let create_agents = create_agents.lock().expect("lock").clone();
+    assert_eq!(create_agents.len(), 2);
+    assert_eq!(create_agents[0].as_deref(), Some("openai"));
+    assert_eq!(create_agents[1].as_deref(), Some("reviewer"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1172,13 +1162,11 @@ async fn slash_commands_call_the_matching_service_methods() {
     .await;
 
     assert!(
-        output.contains(&format!("* {SESSION_A} provider=openai model=gpt-5-codex")),
+        output.contains(&format!("* {SESSION_A} agent=openai")),
         "{output}"
     );
     assert!(
-        output.contains(&format!(
-            "  {SESSION_B} provider=anthropic model=claude-sonnet"
-        )),
+        output.contains(&format!("  {SESSION_B} agent=anthropic")),
         "{output}"
     );
     assert!(
@@ -1288,8 +1276,12 @@ impl EndingStreamService {
 
 #[async_trait]
 impl MagService for EndingStreamService {
-    async fn create_session(&self, config: SessionConfig) -> Result<SessionId, ServiceError> {
-        self.inner.create_session(config).await
+    async fn create_session(
+        &self,
+        cwd: Option<PathBuf>,
+        agent: Option<String>,
+    ) -> Result<SessionId, ServiceError> {
+        self.inner.create_session(cwd, agent).await
     }
 
     async fn list_sessions(&self) -> Result<Vec<SessionInfo>, ServiceError> {

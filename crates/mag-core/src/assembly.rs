@@ -49,7 +49,7 @@ use mag_config::{
     AgentDefinitionRegistry, ApprovalPolicyKind, ConfigSnapshot, ExternalAgentKind, ProviderWire,
     ResolvedProvider, SecretRef,
 };
-use mag_service::{SessionBudget, SessionConfig};
+use mag_service::{ServiceError, SessionBudget};
 use mag_sources::{
     Credentials, LlmSource, LocalAgentKind, LocalAgentSlot, Secret, SourceError, SourceRegistry,
 };
@@ -67,6 +67,13 @@ use crate::{
 /// fallback keeps ACP's placeholder provider label and legacy free-form
 /// labels working).
 pub(crate) const DEFAULT_AGENT_NAME: &str = "default";
+
+/// Last-resort model used only by a session on a **snapshot-less** engine (the
+/// test-only `Engine::with_llm_client` scaffolding): with no configuration there
+/// is no `[agents.<name>].model` to bind. A configuration-backed session never
+/// reaches this fallback — [`Engine::create_session`] rejects a bound local
+/// template that has no usable model before the driver is built.
+pub(crate) const DEFAULT_MODEL: &str = "gpt-5-codex";
 
 /// Effective default agent name for a snapshot: the configured
 /// `[session].default_agent` when set, else the well-known `default` entry.
@@ -441,22 +448,22 @@ fn open_session_store(
     }
 }
 
-/// The session ↔ agent binding resolved from a wire [`SessionConfig`] and the
+/// The session ↔ agent binding resolved from a bound agent-template name and the
 /// current configuration snapshot (`docs/CLI.md` §4.4; see the
 /// [`Engine::from_config`] rustdoc for the full contract).
 ///
 /// A binding is resolved every time a session actor spawns — on `create_session`
 /// and on `resume_session` — so a session (re)built after a configuration
-/// update picks up the current snapshot. Fields left unset by the bound entry
-/// are `None`, and the caller falls back to the wire `SessionConfig` values.
+/// update picks up the current snapshot. Every field is sourced from the bound
+/// `[agents.<name>]` template; there are no per-session wire overrides.
 #[derive(Clone, Debug)]
 pub(crate) struct SessionBinding {
     agent_name: String,
     model: Option<String>,
     tools: Option<Vec<String>>,
     system_prompt: Option<String>,
-    /// Effective per-run budget: explicit wire budget, else the bound entry's,
-    /// else the `[session]` default; `None` when all are unset.
+    /// Effective per-run budget: the bound entry's, else the `[session]`
+    /// default; `None` when both are unset.
     budget: Option<SessionBudget>,
     /// The TOML layer of the session's agent-definition table
     /// (`docs/dyn-agents.md` §3.2 source 4): every other configured
@@ -473,23 +480,36 @@ pub(crate) struct SessionBinding {
 }
 
 impl SessionBinding {
-    /// Resolves the binding for `config` against `snapshot` (`None` for an
-    /// engine without a configuration backend — every field falls back to the
-    /// wire `SessionConfig`).
-    pub(crate) fn resolve(config: &SessionConfig, snapshot: Option<&ConfigSnapshot>) -> Self {
+    /// Resolves the binding for the agent-template named `agent` (`None` uses the
+    /// configured `[session].default_agent`, else the built-in `default`) against
+    /// `snapshot` (`None` for an engine without a configuration backend — the
+    /// binding is the bare default-agent name with no template fields).
+    ///
+    /// This is deliberately infallible and tolerant: an `agent` naming no
+    /// configured template falls back to the default agent (logged at warn),
+    /// because it also runs on `resume_session` and `apply_config` where the
+    /// configuration may have drifted since the session was created. Strict
+    /// validation of the requested template (existence, a usable model) happens
+    /// once at [`Engine::create_session`], which can surface a
+    /// [`ServiceError`](mag_service::ServiceError).
+    pub(crate) fn resolve(agent: Option<&str>, snapshot: Option<&ConfigSnapshot>) -> Self {
         let Some(snapshot) = snapshot else {
             return Self {
-                agent_name: DEFAULT_AGENT_NAME.to_owned(),
+                agent_name: agent
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(DEFAULT_AGENT_NAME)
+                    .to_owned(),
                 model: None,
                 tools: None,
                 system_prompt: None,
-                budget: config.budget,
+                budget: None,
                 agent_definitions: AgentDefinitionRegistry::default(),
                 default_subagent_tools: None,
             };
         };
 
-        let requested = config.provider.trim();
+        let requested = agent.map(str::trim).unwrap_or_default();
         let default_name = default_agent_name(snapshot);
         let agent_name = if requested.is_empty() {
             default_name.to_owned()
@@ -497,7 +517,7 @@ impl SessionBinding {
             requested.to_owned()
         } else {
             tracing::warn!(
-                provider = requested,
+                agent = requested,
                 fallback = default_name,
                 "session binding names no configured agent entry; falling back to the default agent"
             );
@@ -512,9 +532,9 @@ impl SessionBinding {
                 .map(|tool| tool.name().to_owned())
                 .collect::<Vec<_>>()
         });
-        let budget = config
-            .budget
-            .or_else(|| entry.and_then(|agent| agent.budget()).map(session_budget))
+        let budget = entry
+            .and_then(|agent| agent.budget())
+            .map(session_budget)
             .or_else(|| snapshot.session_defaults().budget().map(session_budget));
 
         // Every other configured agent entry and every external ACP entry
@@ -582,6 +602,67 @@ impl SessionBinding {
     }
 }
 
+/// Validates a create-session request against `snapshot` and returns the
+/// resolved agent-template name to persist and bind (`docs/CLI.md` §4.4).
+///
+/// Unlike [`SessionBinding::resolve`], this is **strict**: it is called once at
+/// [`Engine::create_session`], where a bad request can be reported cleanly as a
+/// [`ServiceError`] instead of silently degrading a live session.
+///
+/// - `agent` `None`/empty → the configured default agent name (never rejected;
+///   a config with no `[agents.default]` is a degenerate setup the caller still
+///   allows, matching the clientless engine's behaviour).
+/// - `agent` naming a configured **local** `[agents.<name>]` template → that
+///   name, provided the template resolves a usable `model` (an
+///   [`ServiceError::InvalidInput`] otherwise).
+/// - `agent` naming a configured **external** `[external_agents.<name>]`
+///   template → that name, with no model requirement.
+/// - `agent` naming no configured template → [`ServiceError::InvalidInput`].
+pub(crate) fn validate_agent_binding(
+    agent: Option<&str>,
+    snapshot: &ConfigSnapshot,
+) -> Result<String, ServiceError> {
+    let requested = agent.map(str::trim).unwrap_or_default();
+    // An empty request resolves to the configured default agent; the two paths
+    // then validate the resolved name identically, except that a *completely
+    // absent* default entry is tolerated (a degenerate config with no
+    // `[agents.default]`, matching the clientless engine's fallback) whereas an
+    // explicitly named non-existent template is rejected.
+    let is_default = requested.is_empty();
+    let name = if is_default {
+        default_agent_name(snapshot)
+    } else {
+        requested
+    };
+
+    if let Some(entry) = snapshot.agent(name) {
+        if entry.model().is_none() {
+            return Err(ServiceError::InvalidInput {
+                message: format!(
+                    "agent `{name}` has no model configured; set `model` on \
+                     `[agents.{name}]` or bind a different agent"
+                ),
+            });
+        }
+        return Ok(name.to_owned());
+    }
+    if snapshot.external_agent(name).is_some() {
+        return Ok(name.to_owned());
+    }
+    if is_default {
+        // No `[agents.<default>]` entry at all: a degenerate config the caller
+        // still allows (the session binds the bare default name and the driver
+        // uses its last-resort model).
+        return Ok(name.to_owned());
+    }
+    Err(ServiceError::InvalidInput {
+        message: format!(
+            "agent `{name}` names no configured `[agents.{name}]` or \
+             `[external_agents.{name}]` template"
+        ),
+    })
+}
+
 /// Projects a resolved configuration [`Budget`](mag_config::Budget) onto the
 /// wire [`SessionBudget`] shape `SessionDriver` already consumes.
 fn session_budget(budget: mag_config::Budget) -> SessionBudget {
@@ -647,7 +728,7 @@ mod tests {
     };
 
     use mag_config::ConfigDto;
-    use mag_service::{MagService, RoutingMode, ServiceError, UserInput};
+    use mag_service::{MagService, ServiceError, UserInput};
 
     use super::*;
 
@@ -695,16 +776,6 @@ mod tests {
         ConfigSnapshot::resolve(&dto, 0).expect("config resolves")
     }
 
-    fn session_config(provider: &str, model: &str) -> SessionConfig {
-        SessionConfig {
-            provider: provider.to_owned(),
-            model: model.to_owned(),
-            tool_profile: None,
-            cwd: None,
-            routing: RoutingMode::ModelRouted,
-            budget: None,
-        }
-    }
 
     /// The `docs/CLI.md` §4.2 example config, with the secret pointed at a
     /// test-only environment variable.
@@ -829,7 +900,7 @@ command = ["peer-agent", "--acp"]
         assert!(engine.sources().llm_sources().is_empty());
         assert!(engine.sources().local_agents().is_empty());
         let session = engine
-            .create_session(session_config("default", "any-model"))
+            .create_session(None, None)
             .await
             .expect("create session");
         let error = engine
@@ -918,7 +989,7 @@ model = "gpt-5-codex"
 
         let engine = Engine::from_config(service).expect("assembles");
         engine
-            .create_session(session_config("default", "any-model"))
+            .create_session(None, None)
             .await
             .expect("create session");
 
@@ -941,7 +1012,7 @@ model = "gpt-5-codex"
             Engine::from_config_with_default_persist_path(Arc::clone(&service), &persist_dir)
                 .expect("assembles");
         let session = engine
-            .create_session(session_config("default", "any-model"))
+            .create_session(None, None)
             .await
             .expect("create session");
 
@@ -979,7 +1050,7 @@ model = "gpt-5-codex"
         let engine =
             Engine::from_config_with_default_persist_path(service, &fallback).expect("assembles");
         engine
-            .create_session(session_config("default", "any-model"))
+            .create_session(None, None)
             .await
             .expect("create session");
 
@@ -1030,41 +1101,90 @@ budget = { max_steps = 5 }
 "#,
         );
 
-        // Empty provider → default entry.
-        let binding = SessionBinding::resolve(&session_config("", "wire-model"), Some(&snapshot));
+        // No agent → default entry.
+        let binding = SessionBinding::resolve(None, Some(&snapshot));
         assert_eq!(binding.agent_name(), "default");
         assert_eq!(binding.model(), Some("model-d"));
         assert_eq!(binding.tools(), Some(&["read_file".to_owned()][..]));
         // The default entry has no budget → falls back to [session].budget.
         assert_eq!(binding.budget().and_then(|b| b.max_steps), Some(5));
 
-        // A named entry binds directly.
-        let binding =
-            SessionBinding::resolve(&session_config("reviewer", "wire-model"), Some(&snapshot));
+        // A named entry binds directly and its budget wins over [session].
+        let binding = SessionBinding::resolve(Some("reviewer"), Some(&snapshot));
         assert_eq!(binding.agent_name(), "reviewer");
         assert_eq!(binding.model(), Some("model-r"));
         assert_eq!(binding.system_prompt(), Some("Review carefully."));
         assert_eq!(binding.budget().and_then(|b| b.max_tokens), Some(1000));
 
-        // An unknown provider name falls back to the default entry.
-        let binding =
-            SessionBinding::resolve(&session_config("ghost", "wire-model"), Some(&snapshot));
+        // An unknown agent name falls back to the default entry (tolerant
+        // resolve; strict rejection lives in `validate_agent_binding`).
+        let binding = SessionBinding::resolve(Some("ghost"), Some(&snapshot));
         assert_eq!(binding.agent_name(), "default");
 
-        // An explicit wire budget wins over every configured default.
-        let mut config = session_config("reviewer", "wire-model");
-        config.budget = Some(SessionBudget {
-            max_tokens: Some(7),
-            ..SessionBudget::default()
-        });
-        let binding = SessionBinding::resolve(&config, Some(&snapshot));
-        assert_eq!(binding.budget().and_then(|b| b.max_tokens), Some(7));
-
-        // No configuration backend: everything falls back to the wire config.
-        let binding = SessionBinding::resolve(&config, None);
-        assert_eq!(binding.agent_name(), "default");
+        // No configuration backend: the bare requested (or default) name, with
+        // no template fields.
+        let binding = SessionBinding::resolve(Some("reviewer"), None);
+        assert_eq!(binding.agent_name(), "reviewer");
         assert_eq!(binding.model(), None);
-        assert_eq!(binding.budget().and_then(|b| b.max_tokens), Some(7));
+        assert_eq!(binding.budget(), None);
+    }
+
+    /// `validate_agent_binding` is the strict create-time check: it rejects an
+    /// unknown template and a local template with no usable model, accepts an
+    /// external template without a model, and maps an empty request to the
+    /// configured default agent.
+    #[test]
+    fn validate_agent_binding_enforces_template_existence_and_model() {
+        let base = snapshot(
+            r#"
+[agents.default]
+model = "model-d"
+
+[agents.no_model]
+system_prompt = "Careful."
+"#,
+        );
+
+        assert_eq!(
+            validate_agent_binding(None, &base).expect("default agent"),
+            "default"
+        );
+        assert_eq!(
+            validate_agent_binding(Some("  "), &base).expect("blank → default"),
+            "default"
+        );
+        assert_eq!(
+            validate_agent_binding(Some("default"), &base).expect("named local"),
+            "default"
+        );
+        assert!(matches!(
+            validate_agent_binding(Some("no_model"), &base),
+            Err(ServiceError::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            validate_agent_binding(Some("ghost"), &base),
+            Err(ServiceError::InvalidInput { .. })
+        ));
+
+        // The default agent is model-checked too: an empty request against a
+        // default entry with no model is rejected, not silently defaulted.
+        let no_model_default = snapshot(
+            r#"
+[agents.default]
+system_prompt = "Careful."
+"#,
+        );
+        assert!(matches!(
+            validate_agent_binding(None, &no_model_default),
+            Err(ServiceError::InvalidInput { .. })
+        ));
+
+        // A completely absent default entry is tolerated (degenerate config).
+        let empty = snapshot("");
+        assert_eq!(
+            validate_agent_binding(None, &empty).expect("bare default name"),
+            "default"
+        );
     }
 
     /// `[session].default_agent` selects the entry an empty or unmatched
@@ -1086,7 +1206,7 @@ default_agent = "main"
 
         // Empty provider binds the configured default agent, which is not
         // listed in its own definition table.
-        let binding = SessionBinding::resolve(&session_config("", "wire-model"), Some(&snapshot));
+        let binding = SessionBinding::resolve(None, Some(&snapshot));
         assert_eq!(binding.agent_name(), "main");
         assert_eq!(binding.model(), Some("model-m"));
         assert!(
@@ -1100,12 +1220,12 @@ default_agent = "main"
 
         // An unknown name falls back to the configured default agent.
         let binding =
-            SessionBinding::resolve(&session_config("ghost", "wire-model"), Some(&snapshot));
+            SessionBinding::resolve(Some("ghost"), Some(&snapshot));
         assert_eq!(binding.agent_name(), "main");
 
         // An explicitly named existing entry still binds directly.
         let binding =
-            SessionBinding::resolve(&session_config("default", "wire-model"), Some(&snapshot));
+            SessionBinding::resolve(Some("default"), Some(&snapshot));
         assert_eq!(binding.agent_name(), "default");
         assert_eq!(binding.model(), Some("model-d"));
     }
@@ -1124,10 +1244,10 @@ tools = []
 "#,
         );
 
-        let binding = SessionBinding::resolve(&session_config("default", "m"), Some(&snapshot));
+        let binding = SessionBinding::resolve(Some("default"), Some(&snapshot));
         assert_eq!(binding.tools(), None, "no tools key: unconstrained");
 
-        let binding = SessionBinding::resolve(&session_config("empty", "m"), Some(&snapshot));
+        let binding = SessionBinding::resolve(Some("empty"), Some(&snapshot));
         assert_eq!(
             binding.tools(),
             Some(&[][..]),
@@ -1164,7 +1284,7 @@ enabled = false
         );
 
         // Bound to `default`: `researcher` and `helper` are definitions.
-        let binding = SessionBinding::resolve(&session_config("default", "m"), Some(&snapshot));
+        let binding = SessionBinding::resolve(Some("default"), Some(&snapshot));
         let definitions = binding.agent_definitions();
         assert_eq!(definitions.len(), 2);
         let helper = definitions.get("helper").expect("helper definition");
@@ -1204,13 +1324,13 @@ enabled = false
         );
 
         // Bound to `researcher`: `default` itself becomes a definition.
-        let binding = SessionBinding::resolve(&session_config("researcher", "m"), Some(&snapshot));
+        let binding = SessionBinding::resolve(Some("researcher"), Some(&snapshot));
         assert!(binding.agent_definitions().get("default").is_some());
         assert!(binding.agent_definitions().get("helper").is_some());
         assert!(binding.agent_definitions().get("researcher").is_none());
 
         // No configuration backend: no definitions.
-        let binding = SessionBinding::resolve(&session_config("default", "m"), None);
+        let binding = SessionBinding::resolve(Some("default"), None);
         assert!(binding.agent_definitions().is_empty());
     }
 }

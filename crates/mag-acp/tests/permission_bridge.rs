@@ -23,6 +23,7 @@
 //! No network, real credentials, real Zed, or subprocesses are involved, and
 //! every test completes well under a second.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -42,7 +43,7 @@ use futures::stream::{BoxStream, StreamExt};
 use mag_service::{
     ApprovalDecisionWire, ApprovalRequirementWire, HistoryEntry, InteractionKindWire,
     InteractionOrigin, InteractionResponseWire, MagService, RequestId, RunId, RunOutput,
-    ServiceError, ServiceEvent, SessionConfig, SessionId, SessionInfo, SourceInfo, ToolCallIdWire,
+    ServiceError, ServiceEvent, SessionId, SessionInfo, SourceInfo, ToolCallIdWire,
     UserInput,
 };
 
@@ -113,7 +114,11 @@ impl BridgeService {
 
 #[async_trait]
 impl MagService for BridgeService {
-    async fn create_session(&self, _config: SessionConfig) -> Result<SessionId, ServiceError> {
+    async fn create_session(
+        &self,
+        _cwd: Option<PathBuf>,
+        _agent: Option<String>,
+    ) -> Result<SessionId, ServiceError> {
         Ok(session_id())
     }
 

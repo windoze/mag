@@ -55,8 +55,8 @@ use mag_config::{
 };
 use mag_service::{
     DelegationMessageWire, DelegationStatusWire, DelegationTrace, Event, RunErrorKind,
-    RunId as WireRunId, RunOutput, SessionBudget, SessionConfig, SessionId, ToolCallIdWire,
-    ToolStatusWire, ToolTrace, UsageInfo,
+    RunId as WireRunId, RunOutput, SessionBudget, SessionId, ToolCallIdWire, ToolStatusWire,
+    ToolTrace, UsageInfo,
 };
 use mag_tools::{
     ToolInvocation, ToolPlugin, ToolRegistry, UserInteractionBridge, UserInteractionError,
@@ -204,7 +204,8 @@ impl SessionDriver {
     /// example an invalid model/provider configuration).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        config: &SessionConfig,
+        cwd: Option<&Path>,
+        model: &str,
         client: Arc<dyn LlmClient>,
         tools: Arc<ToolRegistry>,
         approval: Arc<IpcApproval>,
@@ -217,12 +218,9 @@ impl SessionDriver {
         let user_interaction = Arc::new(IpcUserInteractionBridge::new(
             approval.clone() as Arc<dyn InteractionHandler>
         )) as Arc<dyn UserInteractionBridge>;
-        let model = binding
-            .model()
-            .map(str::to_owned)
-            .unwrap_or_else(|| config.model.clone());
+        let model = model.to_owned();
         let spawn_ctx = Arc::new(root_spawn_context(
-            config,
+            cwd,
             client.clone(),
             tools.clone(),
             approval.clone(),
@@ -245,11 +243,11 @@ impl SessionDriver {
             .max_tokens(DEFAULT_MAX_TOKENS)
             .max_steps(DEFAULT_MAX_STEPS)
             .interaction_handler(approval as Arc<dyn InteractionHandler>);
-        if let Some(cwd) = &config.cwd {
-            builder = builder.worktree(WorktreeRef::new(cwd.clone()));
+        if let Some(cwd) = cwd {
+            builder = builder.worktree(WorktreeRef::new(cwd.to_owned()));
         }
-        if let Some(budget) = &config.budget {
-            builder = builder.budget(budget_limits(budget));
+        if let Some(budget) = binding.budget() {
+            builder = builder.budget(budget_limits(&budget));
         }
         for tool in facade_tools {
             builder = builder.tool(tool);
@@ -268,7 +266,7 @@ impl SessionDriver {
             agent_name: binding.agent_name().to_owned(),
             system_prompt: binding.system_prompt().map(str::to_owned),
             spawn_ctx,
-            cwd: config.cwd.clone(),
+            cwd: cwd.map(Path::to_owned),
             pending_notifications: VecDeque::new(),
             run_counter: AtomicU64::new(1),
             tool_set_counter: AtomicU64::new(1),
@@ -314,7 +312,8 @@ impl SessionDriver {
     /// a snapshot whose state cannot be deserialized).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn restore(
-        config: &SessionConfig,
+        cwd: Option<&Path>,
+        model: &str,
         client: Arc<dyn LlmClient>,
         tools: Arc<ToolRegistry>,
         approval: Arc<IpcApproval>,
@@ -330,7 +329,7 @@ impl SessionDriver {
             approval.clone() as Arc<dyn InteractionHandler>
         )) as Arc<dyn UserInteractionBridge>;
         let spawn_ctx = Arc::new(root_spawn_context(
-            config,
+            cwd,
             client.clone(),
             tools.clone(),
             approval.clone(),
@@ -339,10 +338,7 @@ impl SessionDriver {
             session_id,
             events,
             ModelRef::new(
-                binding
-                    .model()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| config.model.clone()),
+                model.to_owned(),
                 NonZeroU32::new(DEFAULT_MAX_TOKENS).expect("non-zero default"),
                 None,
                 None,
@@ -382,7 +378,7 @@ impl SessionDriver {
             agent_name: binding.agent_name().to_owned(),
             system_prompt: binding.system_prompt().map(str::to_owned),
             spawn_ctx,
-            cwd: config.cwd.clone(),
+            cwd: cwd.map(Path::to_owned),
             pending_notifications: VecDeque::new(),
             run_counter: AtomicU64::new(1),
             tool_set_counter: AtomicU64::new(1),
@@ -1118,7 +1114,7 @@ fn budget_limits(budget: &SessionBudget) -> BudgetLimits {
 /// model right after construction.
 #[allow(clippy::too_many_arguments)]
 fn root_spawn_context(
-    config: &SessionConfig,
+    cwd: Option<&Path>,
     client: Arc<dyn LlmClient>,
     tools: Arc<ToolRegistry>,
     approval: Arc<IpcApproval>,
@@ -1131,7 +1127,7 @@ fn root_spawn_context(
     InstanceSpawnContext {
         registry: AgentInstanceRegistry::new(),
         shared: SharedSpawnState::new(
-            assemble_agent_definitions(config.cwd.as_deref(), binding.agent_definitions().clone()),
+            assemble_agent_definitions(cwd, binding.agent_definitions().clone()),
             supervisor_model,
             binding.default_subagent_tools().map(<[String]>::to_vec),
         ),
@@ -1141,9 +1137,9 @@ fn root_spawn_context(
         interaction: approval,
         events,
         session_id,
-        worktree: config.cwd.as_ref().map_or_else(
+        worktree: cwd.map_or_else(
             || WorktreeRef::new("."),
-            |cwd| WorktreeRef::new(cwd.clone()),
+            |cwd| WorktreeRef::new(cwd.to_owned()),
         ),
         depth: 0,
     }
@@ -1895,14 +1891,6 @@ mod tests {
         use crate::engine::approval::{AskFrontendDecider, IpcApproval};
         use crate::turn_complete::TurnCompleteHub;
 
-        let config = mag_service::SessionConfig {
-            provider: "fake".to_owned(),
-            model: "fake-model".to_owned(),
-            tool_profile: None,
-            cwd: None,
-            routing: mag_service::RoutingMode::ModelRouted,
-            budget: None,
-        };
         let events = EventBus::new();
         let approval = std::sync::Arc::new(IpcApproval::new(
             session_id(),
@@ -1910,12 +1898,13 @@ mod tests {
             std::sync::Arc::new(AskFrontendDecider),
         ));
         super::SessionDriver::new(
-            &config,
+            None,
+            "fake-model",
             client,
             std::sync::Arc::new(tools),
             approval,
             TurnCompleteHub::default(),
-            &SessionBinding::resolve(&config, Some(snapshot)),
+            &SessionBinding::resolve(None, Some(snapshot)),
             &ApprovalOverrides::default(),
             session_id(),
             events,
@@ -1932,14 +1921,6 @@ mod tests {
         use crate::engine::approval::{AskFrontendDecider, IpcApproval};
         use crate::turn_complete::TurnCompleteHub;
 
-        let config = mag_service::SessionConfig {
-            provider: "fake".to_owned(),
-            model: "fake-model".to_owned(),
-            tool_profile: None,
-            cwd,
-            routing: mag_service::RoutingMode::ModelRouted,
-            budget: None,
-        };
         let events = EventBus::new();
         let approval = std::sync::Arc::new(IpcApproval::new(
             session_id(),
@@ -1947,12 +1928,13 @@ mod tests {
             std::sync::Arc::new(AskFrontendDecider),
         ));
         super::SessionDriver::new(
-            &config,
+            cwd.as_deref(),
+            "fake-model",
             client,
             std::sync::Arc::new(mag_tools::ToolRegistry::with_builtins()),
             approval,
             TurnCompleteHub::default(),
-            &SessionBinding::resolve(&config, None),
+            &SessionBinding::resolve(None, None),
             &ApprovalOverrides::default(),
             session_id(),
             events,
@@ -2378,14 +2360,6 @@ enabled = false
         use crate::engine::approval::{AskFrontendDecider, IpcApproval};
         use crate::turn_complete::TurnCompleteHub;
 
-        let config = mag_service::SessionConfig {
-            provider: "fake".to_owned(),
-            model: "fake-model".to_owned(),
-            tool_profile: None,
-            cwd: None,
-            routing: mag_service::RoutingMode::ModelRouted,
-            budget: None,
-        };
         let events = EventBus::new();
         let approval = std::sync::Arc::new(IpcApproval::new(
             session_id(),
@@ -2393,14 +2367,15 @@ enabled = false
             std::sync::Arc::new(AskFrontendDecider),
         ));
         super::SessionDriver::restore(
-            &config,
+            None,
+            "fake-model",
             FakeLlmClient::scripted(Vec::new()),
             std::sync::Arc::new(mag_tools::ToolRegistry::with_builtins()),
             approval,
             snapshot,
-            config.budget.as_ref(),
+            None,
             TurnCompleteHub::default(),
-            &SessionBinding::resolve(&config, None),
+            &SessionBinding::resolve(None, None),
             &ApprovalOverrides::default(),
             session_id(),
             events,

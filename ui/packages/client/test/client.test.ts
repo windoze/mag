@@ -3,7 +3,6 @@ import type {
   Event,
   HistoryEntry,
   InteractionResponseWire,
-  SessionConfig,
   SessionId,
   SessionInfo,
   ToolStatusWire,
@@ -25,14 +24,10 @@ import {
 } from "../src/index";
 
 const sessionId = "session-a";
-const config = {
-  provider: "anthropic",
-  model: "claude-sonnet-4-5",
-  routing: "model_routed"
-} satisfies SessionConfig;
+const agent = "default";
 const sessionInfo = {
   id: sessionId,
-  config,
+  agent,
   title: "Inspect README",
   last_active_at: 1721234567890,
   status: "idle"
@@ -60,10 +55,10 @@ describe("@mag/client", () => {
     const commands: Array<{ command: Command; method: string; path: string; body?: unknown }> = [
       { command: { type: "list_sessions" }, method: "GET", path: "/api/sessions" },
       {
-        command: { type: "create_session", config },
+        command: { type: "create_session", agent },
         method: "POST",
         path: "/api/sessions",
-        body: config
+        body: { agent }
       },
       {
         command: { type: "resume_session", id: sessionId },
@@ -627,7 +622,7 @@ describe("@mag/client", () => {
     const transport = new ScriptedTransport();
     const store = new SessionStore(transport);
 
-    store.applyEvent({ type: "session_created", id: "session-new", config });
+    store.applyEvent({ type: "session_created", id: "session-new", agent });
     store.applyEvent({ type: "text_delta", id: "session-new", text: "hello" });
     transport.sessions = [sessionInfo, { ...sessionInfo, id: "session-new" }];
     await store.refreshSessions();
@@ -772,7 +767,7 @@ class ScriptedTransport implements ITransport {
       case "get_session_history":
         return this.histories.get(command.id) ?? [];
       case "create_session":
-        return { id: sessionId, config: command.config };
+        return { id: sessionId, agent: command.agent ?? "default", cwd: command.cwd ?? undefined };
       case "send_message":
         return { run_id: "run-local" };
       case "pivot_message":

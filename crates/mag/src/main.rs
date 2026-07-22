@@ -462,13 +462,11 @@ async fn main() -> ExitCode {
             }
         }
     } else {
-        let mut opts = CliOptions {
+        let opts = CliOptions {
+            agent: cli.agent,
             resume: cli.resume,
             ..CliOptions::default()
         };
-        if let Some(agent) = cli.agent {
-            opts.session.provider = agent;
-        }
         match TerminalCli::run(service, opts).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {

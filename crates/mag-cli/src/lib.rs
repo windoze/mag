@@ -19,18 +19,14 @@ use futures::{Stream, StreamExt};
 use mag_service::{
     ApprovalDecisionWire, ApprovalRequirementWire, ConfigDto, DelegationMessageWire,
     DelegationTrace, InteractionKindWire, InteractionOrigin, InteractionResponseWire, MagService,
-    PermissionCategoryWire, PermissionDecisionWire, PermissionRiskWire, RequestId, RoutingMode,
-    RunErrorKind, ServiceError, ServiceEvent, SessionConfig, SessionId, SessionInfo, SourceInfo,
-    SourceKindWire, StepIdWire, ToolCallIdWire, ToolStatusWire, ToolTrace, UserInput,
+    PermissionCategoryWire, PermissionDecisionWire, PermissionRiskWire, RequestId, RunErrorKind,
+    ServiceError, ServiceEvent, SessionId, SessionInfo, SourceInfo, SourceKindWire, StepIdWire,
+    ToolCallIdWire, ToolStatusWire, ToolTrace, UserInput,
 };
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, Stdout};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
-
-/// Default model used when the CLI creates a session without a user-supplied
-/// agent selection.
-pub const DEFAULT_MODEL: &str = "gpt-5-codex";
 
 /// Overall fallback window after `/quit` or Ctrl-D: in-flight runs are asked to
 /// cancel and the CLI waits for their terminals, but if a driver stays blocked
@@ -50,8 +46,12 @@ type SharedOutput<W> = Arc<Mutex<W>>;
 /// Runtime options for [`Cli::run`].
 #[derive(Clone, Debug)]
 pub struct CliOptions {
-    /// Session configuration used at startup and by `/new`.
-    pub session: SessionConfig,
+    /// Agent-template name bound at startup; `None` (the default) binds the
+    /// configured default agent (`[session].default_agent`, else `default`).
+    /// `/new [agent]` overrides this per session.
+    pub agent: Option<String>,
+    /// Session working root; `None` keeps the agent's default `"."`.
+    pub cwd: Option<std::path::PathBuf>,
     /// Existing session to resume at startup instead of creating a new session.
     pub resume: Option<SessionId>,
     /// Prompt displayed before each input line in the pipe-friendly reader.
@@ -61,17 +61,8 @@ pub struct CliOptions {
 impl Default for CliOptions {
     fn default() -> Self {
         Self {
-            session: SessionConfig {
-                // An empty provider names no agent: on a configuration-backed
-                // engine the session binds the configured default agent
-                // (`[session].default_agent`, else the `default` entry).
-                provider: String::new(),
-                model: DEFAULT_MODEL.to_owned(),
-                tool_profile: None,
-                cwd: None,
-                routing: RoutingMode::default(),
-                budget: None,
-            },
+            agent: None,
+            cwd: None,
             resume: None,
             prompt: "mag> ".to_owned(),
         }
@@ -409,7 +400,9 @@ where
         write_line(&output, &format!("[session {id} resumed]\n")).await?;
         id
     } else {
-        let id = service.create_session(opts.session.clone()).await?;
+        let id = service
+            .create_session(opts.cwd.clone(), opts.agent.clone())
+            .await?;
         write_line(&output, &format!("[session {id}]\n")).await?;
         id
     };
@@ -574,11 +567,12 @@ where
                 write_line(output, "[error] usage: /new [agent]\n").await?;
                 return Ok(LineOutcome::Continue);
             }
-            let mut config = opts.session.clone();
-            if let Some(agent) = agent {
-                config.provider = agent.to_owned();
-            }
-            match service.create_session(config).await {
+            // `/new [agent]` binds the named agent template; without one it
+            // reuses the startup agent (default agent when unset).
+            let agent = agent
+                .map(str::to_owned)
+                .or_else(|| opts.agent.clone());
+            match service.create_session(opts.cwd.clone(), agent).await {
                 Ok(new_session) => {
                     *session_id = new_session;
                     write_line(output, &format!("[session {new_session}]\n")).await?;
@@ -1075,8 +1069,8 @@ where
                 " "
             };
             rendered.push_str(&format!(
-                "{marker} {} provider={} model={}\n",
-                session.id, session.config.provider, session.config.model
+                "{marker} {} agent={}\n",
+                session.id, session.agent
             ));
         }
     }

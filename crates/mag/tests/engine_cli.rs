@@ -36,7 +36,7 @@ use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use mag_cli::{Cli, CliOptions};
 use mag_core::{ConfigService, Engine};
-use mag_service::{MagService, RoutingMode, SessionConfig, SessionId};
+use mag_service::{MagService, SessionId};
 use mag_tools::{ToolPlugin, ToolRegistry};
 use serde_json::{Value, json};
 use tokio::{
@@ -329,14 +329,8 @@ fn engine_with_config(
 /// CLI options used by the in-process tests.
 fn cli_options() -> CliOptions {
     CliOptions {
-        session: SessionConfig {
-            provider: "default".to_owned(),
-            model: "fake-chat".to_owned(),
-            tool_profile: None,
-            cwd: None,
-            routing: RoutingMode::ModelRouted,
-            budget: None,
-        },
+        agent: Some("default".to_owned()),
+        cwd: None,
         resume: None,
         prompt: "mag> ".to_owned(),
     }

@@ -15,6 +15,7 @@
 //! No network, real credentials, real Zed, or subprocesses are involved, and every
 //! test completes well under a second.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,7 +29,7 @@ use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use mag_service::{
     HistoryEntry, InteractionResponseWire, MagService, RequestId, RunId, RunOutput, ServiceError,
-    ServiceEvent, SessionConfig, SessionId, SessionInfo, SourceInfo, ToolCallIdWire,
+    ServiceEvent, SessionId, SessionInfo, SourceInfo, ToolCallIdWire,
     ToolStatusWire, ToolTrace, UserInput,
 };
 
@@ -66,7 +67,11 @@ impl ScriptedService {
 
 #[async_trait]
 impl MagService for ScriptedService {
-    async fn create_session(&self, _config: SessionConfig) -> Result<SessionId, ServiceError> {
+    async fn create_session(
+        &self,
+        _cwd: Option<PathBuf>,
+        _agent: Option<String>,
+    ) -> Result<SessionId, ServiceError> {
         Ok(SessionId::parse_str(SESSION_UUID).expect("valid uuid"))
     }
 

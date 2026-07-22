@@ -18,6 +18,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
+    path::PathBuf,
     sync::{Arc, Mutex, PoisonError},
     thread,
     time::{SystemTime, UNIX_EPOCH},
@@ -28,8 +29,7 @@ use agent_lib::{
     facade::{AgentSnapshot, CancelHandle},
 };
 use mag_service::{
-    Event, InteractionResponseWire, RequestId, RunId, ServiceError, SessionConfig, SessionId,
-    SessionStatusWire,
+    Event, InteractionResponseWire, RequestId, RunId, ServiceError, SessionId, SessionStatusWire,
 };
 use mag_tools::ToolRegistry;
 use tokio::{
@@ -440,7 +440,7 @@ impl SessionActor {
 #[allow(clippy::too_many_arguments)]
 fn session_thread(
     session_id: SessionId,
-    config: SessionConfig,
+    cwd: Option<PathBuf>,
     client: Arc<dyn LlmClient>,
     tools: Arc<ToolRegistry>,
     event_bus: EventBus,
@@ -460,16 +460,26 @@ fn session_thread(
         .build()
         .expect("build mag session runtime");
     let local = LocalSet::new();
+    // The effective per-run budget lives on the binding (bound agent template,
+    // else `[session]` default); the driver reads it directly. The model comes
+    // from the bound template, falling back to the last-resort default only on
+    // a snapshot-less engine (a configured session is validated at create time).
+    let budget = binding.budget();
+    let model = binding
+        .model()
+        .unwrap_or(crate::assembly::DEFAULT_MODEL)
+        .to_owned();
     // Shared approval handler bridges the driver's paused interactions to the
     // event bus and back through `RespondInteraction` (`docs/DESIGN.md` §3.3).
     let driver = match restore {
         Some(snapshot) => SessionDriver::restore(
-            &config,
+            cwd.as_deref(),
+            &model,
             client,
             tools,
             approval.clone(),
             snapshot,
-            config.budget.as_ref(),
+            budget.as_ref(),
             turn_complete,
             &binding,
             &overrides,
@@ -477,7 +487,8 @@ fn session_thread(
             event_bus.clone(),
         ),
         None => SessionDriver::new(
-            &config,
+            cwd.as_deref(),
+            &model,
             client,
             tools,
             approval.clone(),
@@ -569,8 +580,13 @@ impl SessionManager {
     ///
     /// A no-op when the manager has no client. The command sender is registered
     /// synchronously, so a later `send_message` never races the actor thread.
-    pub(crate) fn create_session(&self, session_id: SessionId, config: SessionConfig) {
-        self.spawn_session(session_id, config, None);
+    pub(crate) fn create_session(
+        &self,
+        session_id: SessionId,
+        agent: Option<String>,
+        cwd: Option<PathBuf>,
+    ) {
+        self.spawn_session(session_id, agent, cwd, None);
     }
 
     /// Spawns the actor thread for a persisted session, rebuilding its agent from
@@ -583,7 +599,8 @@ impl SessionManager {
     pub(crate) fn resume_session(
         &self,
         session_id: SessionId,
-        config: SessionConfig,
+        agent: Option<String>,
+        cwd: Option<PathBuf>,
         snapshot: Option<AgentSnapshot>,
     ) -> Result<(), ServiceError> {
         if self.client.is_none() {
@@ -591,7 +608,7 @@ impl SessionManager {
                 message: "no LLM client configured".to_owned(),
             });
         }
-        self.spawn_session(session_id, config, snapshot);
+        self.spawn_session(session_id, agent, cwd, snapshot);
         Ok(())
     }
 
@@ -604,12 +621,13 @@ impl SessionManager {
     /// and the approval overrides are derived from the **current** snapshot
     /// (`docs/CLI.md` §4.4): a session (re)built after a configuration update
     /// picks up the new model/tool/budget defaults and approval tiers. The
-    /// effective per-run budget (explicit wire budget > bound agent entry >
-    /// `[session]` default) is folded back into `config` for the driver.
+    /// effective per-run budget (bound agent template, else `[session]` default)
+    /// is carried on the binding the driver reads.
     fn spawn_session(
         &self,
         session_id: SessionId,
-        mut config: SessionConfig,
+        agent: Option<String>,
+        cwd: Option<PathBuf>,
         restore: Option<AgentSnapshot>,
     ) {
         let Some(client) = self.client.clone() else {
@@ -628,8 +646,7 @@ impl SessionManager {
         let config_apply = self.config_apply.clone();
         let turn_complete = self.turn_complete.clone();
         let snapshot = config_apply.as_ref().map(|state| state.service().current());
-        let binding = SessionBinding::resolve(&config, snapshot.as_deref());
-        config.budget = binding.budget();
+        let binding = SessionBinding::resolve(agent.as_deref(), snapshot.as_deref());
         let overrides = snapshot
             .as_deref()
             .map_or_else(ApprovalOverrides::default, ApprovalOverrides::from_snapshot);
@@ -649,7 +666,7 @@ impl SessionManager {
             .spawn(move || {
                 session_thread(
                     session_id,
-                    config,
+                    cwd,
                     client,
                     tools,
                     event_bus,

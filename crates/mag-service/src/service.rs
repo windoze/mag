@@ -18,10 +18,12 @@ use mag_config::ConfigDto;
 use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt};
 
+use std::path::PathBuf;
+
 use crate::{
     AgentInstanceStatusWire, DelegationMessageWire, DelegationTrace, Event, HistoryEntry,
     InteractionKindWire, InteractionOrigin, InteractionResponseWire, RequestId, RunErrorKind,
-    RunId, RunOutput, SessionConfig, SessionId, SourceInfo, ToolTrace,
+    RunId, RunOutput, SessionId, SourceInfo, ToolTrace,
 };
 
 /// Transport-neutral service facade implemented by `mag-core::Engine`.
@@ -39,13 +41,20 @@ use crate::{
 pub trait MagService: Send + Sync {
     // —— Session management ——
 
-    /// Creates a new session from `config` and returns its identity.
+    /// Creates a new session bound to the `agent` template (or the configured
+    /// default agent when `None`), rooted at `cwd` when supplied, and returns
+    /// its identity.
     ///
     /// # Errors
     ///
-    /// Returns a [`ServiceError`] when the configuration is rejected or the
-    /// backing engine fails to register the session.
-    async fn create_session(&self, config: SessionConfig) -> Result<SessionId, ServiceError>;
+    /// Returns a [`ServiceError`] when `agent` names no configured template, the
+    /// resolved local template has no usable model, or the backing engine fails
+    /// to register the session.
+    async fn create_session(
+        &self,
+        cwd: Option<PathBuf>,
+        agent: Option<String>,
+    ) -> Result<SessionId, ServiceError>;
 
     /// Lists currently known sessions.
     ///
@@ -294,8 +303,11 @@ impl UserInput {
 pub struct SessionInfo {
     /// Stable session identity.
     pub id: SessionId,
-    /// Configuration the session was created with.
-    pub config: SessionConfig,
+    /// Agent-template name the session is bound to.
+    pub agent: String,
+    /// Runtime working root the session was created with, when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
     /// User-facing title derived from the first user message, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -310,10 +322,11 @@ pub struct SessionInfo {
 impl SessionInfo {
     /// Builds a session listing entry with default optional metadata.
     #[must_use]
-    pub fn new(id: SessionId, config: SessionConfig) -> Self {
+    pub fn new(id: SessionId, agent: String, cwd: Option<PathBuf>) -> Self {
         Self {
             id,
-            config,
+            agent,
+            cwd,
             title: None,
             last_active_at: None,
             status: SessionStatusWire::Idle,
@@ -351,8 +364,11 @@ pub enum ServiceEvent {
     SessionCreated {
         /// Created session identity.
         id: SessionId,
-        /// Configuration stored for the session.
-        config: SessionConfig,
+        /// Resolved agent-template name the session bound to.
+        agent: String,
+        /// Runtime working root the session was created with, when set.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<PathBuf>,
     },
     /// A run started for a session.
     RunStarted {
@@ -568,7 +584,7 @@ impl From<Event> for ServiceEvent {
     /// projection.
     fn from(event: Event) -> Self {
         match event {
-            Event::SessionCreated { id, config } => Self::SessionCreated { id, config },
+            Event::SessionCreated { id, agent, cwd } => Self::SessionCreated { id, agent, cwd },
             Event::RunStarted { id, run_id } => Self::RunStarted { id, run_id },
             Event::RunFinished { id, output } => Self::RunFinished { id, output },
             Event::RunError { id, message, kind } => Self::RunError { id, message, kind },
@@ -740,17 +756,6 @@ mod tests {
         SessionId::new(uuid(1))
     }
 
-    fn config() -> SessionConfig {
-        SessionConfig {
-            provider: "openai".to_owned(),
-            model: "gpt-5-codex".to_owned(),
-            tool_profile: None,
-            cwd: None,
-            routing: crate::RoutingMode::ModelRouted,
-            budget: None,
-        }
-    }
-
     fn tool_trace() -> ToolTrace {
         ToolTrace {
             run_id: Some(RunId::new(uuid(3))),
@@ -797,7 +802,11 @@ mod tests {
 
     #[async_trait]
     impl MagService for DummyService {
-        async fn create_session(&self, _config: SessionConfig) -> Result<SessionId, ServiceError> {
+        async fn create_session(
+            &self,
+            _cwd: Option<PathBuf>,
+            _agent: Option<String>,
+        ) -> Result<SessionId, ServiceError> {
             Ok(session_id())
         }
 
@@ -893,7 +902,10 @@ mod tests {
         futures::executor::block_on(async {
             let service: Arc<dyn MagService> = Arc::new(DummyService);
 
-            let id = service.create_session(config()).await.expect("create");
+            let id = service
+                .create_session(None, None)
+                .await
+                .expect("create");
             assert_eq!(id, session_id());
             assert!(service.list_sessions().await.expect("list").is_empty());
 
@@ -906,18 +918,18 @@ mod tests {
     fn session_info_legacy_json_defaults_new_metadata() {
         let legacy = json!({
             "id": session_id(),
-            "config": config(),
+            "agent": "default",
         });
 
         let decoded = serde_json::from_value::<SessionInfo>(legacy)
             .expect("legacy SessionInfo without web metadata");
 
-        assert_eq!(decoded, SessionInfo::new(session_id(), config()));
+        assert_eq!(decoded, SessionInfo::new(session_id(), "default".to_owned(), None));
     }
 
     #[test]
     fn session_info_metadata_round_trips_with_stable_status_tags() {
-        let mut info = SessionInfo::new(session_id(), config());
+        let mut info = SessionInfo::new(session_id(), "default".to_owned(), None);
         info.title = Some("first prompt".to_owned());
         info.last_active_at = Some(1_721_234_567_890);
         info.status = SessionStatusWire::AwaitingInteraction;
@@ -949,7 +961,8 @@ mod tests {
             (
                 ServiceEvent::SessionCreated {
                     id: session_id(),
-                    config: config(),
+                    agent: "default".to_owned(),
+                    cwd: None,
                 },
                 "session_created",
             ),
@@ -1114,11 +1127,13 @@ mod tests {
             (
                 Event::SessionCreated {
                     id: session_id(),
-                    config: config(),
+                    agent: "default".to_owned(),
+                    cwd: None,
                 },
                 ServiceEvent::SessionCreated {
                     id: session_id(),
-                    config: config(),
+                    agent: "default".to_owned(),
+                    cwd: None,
                 },
             ),
             (

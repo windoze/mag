@@ -17,6 +17,7 @@
 //! subprocesses, and every test completes well under a second. The real-Zed
 //! integration skeleton at the bottom is `#[ignore]`d by default.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -35,7 +36,7 @@ use futures::stream::{BoxStream, StreamExt};
 use mag_service::{
     ApprovalDecisionWire, ApprovalRequirementWire, HistoryEntry, InteractionKindWire,
     InteractionOrigin, InteractionResponseWire, MagService, RequestId, RunErrorKind, RunId,
-    RunOutput, ServiceError, ServiceEvent, SessionConfig, SessionId, SessionInfo, SourceInfo,
+    RunOutput, ServiceError, ServiceEvent, SessionId, SessionInfo, SourceInfo,
     ToolCallIdWire, UserInput,
 };
 use tokio::sync::Notify;
@@ -86,7 +87,7 @@ struct RoundScript {
 /// What the scripted service observed.
 #[derive(Debug, Default)]
 struct Observed {
-    created: Option<SessionConfig>,
+    created: Option<Option<PathBuf>>,
     response: Option<InteractionResponseWire>,
     cancelled: Option<SessionId>,
 }
@@ -119,8 +120,12 @@ impl RoundService {
 
 #[async_trait]
 impl MagService for RoundService {
-    async fn create_session(&self, config: SessionConfig) -> Result<SessionId, ServiceError> {
-        self.observed.lock().expect("lock").created = Some(config);
+    async fn create_session(
+        &self,
+        cwd: Option<PathBuf>,
+        _agent: Option<String>,
+    ) -> Result<SessionId, ServiceError> {
+        self.observed.lock().expect("lock").created = Some(cwd);
         Ok(session_id())
     }
 

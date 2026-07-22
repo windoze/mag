@@ -11,11 +11,7 @@ import { captureFragmentToken } from "./token";
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
 
 const sessionId = "session-a";
-const config = {
-  provider: "openai",
-  model: "gpt-5-codex",
-  routing: "model_routed"
-};
+const agent = "default";
 
 type TransportCommand = Parameters<ITransport["send"]>[0];
 type TransportEvent = Parameters<Parameters<ITransport["subscribe"]>[0]>[0];
@@ -114,8 +110,10 @@ describe("App", () => {
 
     await click(getButton(rendered.container, "New chat"));
     await waitFor(() => transport.sent.some((command) => command.type === "create_session"));
+    // The web app creates sessions with no agent/cwd, letting the backend bind
+    // its configured default agent.
     expect(transport.sent.find((command) => command.type === "create_session")).toMatchObject({
-      config: { provider: "openai", model: "gpt-5-codex", routing: "model_routed" }
+      type: "create_session"
     });
 
     await click(getByLabel(rendered.container, "Delete New shell session"));
@@ -474,14 +472,14 @@ class ScriptedTransport implements ITransport {
         return [
           {
             id: sessionId,
-            config,
+            agent,
             title: "Inspect README",
             last_active_at: 1721234567890,
             status: "idle"
           },
           {
             id: "session-new",
-            config,
+            agent,
             title: "New shell session",
             last_active_at: 1721234567999,
             status: "idle"
@@ -495,7 +493,7 @@ class ScriptedTransport implements ITransport {
             ]
           : [];
       case "create_session":
-        return { id: "session-new", config: command.config };
+        return { id: "session-new", agent: command.agent ?? "default", cwd: command.cwd ?? undefined };
       case "get_config":
         return {
           providers: {

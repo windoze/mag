@@ -8,7 +8,6 @@ import type { RequestId } from "./RequestId";
 import type { RunErrorKind } from "./RunErrorKind";
 import type { RunId } from "./RunId";
 import type { RunOutput } from "./RunOutput";
-import type { SessionConfig } from "./SessionConfig";
 import type { SessionId } from "./SessionId";
 import type { SourceInfo } from "./SourceInfo";
 import type { ToolTrace } from "./ToolTrace";
@@ -22,9 +21,13 @@ export type Event = { "type": "session_created",
  */
 id: SessionId, 
 /**
- * Configuration stored for the session.
+ * Resolved agent-template name the session bound to.
  */
-config: SessionConfig, } | { "type": "run_started", 
+agent: string, 
+/**
+ * Runtime working root the session was created with, when set.
+ */
+cwd?: string | null, } | { "type": "run_started", 
 /**
  * Session that owns the run.
  */
