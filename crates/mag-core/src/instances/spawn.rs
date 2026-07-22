@@ -17,8 +17,9 @@
 //! [`SUBAGENT_SKELETON`] + definition body, §4; the child tool surface
 //! resolved from the definition's `tools` list — falling back to the
 //! session's configured default toolset, then to the full session registry —
-//! plus the `agent` tool itself for nesting, §5.4/§7; the supervisor's
-//! approval-policy projection), while a `kind: acp` definition
+//! plus, unless the definition sets `allow_subagents: false`, the `agent`
+//! tool itself for nesting, §5.4/§7; the supervisor's approval-policy
+//! projection), while a `kind: acp` definition
 //! launches one external ACP process per instance and drives it through
 //! agent-lib's one-shot [`run_external_once`](agent_lib::facade::run_external_once)
 //! (§6, feature-gated `external-acp`). Both paths bubble every paused
@@ -366,7 +367,9 @@ impl std::fmt::Debug for InstanceSpawnContext {
 /// child surface gain the trio together (§5.1). The session driver appends
 /// them to the supervisor's surface (M3-5); the child surface reserves the
 /// same extension point: [`drive_local`] appends `agent_tools` of the
-/// instance's own context after its projected plugins.
+/// instance's own context after its projected plugins — unless the
+/// definition sets `allow_subagents: false`, which keeps the child from
+/// nesting further (§5.4).
 pub(crate) fn agent_tools(ctx: &Arc<InstanceSpawnContext>) -> Vec<Tool> {
     vec![
         agent_tool(ctx),
@@ -823,6 +826,7 @@ async fn drive_local(
         model,
         tools,
         max_steps,
+        allow_subagents,
     } = &definition.kind
     else {
         // The dispatch matches on the kind, so this is unreachable.
@@ -850,7 +854,8 @@ async fn drive_local(
     // registry is projected. Names unavailable in this session (unknown, or
     // disabled by `[tools.<name>] enabled = false`) are dropped with a
     // once-per-session warning. The instance tools of the child's own
-    // context are always appended for nesting (§5.4).
+    // context are appended for nesting (§5.4) unless the definition opts
+    // out with `allow_subagents: false`.
     let allowed = ctx.shared.child_surface_names(tools.clone(), &ctx.tools);
     let (mut surface, policy) = project_tool_plugins(
         &ctx.tools,
@@ -859,7 +864,9 @@ async fn drive_local(
         user_interaction,
     );
     let policy = apply_per_tool_tiers(policy, &ctx.overrides);
-    surface.extend(agent_tools(&ctx.child_context()));
+    if *allow_subagents {
+        surface.extend(agent_tools(&ctx.child_context()));
+    }
 
     let supervisor_model = ctx.shared.supervisor_model();
     let mut builder = Agent::builder()
@@ -2355,6 +2362,40 @@ mod tests {
             AgentDefinitionRegistry::builtin(),
             "general-purpose",
             Some(vec!["read_file".to_owned(), "ghost".to_owned()]),
+        );
+        assert_eq!(
+            names,
+            ["agent", "agent_cancel", "agent_result", "read_file"]
+        );
+    }
+
+    /// §5.4: `allow_subagents: false` keeps the instance tool trio off the
+    /// child surface — the rest of the surface is unaffected — while an
+    /// unset key defaults to `true` and the trio is appended as always.
+    #[test]
+    fn child_surface_gates_instance_tools_on_allow_subagents() {
+        let dir = TempAgentsDir::new();
+        dir.write(
+            "leaf.md",
+            "---\nname: leaf\ndescription: cannot nest\ntools: read_file\nallow_subagents: false\n---\nWork alone.\n",
+        );
+        let names = child_tool_names(
+            ToolRegistry::with_builtins(),
+            dir.definitions(),
+            "leaf",
+            None,
+        );
+        assert_eq!(names, ["read_file"]);
+
+        dir.write(
+            "nester.md",
+            "---\nname: nester\ndescription: may nest\ntools: read_file\n---\nWork and delegate.\n",
+        );
+        let names = child_tool_names(
+            ToolRegistry::with_builtins(),
+            dir.definitions(),
+            "nester",
+            None,
         );
         assert_eq!(
             names,

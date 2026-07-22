@@ -106,6 +106,7 @@ env:
 | `tools` | 否 | 仅 local。逗号分隔；显式给出 = child 的**恰好**那份工具列表；缺省 = session 缺省 toolset（`[session].default_subagent_tools`），未配置 = session 可用工具全量。工具面是 agent 种类的属性，**不与 supervisor 工具面取交集**（§7） |
 | `model` | 否 | 仅 local。缺省继承 supervisor 的 model；受 M4-R 限制只能选同 provider 的 model |
 | `max_steps` | 否 | 仅 local。步数预算上限；缺省用运行时默认 |
+| `allow_subagents` | 否 | 仅 local。bool，缺省 `true`；`false` 时 child 工具面不注入 `agent` / `agent_result` / `agent_cancel` 三工具，该类型实例无法再嵌套（§5.4） |
 | `command` / `env` | external 必选 / 否 | 仅 `kind: acp` |
 
 ### 3.2 定义来源与优先级
@@ -199,7 +200,9 @@ spawn 本身是异步的：child 拿到开场提示词后要跑完整 agent loop
   ——并发性由异步实例模型保证，不依赖工具执行器是否并行执行 tool call。
 - local 实例共享 supervisor 的 LLM client，跑在运行时 executor 上。
 - 嵌套：child 的工具面默认可含 `agent` 工具，沿用现有委派深度上限（8，
-  agent-lib `facade/delegate.rs:448`）。
+  agent-lib `facade/delegate.rs:448`）。嵌套是 per-type 可关的能力：定义声明
+  `allow_subagents: false` 时该类型实例的 child 面不含三工具，无法继续派生（TOML
+  `[agents.<name>]` 同名键同义；绑定项上的该键被忽略，supervisor 三工具注入不变）。
 
 ## 6. external agent 统一
 

@@ -309,6 +309,7 @@ default_subagent_tools = ["read_file", "list_dir", "grep"]  # 可选：定义未
 | `tools` | 否 | 仅 local。逗号分隔；显式给出 = child 的恰好工具列表；缺省 = session 缺省 toolset（`[session].default_subagent_tools`），未配置 = session 可用工具全量；不与 supervisor 工具面取交集 |
 | `model` | 否 | 仅 local。缺省继承 supervisor 的 model；仅限同 provider 的 model |
 | `max_steps` | 否 | 仅 local。步数预算上限；缺省用运行时默认 |
+| `allow_subagents` | 否 | 仅 local。bool，缺省 `true`；`false` 时 child 工具面不注入 `agent` / `agent_result` / `agent_cancel` 三工具，该类型实例无法再嵌套 |
 | `command` / `env` | external 必选 / 否 | 仅 `kind: acp`；spawn 命令行（argv 形式）与额外环境变量 |
 
 同名定义四来源优先级（高 → 低）：**TOML > 项目级 > 用户级 > 内置**；内置提供

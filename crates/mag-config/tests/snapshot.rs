@@ -248,6 +248,38 @@ default_subagent_tools = ["read_file", "ghost"]
     assert_eq!(snapshot.project(), dto);
 }
 
+/// `[agents.<name>].allow_subagents` resolves verbatim (absent → `None`,
+/// i.e. the default `true` at definition-build time) and `project()`
+/// round-trips it losslessly (`docs/dyn-agents.md` §5.4).
+#[test]
+fn agent_allow_subagents_resolves_and_round_trips() {
+    let dto = ConfigDto::parse_str(
+        r#"
+[agents.leaf]
+allow_subagents = false
+
+[agents.plain]
+"#,
+    )
+    .expect("parse");
+    let snapshot = ConfigSnapshot::resolve(&dto, 1).expect("resolve");
+    assert_eq!(
+        snapshot
+            .agent("leaf")
+            .expect("agents.leaf")
+            .allow_subagents(),
+        Some(false)
+    );
+    assert_eq!(
+        snapshot
+            .agent("plain")
+            .expect("agents.plain")
+            .allow_subagents(),
+        None
+    );
+    assert_eq!(snapshot.project(), dto, "DTO→DO→DTO must be lossless");
+}
+
 #[test]
 fn explicit_empty_tool_list_is_distinct_from_no_tool_list() {
     let dto = ConfigDto::parse_str(

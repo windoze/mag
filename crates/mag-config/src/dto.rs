@@ -142,6 +142,12 @@ pub struct AgentDto {
     /// Per-agent budget override (falls back to `[session]` defaults).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<BudgetDto>,
+    /// Whether instances spawned from this entry (as a subagent definition)
+    /// may nest further: `false` keeps their child surface free of the
+    /// `agent` tool trio (`docs/dyn-agents.md` §5.4). Absent means `true`;
+    /// ignored on the session-bound agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_subagents: Option<bool>,
 }
 
 /// An external agent source (`[external_agents.<name>]`, decision D3).

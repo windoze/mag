@@ -1175,6 +1175,7 @@ enabled = false
                 model: None,
                 tools: None,
                 max_steps: None,
+                allow_subagents: true,
             },
             "no model/tools keys: inherit and unconstrained"
         );
@@ -1193,6 +1194,7 @@ enabled = false
                 model: Some("model-r".to_owned()),
                 tools: Some(vec!["read_file".to_owned()]),
                 max_steps: None,
+                allow_subagents: true,
             },
             "disabled tools are filtered from the definition surface"
         );

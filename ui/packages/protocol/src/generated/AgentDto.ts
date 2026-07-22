@@ -32,4 +32,11 @@ role?: string,
 /**
  * Per-agent budget override (falls back to `[session]` defaults).
  */
-budget?: BudgetDto, };
+budget?: BudgetDto, 
+/**
+ * Whether instances spawned from this entry (as a subagent definition)
+ * may nest further: `false` keeps their child surface free of the
+ * `agent` tool trio (`docs/dyn-agents.md` §5.4). Absent means `true`;
+ * ignored on the session-bound agent.
+ */
+allow_subagents?: boolean, };

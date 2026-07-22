@@ -412,6 +412,7 @@ pub struct ResolvedAgent {
     system_prompt: Option<String>,
     role: Option<String>,
     budget: Option<Budget>,
+    allow_subagents: Option<bool>,
 }
 
 impl ResolvedAgent {
@@ -468,6 +469,14 @@ impl ResolvedAgent {
         self.budget
     }
 
+    /// The subagent-definition nesting gate, when configured: `Some(false)`
+    /// keeps instances spawned from this entry (as a definition) from
+    /// nesting further; `None` means the default `true`
+    /// (`docs/dyn-agents.md` §5.4). Meaningless on the session-bound agent.
+    pub fn allow_subagents(&self) -> Option<bool> {
+        self.allow_subagents
+    }
+
     fn to_dto(&self) -> AgentDto {
         AgentDto {
             provider: self.provider.as_ref().map(|p| p.name().to_string()),
@@ -479,6 +488,7 @@ impl ResolvedAgent {
             system_prompt: self.system_prompt.clone(),
             role: self.role.clone(),
             budget: self.budget.map(Budget::to_dto),
+            allow_subagents: self.allow_subagents,
         }
     }
 }
@@ -860,6 +870,7 @@ impl ConfigSnapshot {
                     system_prompt: a.system_prompt.clone(),
                     role: a.role.clone(),
                     budget: a.budget.map(Budget::from),
+                    allow_subagents: a.allow_subagents,
                 }),
             );
         }

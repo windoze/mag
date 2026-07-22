@@ -21,13 +21,14 @@ use crate::snapshot::{ConfigSnapshot, ExternalAgentKind};
 
 /// Fields recognized in the frontmatter mapping (`docs/dyn-agents.md` §3.1
 /// field table). Anything else is an [`AgentDefError::UnknownField`].
-const KNOWN_FIELDS: [&str; 8] = [
+const KNOWN_FIELDS: [&str; 9] = [
     "name",
     "description",
     "kind",
     "tools",
     "model",
     "max_steps",
+    "allow_subagents",
     "command",
     "env",
 ];
@@ -66,6 +67,11 @@ pub enum AgentKindDef {
         tools: Option<Vec<String>>,
         /// Step-budget override; `None` uses the runtime default.
         max_steps: Option<u32>,
+        /// Whether instances of this type may spawn their own subagents:
+        /// `false` keeps the child surface free of the `agent` /
+        /// `agent_result` / `agent_cancel` tool trio, so the instance cannot
+        /// nest further (`docs/dyn-agents.md` §5.4). Defaults to `true`.
+        allow_subagents: bool,
     },
     /// An external ACP peer: spawned as a subprocess per instance.
     ExternalAcp {
@@ -194,6 +200,9 @@ impl AgentDefError {
 /// - `kind` — `local` (default) or `acp`.
 /// - `tools` — local only; a YAML list or a comma-separated string.
 /// - `model`, `max_steps` — local only.
+/// - `allow_subagents` — local only; a boolean, default `true`. `false`
+///   keeps the child surface free of the instance tool trio, so instances of
+///   the type cannot nest further (§5.4).
 /// - `command` — `acp` only and required there; a YAML list (argv form).
 /// - `env` — `acp` only; a string-to-string map.
 ///
@@ -409,6 +418,19 @@ fn take_max_steps(fields: &RawFields, stem: &str) -> Result<Option<u32>, AgentDe
     }
 }
 
+/// Reads `allow_subagents`: a boolean.
+fn take_allow_subagents(fields: &RawFields, stem: &str) -> Result<Option<bool>, AgentDefError> {
+    match present(fields, "allow_subagents") {
+        None => Ok(None),
+        Some(serde_yml::Value::Bool(value)) => Ok(Some(*value)),
+        Some(other) => Err(AgentDefError::invalid(
+            stem,
+            "allow_subagents",
+            format!("expected a boolean, got {}", yaml_kind(other)),
+        )),
+    }
+}
+
 /// Reads `env`: a string-to-string map.
 fn take_env(
     fields: &RawFields,
@@ -475,6 +497,7 @@ fn build_definition(
     let model = take_string(fields, stem, "model")?;
     let tools = take_tools(fields, stem)?;
     let max_steps = take_max_steps(fields, stem)?;
+    let allow_subagents = take_allow_subagents(fields, stem)?;
     let command = take_command(fields, stem)?;
     let env = take_env(fields, stem)?;
 
@@ -500,6 +523,7 @@ fn build_definition(
                 model,
                 tools,
                 max_steps,
+                allow_subagents: allow_subagents.unwrap_or(true),
             }
         }
         Some("acp") => {
@@ -521,6 +545,13 @@ fn build_definition(
                 return Err(AgentDefError::invalid(
                     stem,
                     "max_steps",
+                    "only valid for `kind: local` definitions",
+                ));
+            }
+            if allow_subagents.is_some() {
+                return Err(AgentDefError::invalid(
+                    stem,
+                    "allow_subagents",
                     "only valid for `kind: local` definitions",
                 ));
             }
@@ -657,6 +688,7 @@ impl AgentDefinitionRegistry {
                     model: None,
                     tools: None,
                     max_steps: None,
+                    allow_subagents: true,
                 },
                 body: GENERAL_PURPOSE_BODY.to_owned(),
                 source: DefinitionSource::Builtin,
@@ -674,6 +706,7 @@ impl AgentDefinitionRegistry {
                             .to_vec(),
                     ),
                     max_steps: None,
+                    allow_subagents: true,
                 },
                 body: EXPLORER_BODY.to_owned(),
                 source: DefinitionSource::Builtin,
@@ -787,8 +820,10 @@ impl AgentDefinitionRegistry {
     /// - every `[agents.<name>]` entry except the session-bound
     ///   `bound_agent` becomes a local definition: `role` (or the fallback
     ///   `Local subagent \`<name>\``) as the description, `system_prompt`
-    ///   (or empty) as the body, `model`, the enabled tool-name set, and the
-    ///   budget's `max_steps`;
+    ///   (or empty) as the body, `model`, the enabled tool-name set, the
+    ///   budget's `max_steps`, and `allow_subagents` (absent → `true`; the
+    ///   key on the bound entry itself is ignored — it constrains subagent
+    ///   definitions, not the supervisor);
     /// - every `[external_agents.<name>]` entry of kind `acp` becomes an
     ///   external definition (other kinds, and entries without a spawn
     ///   command, are logged and skipped).
@@ -833,6 +868,7 @@ impl AgentDefinitionRegistry {
                         model: agent.model().map(str::to_owned),
                         tools,
                         max_steps,
+                        allow_subagents: agent.allow_subagents().unwrap_or(true),
                     },
                     body: agent.system_prompt().map(str::to_owned).unwrap_or_default(),
                     source: DefinitionSource::Toml,
@@ -997,6 +1033,7 @@ Report findings back.
                 model: Some("claude-haiku-4-5".to_owned()),
                 tools: Some(strings(&["read_file", "grep"])),
                 max_steps: Some(12),
+                allow_subagents: true,
             }
         );
         assert_eq!(def.body, "You review code.\nReport findings back.");
@@ -1014,6 +1051,7 @@ Report findings back.
                 model: None,
                 tools: None,
                 max_steps: None,
+                allow_subagents: true,
             }
         );
         assert_eq!(def.body, "");
@@ -1135,6 +1173,7 @@ Task frame template.
             model: None,
             tools: Some(strings(&["read_file", "grep"])),
             max_steps: None,
+            allow_subagents: true,
         };
         assert_eq!(from_list.kind, expected);
         assert_eq!(from_flow_list.kind, expected);
@@ -1191,11 +1230,12 @@ Task frame template.
         // `env` on a local definition.
         let err = parse_agent_md("x", "---\ndescription: x\nenv:\n  FOO: bar\n---\n").unwrap_err();
         assert!(err.to_string().contains("`env`"));
-        // `tools` / `model` / `max_steps` on an acp definition.
+        // `tools` / `model` / `max_steps` / `allow_subagents` on an acp definition.
         for content in [
             "---\ndescription: x\nkind: acp\ncommand: [foo]\ntools: [grep]\n---\n",
             "---\ndescription: x\nkind: acp\ncommand: [foo]\nmodel: m\n---\n",
             "---\ndescription: x\nkind: acp\ncommand: [foo]\nmax_steps: 3\n---\n",
+            "---\ndescription: x\nkind: acp\ncommand: [foo]\nallow_subagents: false\n---\n",
         ] {
             let err = parse_agent_md("x", content).unwrap_err();
             assert!(matches!(err, AgentDefError::Validation { .. }));
@@ -1225,6 +1265,42 @@ Task frame template.
         // Non-string tools entry.
         let err = parse_agent_md("x", "---\ndescription: x\ntools: [1, 2]\n---\n").unwrap_err();
         assert!(matches!(err, AgentDefError::Validation { .. }));
+    }
+
+    #[test]
+    fn allow_subagents_defaults_to_true_and_parses_bool() {
+        // Absent: defaults to `true`.
+        let def = parse_agent_md("x", "---\ndescription: x\n---\n").unwrap();
+        assert_eq!(
+            def.kind,
+            AgentKindDef::Local {
+                model: None,
+                tools: None,
+                max_steps: None,
+                allow_subagents: true,
+            }
+        );
+        // Explicit `false` parses as-is.
+        let def =
+            parse_agent_md("x", "---\ndescription: x\nallow_subagents: false\n---\n").unwrap();
+        assert_eq!(
+            def.kind,
+            AgentKindDef::Local {
+                model: None,
+                tools: None,
+                max_steps: None,
+                allow_subagents: false,
+            }
+        );
+        // A non-boolean value is a validation error.
+        let err =
+            parse_agent_md("x", "---\ndescription: x\nallow_subagents: maybe\n---\n").unwrap_err();
+        assert!(matches!(err, AgentDefError::Validation { .. }));
+        assert!(err.to_string().contains("`allow_subagents`"));
+        // A misspelled key is still an unknown-field error, not a silent default.
+        let err =
+            parse_agent_md("x", "---\ndescription: x\nallow_subagent: false\n---\n").unwrap_err();
+        assert!(matches!(err, AgentDefError::UnknownField { .. }));
     }
 
     #[test]
@@ -1266,6 +1342,7 @@ Task frame template.
                 model: None,
                 tools: Some(strings(&["a", "b"])),
                 max_steps: None,
+                allow_subagents: true,
             }
         );
         assert_eq!(def.body, "body line");
@@ -1339,6 +1416,7 @@ default_subagent_tools = ["read_file", "list_dir", "grep"]  # 可选：定义未
                 model: None,
                 tools: None,
                 max_steps: None,
+                allow_subagents: true,
             }
         );
 
@@ -1353,6 +1431,7 @@ default_subagent_tools = ["read_file", "list_dir", "grep"]  # 可选：定义未
                 model: None,
                 tools: Some(strings(&["read_file", "list_dir", "grep"])),
                 max_steps: None,
+                allow_subagents: true,
             }
         );
     }
@@ -1483,6 +1562,7 @@ default_subagent_tools = ["read_file", "list_dir", "grep"]  # 可选：定义未
                 model: Some("gpt-5-codex".to_owned()),
                 tools: Some(strings(&["read_file", "grep"])),
                 max_steps: None,
+                allow_subagents: true,
             }
         );
 
@@ -1534,6 +1614,7 @@ enabled = false
                 model: Some("m1".to_owned()),
                 tools: Some(strings(&["read_file"])),
                 max_steps: Some(9),
+                allow_subagents: true,
             }
         );
 
@@ -1559,6 +1640,49 @@ enabled = false
                 model: None,
                 tools: None,
                 max_steps: None,
+                allow_subagents: true,
+            }
+        );
+    }
+
+    #[test]
+    fn toml_projection_maps_allow_subagents() {
+        let dto = ConfigDto::parse_str(
+            r#"
+[agents.default]
+
+[agents.leaf]
+allow_subagents = false
+"#,
+        )
+        .expect("parse toml");
+        let snapshot = ConfigSnapshot::resolve(&dto, 1).expect("resolve toml");
+
+        let registry = AgentDefinitionRegistry::from_toml_snapshot(&snapshot, "default");
+        let leaf = registry.get("leaf").expect("leaf");
+        assert_eq!(
+            leaf.kind,
+            AgentKindDef::Local {
+                model: None,
+                tools: None,
+                max_steps: None,
+                allow_subagents: false,
+            }
+        );
+
+        // An unset key defaults to `true`; the key on the bound entry is
+        // ignored entirely (the bound entry never becomes a definition, and
+        // the supervisor's own trio injection is unaffected).
+        let registry = AgentDefinitionRegistry::from_toml_snapshot(&snapshot, "leaf");
+        assert!(registry.get("leaf").is_none());
+        let default = registry.get("default").expect("default");
+        assert_eq!(
+            default.kind,
+            AgentKindDef::Local {
+                model: None,
+                tools: None,
+                max_steps: None,
+                allow_subagents: true,
             }
         );
     }

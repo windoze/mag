@@ -1772,3 +1772,35 @@ drop + warn（`child_surface_skips_unknown_default_toolset_names`、
 **文档**：`docs/dyn-agents.md` §3.1 字段表 `tools` 行、§3.3 `general-purpose` 条目、§7 工具面
 条目重写；`docs/CLI.md` §4.2 TOML 示例与 frontmatter 字段表 `tools` 行、[session] 说明、§4.4
 生效时机表同步。
+
+---
+
+## F-R 后设计修订（2026-07-22）：per-definition `allow_subagents` 嵌套开关
+
+**主题**：动态 subagent 定义新增 `allow_subagents` 字段（bool，缺省 `true`）。创建/管理子
+agent 不是所有子 agent 都需要的能力，改为在定义里显式声明；缺省允许，不影响已有语义。
+
+**语义**：
+
+- frontmatter `allow_subagents: false`（可选 bool，仅 local；acp 定义上出现按既有 kind 错配
+  规则报 `Validation` 错；加入 KNOWN_FIELDS，未知拼写仍按未知字段报错）。
+- TOML `[agents.<name>].allow_subagents`（`Option<bool>`，`None` → true；DTO→DO→`project()`
+  往返无损）。绑定项（supervisor）上出现该键被忽略——它约束的是子 agent 定义，supervisor
+  三工具注入不变。
+- `AgentKindDef::Local` 携带解析后的 bool；内置 `general-purpose`/`explorer` 均为 true。
+- 生效点（`drive_local`）：`false` → child 工具面不注入 `agent`/`agent_result`/`agent_cancel`
+  三工具，该 child 无法再嵌套；`true` 维持现状。depth 上限 8 的既有逻辑不动。
+- `describe_for_tool()` 不变（该字段是运行时行为，不影响类型选择）。
+
+**测试**：frontmatter 缺省 true / 显式 false / acp 声明报错 / 未知拼写仍报未知字段
+（`allow_subagents_defaults_to_true_and_parses_bool`，`kind_mismatched_fields_are_errors` 扩
+acp 例）；TOML DTO→DO→`project()` 往返（tests/snapshot.rs
+`agent_allow_subagents_resolves_and_round_trips`）与 `from_toml_snapshot` 投影
+（`toml_projection_maps_allow_subagents`）；spawn child 面门控
+（`child_surface_gates_instance_tools_on_allow_subagents`：false 无三工具、缺省有三工具）。
+
+**文档**：`docs/dyn-agents.md` §3.1 字段表加行、§5.4 嵌套条目补 per-type 可关说明；
+`docs/CLI.md` §4.2 frontmatter 字段表同步；ts-rs 生成物 `AgentDto.ts` 重生成
+（`allow_subagents?: boolean`，diff 受控仅此一处）。
+
+**涉及 commit**：本条目随特性 commit 提交，hash 由后续 docs commit 回填。
