@@ -1506,7 +1506,7 @@ mag-core --no-default-features`（含 `--all-targets`）✅；external 4 测试�
      `agent_result` 断言取请求**最后一个** tool result（spawn 的立即返回也是
      `status:"running"` 的 JSON，取首个会张冠李戴——M3-4 测试基建已有同结论）。
 
-### M5-2 [TODO] 文档更新：CLI.md agents 章节 + dyn-agents.md 状态
+### M5-2 [DONE] 文档更新：CLI.md agents 章节 + dyn-agents.md 状态
 
 **目标**：
 1. `docs/CLI.md`：§4.2 配置示例与结构图（:219-279）更新——`[agents.<name>]`/`[external_agents]`
@@ -1520,6 +1520,62 @@ mag-core --no-default-features`（含 `--all-targets`）✅；external 4 测试�
 
 **验证**：文档内链接与文件引用有效（对照真实代码行号抽查）；门禁序列全绿（doc 任务至少
 fmt + workspace test）。
+
+**完成记录**（2026-07-22）：
+
+- 改动（仅文档，无代码）：
+  - `docs/CLI.md`：
+    - §4.2：新增「非绑定项 = subagent 定义来源」bullet（TOML 投影进 `AgentDefinition`
+      注册表，绑定项仍是 supervisor 自身装配）；TOML 示例注释更新——`[agents.reviewer]`
+      改为定义来源写法（`role`→description、`system_prompt`→定义正文、`model` 限同
+      provider，删去会误导的 `provider = "local_proxy"` 行），`[external_agents.peer_acp]`
+      注释改为「按实例拉起进程」；示例后新增 markdown 定义文件块
+      （`~/.config/mag/agents/*.md` / `<项目>/.mag/agents/*.md`、8 字段 frontmatter 表、
+      内置 `general-purpose`/`explorer`、四来源优先级 TOML > 项目 > 用户 > 内置、注册表
+      装配/重建时机）。
+    - §3.3 重写为 `agent`/`agent_result`/`agent_cancel` 工具表 + 异步实例模型（spawn
+      立即返回 `{id,status:"running"}`、生命周期事件 `AgentInstanceStarted/Finished`、
+      完成通知 pivot/空闲缓冲双通道、cancel 级联、`[tools.agent]` tier、origin 冒泡
+      `{delegate=实例id, depth}`、CLI `[from <id>@depth<n>]` 前缀——与 mag-cli
+      `origin_prefix` 实际格式一致）。
+    - §4.4 生效时机表：原 providers/external_agents 与 agents.* 两行重排为 providers /
+      绑定项 / subagent 定义三行（定义注册表随会话创建装配、随 `apply_config` 重建、只
+      影响之后的 spawn）；turn 边界应用 bullet 补「并重建 subagent 定义注册表」。
+    - §5 P7 行重写为动态 subagent 体系（已实现，指向 `dyn-agents.md`）；表后注更正 P2
+      的 origin 路由由 mag 侧 origin 路由器实现（不再依赖 agent-lib A1）。
+    - §5A 顶部加 2026-07-22 supersede 注记（委派相关条目 A1/A3/A6/A7/A9/A10 与 §D 两条
+      随静态委派退役或被取代；A2/A4/A5/A8 与 §D 其余条目仍有效）；§6 external 测试
+      bullet、§7 D3/D5、§0 目标表 #3/#4 与非目标 dispatcher 条目、§1.2 render 注记同步
+      改写；`ask_<name>` 作为现行机制的描述全部移除（仅 §5A 历史评估正文与 supersede
+      注记中作为史实保留）。
+  - `docs/dyn-agents.md`：状态行改为「已实现（2026-07-22，TODO.md M1–M5-1）」；§11 新增
+    wall-clock 条目（external 实例对「持续输出但永不完成」的对端无整体时长上限——120s
+    为 ACP transport 每读 idle 超时，仅覆盖静默对端；依赖协作式 cancel 终止；进程池/
+    常驻复用为后续优化；M4-R 结论）。
+  - 根 `README.md`：grep 确认无 delegation/subagent/`ask_` 提及（仅 agent-lib 库名与
+    mag-sources 的 local-agent 描述），未改动。
+- 抽查（文档 ↔ 真实代码）：工具名 `agent`/`agent_result`/`agent_cancel`
+  （`crates/mag-core/src/instances/spawn.rs:90-96`）；spawn 返回 `{id,status:"running"}`、
+  `agent_result` 超时返回 `{"status":"running"}`（spawn.rs:10/34）；`AgentDefinition`/
+  `AgentKindDef`（`crates/mag-config/src/agent_def.rs:57/80`，Local{model,tools,max_steps} /
+  ExternalAcp{command,env}）；frontmatter 8 字段（agent_def.rs:24-33 KNOWN_FIELDS）；四
+  来源优先级 Builtin<User<Project<Toml（agent_def.rs:37-52）；TOML 投影 role→description、
+  provider 不投影（agent_def.rs:782-840）；`AgentInstanceStarted/Finished`
+  （`crates/mag-service/src/service.rs:454-483`）；`InteractionOrigin{delegate,depth}` 及
+  serde default=root（`crates/mag-service/src/lib.rs:689-700`）；定义表 apply 时重建、目录
+  层重读、只影响之后的 spawn（`crates/mag-core/src/driver.rs:674-679,723-734`）；
+  `[tools.agent]` tier（engine.rs:4848-4860）；CLI origin 前缀格式
+  `[from {delegate}@depth{n}]`（`crates/mag-cli/src/lib.rs:1552-1554`）；120s 每读 idle
+  超时（spawn.rs:840,878 + M4-R 记录）。文档内相对链接 `(dyn-agents.md)`/`(DESIGN.md)`/
+  `(ACP.md)` 目标均存在。
+- 门禁（doc 任务两项，实跑）：`cargo fmt --all -- --check` ✅；`cargo test --workspace`
+  ✅（全套件 ok、0 failed、exit 0）。
+- 偏差：
+  1. §5A 正文未逐条改写——它是注明日期（2026-07-20）的 agent-lib 评估记录，且其中
+     `ask_<name>` 等陈述对 agent-lib 库本身仍为事实（旧 API 按计划保留在库内、mag 侧
+     停用）；以节首 supersede 注记消除与现行体系的矛盾。
+  2. §4.4 表格由 4 行扩为 5 行（subagent 定义独立一行），§6 测试策略相应由「四行」改为
+     「每行」。
 
 ### M5-R [TODO] M5 review：e2e 与文档
 

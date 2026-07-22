@@ -6,7 +6,7 @@
 > 定义文件、单一 `agent` 工具入口）与 [Codex custom agents](https://simonwillison.net/2026/Mar/16/codex-subagents/)
 > （内置只读 `explorer`、工具面约束）。
 >
-> 状态：设计已定稿，待实现。
+> 状态：已实现（2026-07-22，TODO.md M1–M5-1；实现偏差见 §11 与各任务完成记录）。
 
 ## 0. 背景与动机
 
@@ -277,6 +277,10 @@ TOML `[external_agents.<name>]` 与 markdown `kind: acp` 定义等价，同为�
 - `model` 字段受 M4-R 限制（delegate 独立 provider 未接通），只能选 supervisor 同
   provider 的 model。
 - external 按实例拉起有进程启动开销；进程池 / 常驻复用是后续优化。
+- external 实例对「持续输出但永不完成」的对端**无 wall-clock 上限**：120s 是 ACP
+  transport 的**每读 idle 超时**（静默对端每读最多挂 120s → SessionLost → Failed +
+  进程回收），不约束整体运行时长；不再需要的运行依赖协作式 cancel（`agent_cancel` /
+  会话级级联）终止。进程池 / 常驻复用同为后续优化（M4-R 结论）。
 - 实例的 UI 展示（TUI/web 中的实例列表、实时进度）依赖实例事件投影，本阶段只落
   journal。
 - 完成通知：run 中经 pivot 通道（纯文本 turn 无窗口，可能延迟到下一边界）；run 空闲
