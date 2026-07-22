@@ -1506,6 +1506,8 @@ mag-core --no-default-features`（含 `--all-targets`）✅；external 4 测试�
      `agent_result` 断言取请求**最后一个** tool result（spawn 的立即返回也是
      `status:"running"` 的 JSON，取首个会张冠李戴——M3-4 测试基建已有同结论）。
 
+### M5-2 [TODO] 文档更新：CLI.md agents 章节 + dyn-agents.md 状态
+
 **目标**：
 1. `docs/CLI.md`：§4.2 配置示例与结构图（:219-279）更新——`[agents.<name>]`/`[external_agents]`
    语义改为"subagent 定义来源"；新增 `~/.config/mag/agents/*.md` 与 `.mag/agents/*.md` 定义
