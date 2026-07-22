@@ -14,13 +14,14 @@
 //!
 //! The drive task assembles the child facade agent from the definition: the
 //! layered system prompt ([`SUBAGENT_SKELETON`] + definition body, §4), the
-//! supervisor's tool surface filtered by the definition's `tools` allowlist
-//! plus the `agent` tool itself for nesting (§5.4/§7), the supervisor's
-//! approval-policy projection, and an [`OriginRouter`] that bubbles every
-//! paused interaction to the root session's [`IpcApproval`] with the
-//! instance's attribution (§4/§7). The run's final assistant text becomes the
-//! instance report (the report contract of §4); the terminal transition goes
-//! through [`AgentInstanceRegistry::complete`] and is announced as
+//! supervisor's tool surface filtered by the supervisor's own surface bound
+//! and the definition's `tools` allowlist plus the `agent` tool itself for
+//! nesting (§5.4/§7), the supervisor's approval-policy projection, and an
+//! [`OriginRouter`] that bubbles every paused interaction to the root
+//! session's [`IpcApproval`] with the instance's attribution (§4/§7). The
+//! run's final assistant text becomes the instance report (the report
+//! contract of §4); the terminal transition goes through
+//! [`AgentInstanceRegistry::complete`] and is announced as
 //! [`Event::AgentInstanceFinished`].
 //!
 //! `agent_result` (§5.1, D8) blocks on one instance's terminal state under a
@@ -111,14 +112,16 @@ your task brief.
   (`path:line`), and anything left unresolved.";
 
 /// Session-wide spawn state shared by every [`InstanceSpawnContext`] of one
-/// session: the merged agent-definition table and the supervisor's effective
-/// model (`docs/dyn-agents.md` §3.2/§7).
+/// session: the merged agent-definition table, the supervisor's effective
+/// model, and the supervisor's plugin-surface filter
+/// (`docs/dyn-agents.md` §3.2/§7).
 ///
-/// Both pieces are hot-swappable behind one lock: the session driver rebuilds
-/// the definition table at config-apply time (the TOML definition layer is
-/// re-projected and re-merged), and the supervisor model follows the built
-/// agent's authoritative value at build and at every turn start (an applied
-/// `SetModel` reconfiguration lands at the turn boundary). The root
+/// All three pieces are hot-swappable behind one lock: the session driver
+/// rebuilds the definition table at config-apply time (the TOML definition
+/// layer is re-projected and re-merged), the supervisor model follows the
+/// built agent's authoritative value at build and at every turn start (an
+/// applied `SetModel` reconfiguration lands at the turn boundary), and the
+/// surface filter follows a bound tool-list change the same way. The root
 /// supervisor's context and every child context derived from it share the
 /// same cell, so a rebuilt table takes effect for the next spawn at any depth
 /// (definitions only affect *later* spawns, M3-5).
@@ -127,7 +130,7 @@ pub(crate) struct SharedSpawnState {
     inner: Arc<RwLock<SpawnStateInner>>,
 }
 
-/// The swappable pair behind [`SharedSpawnState`].
+/// The swappable triple behind [`SharedSpawnState`].
 #[derive(Clone, Debug)]
 struct SpawnStateInner {
     /// Merged definition table the `agent` tool's `type` resolves against.
@@ -135,16 +138,28 @@ struct SpawnStateInner {
     /// The supervisor's effective model; a definition without `model`
     /// inherits it, and `max_tokens` always aligns with it.
     supervisor_model: ModelRef,
+    /// The supervisor's plugin-surface filter — its bound `agents.<name>`
+    /// tool list; `None` is unconstrained. Every instance surface is
+    /// intersected with it (§7's anti-escalation rule: a definition, which
+    /// is data possibly shipped by a project, must never grant a child a
+    /// plugin the supervisor itself does not have). The instance tool trio
+    /// is exempt, exactly as on the supervisor's own surface.
+    surface: Option<Vec<String>>,
 }
 
 impl SharedSpawnState {
-    /// Creates the shared cell from the assembled definition table and the
-    /// supervisor's model.
-    pub(crate) fn new(definitions: AgentDefinitionRegistry, supervisor_model: ModelRef) -> Self {
+    /// Creates the shared cell from the assembled definition table, the
+    /// supervisor's model, and the supervisor's plugin-surface filter.
+    pub(crate) fn new(
+        definitions: AgentDefinitionRegistry,
+        supervisor_model: ModelRef,
+        surface: Option<Vec<String>>,
+    ) -> Self {
         Self {
             inner: Arc::new(RwLock::new(SpawnStateInner {
                 definitions,
                 supervisor_model,
+                surface,
             })),
         }
     }
@@ -159,6 +174,18 @@ impl SharedSpawnState {
     /// applied `SetModel`).
     pub(crate) fn set_supervisor_model(&self, supervisor_model: ModelRef) {
         self.lock().supervisor_model = supervisor_model;
+    }
+
+    /// Replaces only the supervisor's plugin-surface filter (config apply
+    /// changed the bound entry's tool list).
+    pub(crate) fn set_surface(&self, surface: Option<Vec<String>>) {
+        self.lock().surface = surface;
+    }
+
+    /// Returns the supervisor's current plugin-surface filter (`None` is
+    /// unconstrained).
+    pub(crate) fn surface(&self) -> Option<Vec<String>> {
+        self.lock().surface.clone()
     }
 
     /// Returns a clone of the definition named `name` (the `agent` tool's
@@ -731,12 +758,26 @@ async fn drive_local(
     let user_interaction = Arc::new(IpcUserInteractionBridge::new(
         origin.clone() as Arc<dyn InteractionHandler>
     ));
-    // §7: the child surface is the supervisor's projection intersected with
-    // the definition's allowlist (`None` inherits everything), plus the
-    // instance tools of the child's own context for nesting (§5.4).
+    // §7: the child surface is the supervisor's plugin projection narrowed
+    // by the supervisor's own surface filter (the bound `agents.<name>`
+    // tool list — the anti-escalation anchor, shared at every depth) and
+    // intersected with the definition's allowlist (`None` inherits the
+    // supervisor's surface), plus the instance tools of the child's own
+    // context for nesting (§5.4).
+    let allowed: Option<Vec<String>> = match (ctx.shared.surface(), tools.clone()) {
+        (None, None) => None,
+        (Some(bound), None) => Some(bound),
+        (None, Some(definition)) => Some(definition),
+        (Some(bound), Some(definition)) => Some(
+            definition
+                .into_iter()
+                .filter(|name| bound.contains(name))
+                .collect(),
+        ),
+    };
     let (mut surface, policy) = project_tool_plugins(
         &ctx.tools,
-        tools.as_deref(),
+        allowed.as_deref(),
         ctx.overrides.default_tier(),
         user_interaction,
     );
@@ -843,6 +884,16 @@ mod tests {
         definitions: AgentDefinitionRegistry,
         depth: u32,
     ) -> TestRig {
+        rig_with_surface(client, tools, definitions, depth, None)
+    }
+
+    fn rig_with_surface(
+        client: &Arc<FakeLlmClient>,
+        tools: ToolRegistry,
+        definitions: AgentDefinitionRegistry,
+        depth: u32,
+        surface: Option<Vec<String>>,
+    ) -> TestRig {
         let events = EventBus::new();
         let session_id = SessionId::new(Uuid::from_u128(7));
         let ipc = Arc::new(IpcApproval::new(
@@ -861,6 +912,7 @@ mod tests {
                     None,
                     None,
                 ),
+                surface,
             ),
             client: client.clone() as Arc<dyn LlmClient>,
             tools: Arc::new(tools),
@@ -1939,11 +1991,13 @@ mod tests {
     }
 
     /// Spawns one `agent_type` instance and returns the tool names the child
-    /// advertised on its first LLM request (sorted).
+    /// advertised on its first LLM request (sorted). `surface` is the
+    /// supervisor's plugin-surface filter (`None` = unconstrained).
     fn child_tool_names(
         tools: ToolRegistry,
         definitions: AgentDefinitionRegistry,
         agent_type: &str,
+        surface: Option<Vec<String>>,
     ) -> Vec<String> {
         run_local(async move {
             let client = routed_client(
@@ -1953,7 +2007,7 @@ mod tests {
                 ))],
                 supervisor_scripts(json!({ "type": agent_type, "task": "t" })),
             );
-            let rig = rig(&client, tools, definitions);
+            let rig = rig_with_surface(&client, tools, definitions, 0, surface);
             let mut agent = supervisor_agent(&rig);
 
             tokio::time::timeout(Duration::from_secs(5), drive_supervisor(&mut agent, "go"))
@@ -1983,6 +2037,7 @@ mod tests {
             ToolRegistry::with_builtins(),
             AgentDefinitionRegistry::builtin(),
             "general-purpose",
+            None,
         );
         assert_eq!(
             names,
@@ -2005,6 +2060,7 @@ mod tests {
             ToolRegistry::with_builtins(),
             AgentDefinitionRegistry::builtin(),
             "explorer",
+            None,
         );
         // `tools = [read_file, list_dir, grep]` narrows the supervisor's
         // surface; the instance tool trio is always appended (§5.1/§5.4).
@@ -2028,7 +2084,54 @@ mod tests {
             "reader.md",
             "---\nname: reader\ndescription: reads files only\ntools: read_file, ghost\n---\nRead things carefully.\n",
         );
-        let names = child_tool_names(ToolRegistry::with_builtins(), dir.definitions(), "reader");
+        let names = child_tool_names(
+            ToolRegistry::with_builtins(),
+            dir.definitions(),
+            "reader",
+            None,
+        );
+        assert_eq!(
+            names,
+            ["agent", "agent_cancel", "agent_result", "read_file"]
+        );
+    }
+
+    /// §7's anti-escalation rule: a child never widens past the supervisor's
+    /// own (binding-narrowed) surface — a definition with no `tools` inherits
+    /// the narrowed surface, and an explicit `tools` allowlist is intersected
+    /// with it. The instance tool trio is exempt (§5.1).
+    #[test]
+    fn child_surface_is_bounded_by_the_supervisor_surface() {
+        let bound = || Some(vec!["read_file".to_owned(), "shell".to_owned()]);
+        // The definition sets no `tools`: it inherits the supervisor's
+        // narrowed surface, not the full registry (`ask_user`, `grep`,
+        // `list_dir` are all out).
+        let names = child_tool_names(
+            ToolRegistry::with_builtins(),
+            AgentDefinitionRegistry::builtin(),
+            "general-purpose",
+            bound(),
+        );
+        assert_eq!(
+            names,
+            [
+                "agent",
+                "agent_cancel",
+                "agent_result",
+                "read_file",
+                "shell"
+            ]
+        );
+
+        // An explicit `tools` allowlist is intersected with the supervisor's
+        // surface: `explorer` names `grep`/`list_dir`, which the supervisor
+        // itself does not have, so they drop out.
+        let names = child_tool_names(
+            ToolRegistry::with_builtins(),
+            AgentDefinitionRegistry::builtin(),
+            "explorer",
+            bound(),
+        );
         assert_eq!(
             names,
             ["agent", "agent_cancel", "agent_result", "read_file"]

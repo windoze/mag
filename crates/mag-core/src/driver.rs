@@ -661,7 +661,10 @@ impl SessionDriver {
     ///   with no registered plugin is skipped with a warn log. An agent entry
     ///   with no tool list imposes no constraint and leaves the current
     ///   surface untouched; an explicit `tools = []` clears the plugin
-    ///   surface while the instance tools remain.
+    ///   surface while the instance tools remain. The spawn context's shared
+    ///   surface filter follows the same projection, so instances spawned
+    ///   after the apply stay bounded by the supervisor's new surface
+    ///   (`docs/dyn-agents.md` §7).
     /// - `system_prompt` → this driver's config-controlled overlay target. The
     ///   target is queued as [`ReconfigRequest::SetSystemPromptOverlay`] right
     ///   before the next turn starts instead of being stored in the agent's
@@ -698,6 +701,23 @@ impl SessionDriver {
             _ => None,
         }) {
             self.spawn_ctx.shared.set_supervisor_model(model);
+        }
+        // Mirror a bound tool-list change into the spawn surface filter (§7):
+        // the facade's `ReplaceToolSet` lands at the next turn boundary, so
+        // instances spawned from the next run on stay bounded by the
+        // supervisor's own surface. An entry without a tool list leaves the
+        // current filter untouched, matching the `ReplaceToolSet` rule (this
+        // is the same enabled-name projection `reconfig_requests` applies).
+        if let Some(agent_config) = snapshot.agent(&self.agent_name)
+            && let Some(tools) = agent_config.tools_list()
+        {
+            self.spawn_ctx.shared.set_surface(Some(
+                tools
+                    .iter()
+                    .filter(|tool| tool.is_enabled())
+                    .map(|tool| tool.name().to_owned())
+                    .collect(),
+            ));
         }
         self.apply_reconfig_items(session_id, requests);
         // Rebuild the definition table in the shared spawn state
@@ -1117,6 +1137,7 @@ fn root_spawn_context(
         shared: SharedSpawnState::new(
             assemble_agent_definitions(config.cwd.as_deref(), binding.agent_definitions().clone()),
             supervisor_model,
+            binding.tools().map(<[String]>::to_vec),
         ),
         client,
         tools,
@@ -1841,6 +1862,45 @@ mod tests {
         driver_with_cwd(client, None)
     }
 
+    /// Builds a driver whose session binding is resolved from `snapshot`
+    /// (the bound entry's tool list seeds the spawn surface filter, §7).
+    fn driver_with_binding(
+        client: std::sync::Arc<FakeLlmClient>,
+        snapshot: &mag_config::ConfigSnapshot,
+    ) -> super::SessionDriver {
+        use crate::EventBus;
+        use crate::assembly::{ApprovalOverrides, SessionBinding};
+        use crate::engine::approval::{AskFrontendDecider, IpcApproval};
+        use crate::turn_complete::TurnCompleteHub;
+
+        let config = mag_service::SessionConfig {
+            provider: "fake".to_owned(),
+            model: "fake-model".to_owned(),
+            tool_profile: None,
+            cwd: None,
+            routing: mag_service::RoutingMode::ModelRouted,
+            budget: None,
+        };
+        let events = EventBus::new();
+        let approval = std::sync::Arc::new(IpcApproval::new(
+            session_id(),
+            events.clone(),
+            std::sync::Arc::new(AskFrontendDecider),
+        ));
+        super::SessionDriver::new(
+            &config,
+            client,
+            std::sync::Arc::new(mag_tools::ToolRegistry::with_builtins()),
+            approval,
+            TurnCompleteHub::default(),
+            &SessionBinding::resolve(&config, Some(snapshot)),
+            &ApprovalOverrides::default(),
+            session_id(),
+            events,
+        )
+        .expect("build session driver")
+    }
+
     fn driver_with_cwd(
         client: std::sync::Arc<FakeLlmClient>,
         cwd: Option<std::path::PathBuf>,
@@ -1964,6 +2024,65 @@ role = "Researches topics."
             assert_eq!(requests.len(), 1);
             assert_eq!(requests[0].model, "model-b");
         });
+    }
+
+    /// §7 (M3-R): the spawn surface filter — the anti-escalation bound every
+    /// child surface is intersected with — is seeded from the bound entry's
+    /// tool list at build and follows a tool-list change at config apply; an
+    /// entry without a tool list leaves the filter untouched.
+    #[test]
+    fn spawn_surface_filter_follows_the_bound_tool_list() {
+        use mag_config::{ConfigDto, ConfigSnapshot};
+
+        // An unconstrained binding leaves the filter open.
+        let driver = driver_for_test(FakeLlmClient::scripted(Vec::new()));
+        assert_eq!(driver.spawn_ctx.shared.surface(), None);
+
+        // A bound tool list seeds the filter at build.
+        let dto = ConfigDto::parse_str(
+            r#"
+[agents.default]
+tools = ["read_file", "shell"]
+"#,
+        )
+        .expect("config parses");
+        let snapshot = ConfigSnapshot::resolve(&dto, 1).expect("config resolves");
+        let mut driver = driver_with_binding(FakeLlmClient::scripted(Vec::new()), &snapshot);
+        assert_eq!(
+            driver.spawn_ctx.shared.surface(),
+            Some(vec!["read_file".to_owned(), "shell".to_owned()])
+        );
+
+        // A config apply with a new list re-seeds the filter.
+        let dto = ConfigDto::parse_str(
+            r#"
+[agents.default]
+tools = ["grep"]
+"#,
+        )
+        .expect("config parses");
+        let snapshot = ConfigSnapshot::resolve(&dto, 2).expect("config resolves");
+        driver.apply_config(session_id(), &snapshot);
+        assert_eq!(
+            driver.spawn_ctx.shared.surface(),
+            Some(vec!["grep".to_owned()])
+        );
+
+        // An entry without a tool list leaves the filter untouched (the same
+        // rule `ReplaceToolSet` follows).
+        let dto = ConfigDto::parse_str(
+            r#"
+[agents.default]
+model = "model-b"
+"#,
+        )
+        .expect("config parses");
+        let snapshot = ConfigSnapshot::resolve(&dto, 3).expect("config resolves");
+        driver.apply_config(session_id(), &snapshot);
+        assert_eq!(
+            driver.spawn_ctx.shared.surface(),
+            Some(vec!["grep".to_owned()])
+        );
     }
 
     /// M3-5 restore compatibility: a snapshot persisted before the static

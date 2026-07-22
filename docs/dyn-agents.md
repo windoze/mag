@@ -283,5 +283,7 @@ TOML `[external_agents.<name>]` 与 markdown `kind: acp` 定义等价，同为�
   经下一次输入前缀缓冲；无"空闲即触发新 turn"的通道。
 - 嵌套实例的深度/预算由 mag 侧注册表实现，不与 agent-lib 的 `RunContext` 委派链共享
   （实例是独立 root ctx）；深度上限语义沿用 8。
-- spawn 审批粒度：v1 视 `ApprovalDecision` 变体情况，可能只有 per-tool tier
-  （`[tools.agent]`），per-type（`agent:<type>`）留 follow-up。
+- spawn 审批粒度：v1 只有 per-tool tier（`[tools.agent]`）——M3-5 实证 agent-lib
+  `ApprovalDecision` 只有 `Approve / Deny / Timeout / Cancel` 四变体、无 Ask/暂停变体
+  （暂停语义由 `ApprovalKind::Ask` tier 自身表达），per-type（`agent:<type>`）留
+  follow-up。

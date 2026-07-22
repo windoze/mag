@@ -1140,7 +1140,7 @@ LLM 请求的消息流（FakeLlmClient 记录请求内容可断）；② run 结
      纯文本 turn 无窗口——未落地窗口的通知不丢，转入下一次 turn 的前缀块（测试②
      覆盖的正是该路径）。
 
-### M3-R [TODO] M3 review：local 实例运行时
+### M3-R [DONE] M3 review：local 实例运行时
 
 **内容**：
 - review M3 全部 diff：spawn_local 纪律（全库无新增 `tokio::spawn`）；!Send 边界没有被破坏；
@@ -1150,6 +1150,105 @@ LLM 请求的消息流（FakeLlmClient 记录请求内容可断）；② run 结
 - 对照设计 §4/§5/§7/§8 逐条核对；per-type tier 的验证结论（M3-5 第 4 点）记录到完成记录，
   若是降级则更新 `docs/dyn-agents.md` §11。
 **验证**：门禁序列全绿；问题修复并附完成记录。
+
+**完成记录**（2026-07-22）：review 范围 `git diff 55c296c..HEAD`（17 文件，+5491/-1887，
+M3-1..M3-6 六任务）。逐项检查单结论如下；发现一处 §7 语义缺口（supervisor 面收窄不约束
+child 面，防提权意图落空），已最小修复随本 review 提交；另 §11 per-type tier 条目按实证
+结论更新措辞。
+
+- **检查单 1（!Send / spawn_local 纪律）**：diff 全量 grep `tokio::spawn`——生产代码零
+  新增；唯一新命中是 `instances.rs` 并发 register 单测（registry 自身 Send，与 facade
+  无关）及 spawn.rs 模块文档注释。实例驱动走 `instances/spawn.rs` 的
+  `tokio::task::spawn_local`（session `LocalSet` 内，child Agent 在该 future 内构建并
+  驱动到底），facade !Send 边界未破坏。
+- **检查单 2（origin 归因）**：`OriginRouter`（spawn.rs:594 起）与 agent-lib
+  `DelegationInteractionRouter`（`../agent-lib/src/facade/delegate/handler.rs:227-248`）
+  逐行同构——`with_origin(InteractionOrigin::new(label=实例 id, depth))` +
+  `tokio::select! { biased; cancel => .., parent.fulfill => .. }` 包装；
+  `cancelled_interaction_result` 逐变体复刻 crate-private 的
+  `cancelled_delegation_interaction_result`（Approval→Deny "interaction cancelled" /
+  Question→空答 / Choice→0 / Permission→cancel）。depth 1-based：root ctx depth=0、
+  实例=spawner+1；测试断言 `origin.delegate == "general-purpose-1"`、`depth == 1`、
+  `!is_root()`，与旧委派测试（`engine/approval.rs:1248`）语义一致。
+- **检查单 3（退役面无残留）**：mag workspace grep——`DelegateBinding` / `.subagent(` /
+  `delegate_worker` / `apply_delegate_start_tiers` / `delegate_start_tool_name` /
+  `external_acp_delegate` / `split_external_command` / `TrackedExternalSessionHandler` /
+  `cleanup_external_sessions` 均 0 命中；`prune_unregistered` 2 命中即 M3-5 偏差 1 的
+  保留调用 + rustdoc（driver.rs:302/368）；`ask_` 命中全为活机制（`ask_user`/`ask_tool`）、
+  `history.rs:184` 只读旧数据投影、注释与 legacy 测试夹具。**偏差 1 论证成立**：agent-lib
+  `facade/agent/snapshot.rs:793-837` rustdoc 实证——不 re-register 且不 prune 时持久化
+  delegate 以 `ApprovalPolicy::default`（auto_allow）复活且 `ask_<name>` 留在工具面；
+  prune 在零 re-registration 下是纯单向清扫（声明随 recipe 一起从 current/initial tool
+  set 删除，不触发 InvalidState）。抽查测试
+  `restore_sweeps_legacy_delegates_from_an_old_snapshot`：真实快照注入 legacy recipe +
+  `ask_legacy` 声明 → restore 不崩、surface 无 `ask_legacy`、`subagents()` 为空、三工具
+  在面。
+- **检查单 4（registry 并发与竞态）**：全部终态迁移走 `Instance::transition` 单一入口
+  （status Mutex 内判 terminal + 置位，出锁后 `notify_waiters`）——cancel 与 complete
+  并发时首次迁移胜出、每实例恰好一条通知；`cancel`/`cancel_all` 仅在胜出时触发
+  CancelHandle（句柄至多一次、不覆盖已达成 Completed 报告）。`agent_result` 的
+  `await_terminal` 逐字为 check → `Notified::enable` → re-check → wait 无竞态范式
+  （enable 先于状态检查，落在 check 与 wait 之间的迁移必然唤醒）；cancel 抢占 select 形状
+  对照 agent-lib `fulfill_batch_cancellable`。run 两条 Cancelled 路径 +
+  `impl Drop for SessionDriver`（driver.rs:891）均级联 `cancel_all`。
+- **检查单 5（分层 prompt §4 + 工具面交集 §7）**：§4 逐条一致——`SUBAGENT_SKELETON`
+  覆盖角色（supervisor 子代理）/开场=任务简报/预算内自主/审批经 origin 冒泡不直达用户/
+  最终消息=报告（结论、改动、`path:line`、遗留），`layered_system_prompt` = 骨架 +
+  `"\n\n"` + body（空 body 只用骨架），builder `.system()` 一次性传入（§4"两层拼好
+  一次性传入"）。**§7 发现缺口**：child 面交集此前只交 session 注册表全量
+  （`def.tools ∩ registry`），supervisor 绑定收窄（`agents.<name>.tools`）不约束
+  child——`tools` 缺省时 child 面可能宽于 supervisor 自身，§7"缺省=继承 supervisor
+  工具面 / 显式取交集（防提权）"落空；M3-3 偏差 7 把它留给 M3-5，M3-5 未落地也未记录。
+  修复见下。
+- **检查单 6（M3-6 通知通道）**：pivot 归因 `PivotSource::Host { label:
+  format!("agent:{id}") }`（driver.rs:1025），id 来自结构化 `InstanceNotification` 而非
+  文案回解析；`PivotMessage`/`PivotSource` 经 `agent_lib::agent::` 路径引入（未改
+  agent-lib）；run 终态只 drop user pivot、通知留 `pending_notifications`
+  （driver.rs:570-575 分野注释明确），`take_pending_notifications` 折
+  `[agent 实例通知]` 前缀块、stream 建立失败早退路径放回缓冲（driver.rs:474-476）；
+  message id 外部分配高位 = epoch 纳秒 tag——agent-lib `facade/ids.rs:72-75` 明文
+  `continuing_after` 只考虑低 64 位空间的 id，高位非零者被忽略、facade 小计数器永不与之
+  冲突，restore 重播种不受影响（实证一致）。
+- **检查单 7（§8 退役清单 + §11）**：§8 七行逐条——① `ask_<name>` 合成工具退役 ✓
+  （grep + engine/CLI 三处 surface 断言无 `ask_*`）；② build/restore 静态注册退役 ✓
+  （零 `.subagent(`）；③ `prune_unregistered_delegates` 偏差保留，论证成立（见检查单 3）；
+  ④ `apply_delegate_start_tiers` tier 迁移——实际落 per-tool `[tools.agent]`（三工具无
+  derived gate，插件投影后追加、再 `apply_per_tool_tiers`），per-type 留 follow-up；
+  ⑤ `agents.<name>.system_prompt` 保留为 TOML 定义层 ✓（M2-2 已核）；⑥
+  `[external_agents]` 常驻连接退役 ✓（`external_acp_delegate` 删除，per-instance 拉起属
+  M4）；⑦ `Delegation::single_tool` 复用——实际以 facade `Tool::function_with_schema`
+  自建三工具，无 agent-lib 耦合（实现形态差异，§8 语义目标达成）。per-type tier 验证结论
+  复核：`agent-lib/src/agent/approval.rs:76-85` 实证 `ApprovalDecision` 只有
+  Approve/Deny/Timeout/Cancel 四变体、无 Ask/暂停变体，M3-5 结论属实；§11 条目已更新为
+  实证措辞（修复 2）。
+- **检查单 8（测试质量）**：M3 新增测试与各任务验证清单一一对应（registry 9、
+  instances::spawn 22、driver 21、engine::instances 5、persist/CLI 改写等）；时序同步全部
+  走 gate（`StreamGate`/`GatedStubTool`/`await_until`，5s 兜底超时、卡住即 bug）——仅两处
+  sleep：`await_until` 轮询间隔（gate 模式，非时序断言）与 spawn.rs 的 50ms 负断言
+  （断言 `agent_result` 阻塞期间 supervisor 不推进——负断言无法 gate；单线程 runtime +
+  充裕窗口，慢 CI 只放大窗口不致 flaky）；engine.rs 的 10ms 为带 5s 超时的正条件轮询。
+- **检查单 9（mag-acp/mag-cli wildcard）**：mag-acp `map.rs:298` `_ => None`、mag-cli
+  `lib.rs:1340` `_ => {}`——`AgentInstanceStarted/Finished` 落 wildcard，编译无感（serde
+  向后兼容新增成立）；展示层本阶段**不补**（设计 §11"实例的 UI 展示…本阶段只落
+  journal"，M3-5 偏差 5 已记 CLI 无渲染、e2e 待 M5-1），结论记录于此。
+- **修复内容**（随本 review 提交，均最小改动）：
+  1. **§7 supervisor 面过滤**（防提权缺口）：`SharedSpawnState` 增
+     `surface: Option<Vec<String>>`（绑定 `agents.<name>.tools` 的 enabled 投影，与
+     definitions/model 同 cell hot-swappable）；`drive_local` 有效 allowlist =
+     `bound ∩ def.tools`（def 缺省=继承 bound、两者皆空=全量），实例三工具豁免（与
+     supervisor 面"收窄不剥实例面"语义一致）；`root_spawn_context` 以 `binding.tools()`
+     播种；`apply_config` 镜像更新（entry 无 tools 键=过滤不动，同 `ReplaceToolSet`
+     规则）。新增测试 2 个：`child_surface_is_bounded_by_the_supervisor_surface`
+     （缺省继承收窄面 + bound∩def 交集双向断言）、
+     `spawn_surface_filter_follows_the_bound_tool_list`（build 播种 + apply 重播种 +
+     无键不动）。
+  2. `docs/dyn-agents.md` §11 per-type tier 条目由"视变体情况，可能只有 per-tool"更新为
+     M3-5 实证结论。
+- **门禁结果**（全部实跑）：`cargo fmt --all -- --check` ✅；
+  `cargo clippy --all-targets -- -D warnings` ✅（0 warning）；
+  `cargo test --workspace` ✅（32 套件 379 passed 0 failed，含新增 2 测试）；
+  `cargo doc --no-deps --workspace` ✅（mag-config 1 个既有 rustdoc warning，同
+  M3-1..M3-6 记录，与本任务无关）；`cargo check -p mag-core --no-default-features` ✅。
 
 ---
 
