@@ -1755,7 +1755,7 @@ child 面计算。
 交集语义会静默阉割项目携带的定义（定义声明的工具因 supervisor 未配而悄悄消失），并堵死
 coordinator 拓扑（面被刻意收窄的 supervisor 无法派出需要更多工具的 child）。
 
-**涉及 commit**：`<提交后回填>`
+**涉及 commit**：`62fb5d3`
 
 **测试**：M3-R 两个"supervisor 收窄约束 child"测试语义反转（driver.rs
 `child_surface_ignores_the_supervisor_bound_tool_list` +
