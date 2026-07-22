@@ -1629,7 +1629,7 @@ review 范围 `f725317..HEAD`（`45df2fd` + `9d1d200` + `2185d3c`）。逐项结
 
 ---
 
-## F-R [TODO] 全计划 review
+## F-R [DONE] 全计划 review
 
 **内容**：
 - 对照 `docs/dyn-agents.md` 全量核对：D1–D8 逐条落地情况；§8 退役清单全库 grep 复核
@@ -1641,3 +1641,89 @@ review 范围 `f725317..HEAD`（`45df2fd` + `9d1d200` + `2185d3c`）。逐项结
 - 修复全部发现的问题，必要时在依赖位置插最小修复任务。
 
 **验证**：门禁全绿；`docs/dyn-agents.md` 状态与偏差记录最终一致；完成记录归档。
+
+**完成记录**（2026-07-22）：
+
+review 范围：mag `git diff 3e2a56f..HEAD`（24 文件，+9554/-1858，14 commit）+ agent-lib
+`8db05c7`（唯一 commit）。逐项核对结论：
+
+1. **D1–D8 逐条落地 ✅**（代码证据）：
+   - D1 agent 自主创建：`agent` 是普通 facade 工具、由模型 tool call 触发
+     （`instances/spawn.rs:323` `agent_tool`），无用户命令路径。
+   - D2 markdown 定义：`parse_agent_md`（`mag-config/src/agent_def.rs:205`，YAML
+     frontmatter + 正文即 prompt，Claude Code 格式）；内置只读 `explorer`
+     （`builtin()` :648，`tools=[read_file,list_dir,grep]`，Codex 参照）。
+   - D3 实例化多并发：`register` + `spawn_local` 后立即返回
+     `{"id","status":"running"}`（spawn.rs:402-415）；实例即用即抛、不进 restore。
+   - D4 分层 prompt + 兜底：`SUBAGENT_SKELETON`（spawn.rs:120）+
+     `layered_system_prompt`（:621）骨架+正文两层；`DEFAULT_AGENT_TYPE =
+     "general-purpose"`（:103），builtin 定义永存。
+   - D5 单一 `agent` 工具：`AGENT_TOOL_NAME` + `type` 参数（:90、:331-348），描述动态
+     枚举全部类型；无 per-type 合成工具（§8 grep 见检查单 2）。
+   - D6 异步 spawn + 拉/推双通道：拉 = `agent_result` 阻塞（:494-507）；推 = run 中
+     pivot `PivotSource::Host { label: "agent:<id>" }`（driver.rs:1045）+ run 空闲
+     `[agent 实例通知]` 前缀缓冲（driver.rs:621-623、:965）。
+   - D7 external 统一：同一 `agent` 工具按 `definition.kind` 分派（spawn.rs:712-717）；
+     external 经 `run_external_once` 按实例拉起、终态回收（:901），与 local 同一
+     注册表/事件/生命周期/审批冒泡。
+   - D8 `agent_result` 阻塞+超时：`tokio::time::timeout(timeout_secs, await_terminal)`
+     缺省 600s（:100、:494），超时返回 `running` 不置失败（:507），cancel 可抢占。
+2. **§8 退役清单 grep 复核 ✅**（mag workspace，agent-lib 库内旧 API 按计划保留不查）：
+   `subagent(`/`DelegateBinding`/`delegate_worker`/`apply_delegate_start_tiers`/
+   `delegate_start_tool_name`/`external_acp_delegate`/`TrackedExternalSessionHandler`/
+   `cleanup_external_sessions` 在 `crates/` 均 0 命中；`ask_` 命中全为活机制
+   （`ask_user`/`ask_tool`/`ApprovalPolicyKind::Ask`）、`history.rs:184` 只读旧数据
+   投影、退役注释与 legacy 测试夹具、以及"surface 无 `ask_*`"否定断言；
+   `prune_unregistered` 仅 2 命中（driver.rs:302 rustdoc + :368 restore 调用）=
+   M3-5 偏差 1 的唯一残留。偏差论证复核成立：agent-lib `snapshot.rs:793-837` rustdoc
+   实证不 re-register 且不 prune 时持久化 delegate 以 `ApprovalPolicy::default`
+   （auto_allow）复活且 `ask_<name>` 留在工具面；零 re-registration 下 prune 是纯单向
+   清扫（声明随 recipe 一并从 current/initial tool set 移除）。§8 七行去向逐条与实现
+   一致（⑦ `Delegation::single_tool` 复用的实现形态差异 M3-R 已记录在案）。
+3. **§11 已知限制 ✅（补 1 条）**：既有 7 条（M4-R model 同 provider 限制、external
+   启动开销、external 无 wall-clock 上限、实例 UI 后补、通知通道窗口限制、嵌套独立
+   root ctx、per-type tier follow-up）逐条与实现核对一致，无"记录了但已解决"条目。
+   发现 1 条"实现了但没记录"：M3-5 偏差 4（supervisor 面 `agent` 工具描述 build 时
+   烘焙，apply_config 后仅随 `ReplaceToolSet` 刷新——driver.rs:833-839 实证）此前只在
+   完成记录里，已正式补入 §11（修复 2）。
+4. **全量门禁（全部实跑）**：
+   - mag：`cargo fmt --all -- --check` ✅；`cargo clippy --all-targets -- -D warnings`
+     ✅（0 warning）；`cargo test --workspace` ✅（exit 0，全套件 ok、0 failed）；
+     `cargo check -p mag-core --no-default-features --all-targets` ✅；
+     `cargo doc --no-deps --workspace` ✅（mag-config 1 个既有 rustdoc warning，同
+     M3-1 起记录）。
+   - agent-lib：`cargo fmt -- --check` ✅；`cargo clippy --all-targets -- -D warnings`
+     默认与 `--features external-acp` 两组合 ✅；`cargo test` 默认与
+     `--features external-acp` 两组合 ✅。
+   - ts-rs：`cargo test -p mag-service --features ts-export export_ts` 后
+     `git diff --exit-code -- ui/packages/protocol/src` ✅ 无漂移。
+5. **rustdoc 覆盖 ✅**：本计划新 pub API 全部有文档——agent_def 全模块
+   （`#![warn(missing_docs)]` + clippy `-D warnings` 机械保证）；`run_external_once`
+   一次性语义/三终态回收保证/Errors 段齐备（agent-lib delegate.rs:600-633）；wire 新
+   变体与 `AgentInstanceStatusWire` 类型级+字段级文档（mag-service lib.rs:307-323、
+   :642-648）。
+6. **secret 纪律 ✅**：`git diff 3e2a56f..HEAD` 全量按常见 secret 形态（sk-/bearer/
+   password/api_key/AKIA/ghp_/xox 等）grep，无解析后 secret 值（仅 "task-frame" 一类
+   误命中）；配置与测试夹具中 secret 仅以 `{env=...}`/`{keyring=...}` 引用形态出现
+   （agent_def.rs:1282/1287）。
+7. **计划外改动审查 ✅**：`--stat` 24 文件全部落在任务单 scope（mag-config 定义模型、
+   mag-core 实例运行时与接线、mag-service wire、测试、文档、ts-rs 生成物、TODO 与依赖
+   清单）；`ui/` 下用户 4 个未提交文件（apps/web/package.json、pnpm-lock.yaml、
+   postcss.config.js、tailwind.config.ts）未被任何 commit 触及（本任务提交也不含）；
+   agent-lib 仅 `8db05c7` 一个 commit 且工作树干净。
+8. **PLAN.md 完成定义逐条 ✅**：17 个任务（含 M1-R..M5-R 各 review）全 `[DONE]` 且有
+   完成记录（本任务收尾后 18/18）；两仓库门禁序列实跑全绿（检查单 4）；测试全离线
+   （FakeLlmClient scripted_routes / fake-acp.sh / tempdir），实例相关套件均为秒级；
+   退役面 grep 干净（检查单 2）；公开 API rustdoc 全覆盖（检查单 5）；wire 变体 ts-rs
+   无漂移（检查单 4）；本记录即 F-R，发现的问题已修复（下）。
+
+**修复内容**（随本 review 提交，均最小改动）：
+1. `crates/mag-core/src/instances/spawn.rs` `split_external_command` rustdoc 更正：原文
+   称"TOML `[external_agents]` 投影不校验空 command"，与 M4-R 已更正的结论相悖
+   （`agent_def.rs:850` 空 command skip+warn、`io.rs:157` 加载期拒绝空 argv）——改为
+   如实描述两条真实配置路径均已校验、`None` 臂为不可达的纵深防御。
+2. `docs/dyn-agents.md` §11 补 supervisor 面 `agent` 描述烘焙滞后条目（M3-5 偏差 4 的
+   正式收录，见检查单 3）。
+
+**遗留事项**：全部收录于 §11（7+1 条），本 review 无新增；M5-R defer 的 CLI 实例渲染
+e2e 维持原结论，随实例 UI 里程碑一并补。

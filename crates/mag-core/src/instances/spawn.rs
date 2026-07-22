@@ -960,8 +960,10 @@ fn external_task(body: &str, task: &str) -> String {
 }
 
 /// Splits an argv-form external command into binary + args; `None` when the
-/// command is empty (TOML `[external_agents]` projection does not validate
-/// it, unlike the markdown frontmatter parser).
+/// command is empty. Both real definition paths already reject an empty
+/// command (the markdown frontmatter parser at parse time, the TOML
+/// projection with a skip-and-warn — `docs/dyn-agents.md` §3.1, TODO M4-R),
+/// so the `None` arm is unreachable defense in depth.
 #[cfg(feature = "external-acp")]
 fn split_external_command(command: &[String]) -> Option<(PathBuf, Vec<String>)> {
     let (binary, args) = command.split_first()?;

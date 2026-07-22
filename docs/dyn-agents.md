@@ -6,7 +6,7 @@
 > 定义文件、单一 `agent` 工具入口）与 [Codex custom agents](https://simonwillison.net/2026/Mar/16/codex-subagents/)
 > （内置只读 `explorer`、工具面约束）。
 >
-> 状态：已实现（2026-07-22，TODO.md M1–M5-1；实现偏差见 §11 与各任务完成记录）。
+> 状态：已实现（2026-07-22，TODO.md M1–M5 + F-R 全部完成；实现偏差见 §11 与各任务完成记录）。
 
 ## 0. 背景与动机
 
@@ -291,3 +291,7 @@ TOML `[external_agents.<name>]` 与 markdown `kind: acp` 定义等价，同为�
   `ApprovalDecision` 只有 `Approve / Deny / Timeout / Cancel` 四变体、无 Ask/暂停变体
   （暂停语义由 `ApprovalKind::Ask` tier 自身表达），per-type（`agent:<type>`）留
   follow-up。
+- supervisor 面 `agent` 工具的类型枚举描述在会话 build 时烘焙：`apply_config` 重建
+  定义表后新定义立即可 spawn（handler 侧解析走新表），但展示给 model 的描述文本仅随
+  `ReplaceToolSet`（绑定项配了 `tools` 时）刷新；无该键时会话内描述保持旧表，属纯
+  展示层滞后（M3-5 偏差 4）。
