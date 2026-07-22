@@ -107,8 +107,8 @@ pub(crate) async fn session_new(
     responder: Responder<NewSessionResponse>,
     _connection: ConnectionTo<Client>,
 ) -> Result<(), agent_client_protocol::Error> {
-    let config = map::new_session_request_to_config(&request);
-    match service.create_session(config).await {
+    let cwd = map::new_session_request_cwd(&request);
+    match service.create_session(Some(cwd), None).await {
         Ok(session_id) => {
             let acp_session_id = map::mag_session_id_to_acp(session_id);
             responder.respond(NewSessionResponse::new(acp_session_id))

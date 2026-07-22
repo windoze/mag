@@ -13,7 +13,6 @@ import type {
   RequestId,
   RunErrorKind,
   RunId,
-  SessionConfig,
   SessionId,
   SessionInfo,
   SessionStatusWire,
@@ -167,8 +166,10 @@ export type RunView =
 export interface SessionView {
   /** Stable session identity. */
   readonly id: SessionId;
-  /** Last known session configuration. */
-  readonly config?: SessionConfig;
+  /** Bound agent-template name, when known. */
+  readonly agent?: string;
+  /** Runtime working root, when set. */
+  readonly cwd?: string;
   /** Last metadata row returned by `list_sessions`, when loaded. */
   readonly info?: SessionInfo;
   /** Derived status used by sidebars. */
@@ -220,8 +221,10 @@ export interface SessionStoreOptions {
 export interface CreateSessionResult {
   /** Created session identity. */
   readonly id: SessionId;
-  /** Stored session configuration. */
-  readonly config: SessionConfig;
+  /** Bound agent-template name. */
+  readonly agent: string;
+  /** Runtime working root, when set. */
+  readonly cwd?: string;
 }
 
 /** Response shape returned by `POST /api/sessions/{id}/messages`. */
@@ -232,7 +235,8 @@ export interface SendMessageResult {
 
 interface MutableSession {
   id: SessionId;
-  config?: SessionConfig;
+  agent?: string;
+  cwd?: string;
   info?: SessionInfo;
   status: SessionStatusWire;
   messages: ConversationMessage[];
@@ -594,14 +598,21 @@ export class SessionStore {
     pendingInteractions.forEach((interaction) => this.installInteraction(session, interaction));
   }
 
-  /** Sends a create-session command and syncs the returned session row. */
-  async createSession(config: SessionConfig): Promise<CreateSessionResult> {
+  /**
+   * Sends a create-session command and syncs the returned session row.
+   *
+   * `agent` names the agent template to bind; omit it to use the backend's
+   * configured default agent. `cwd` is the session's runtime working root.
+   */
+  async createSession(agent?: string, cwd?: string): Promise<CreateSessionResult> {
     const result = (await this.transport.send({
       type: "create_session",
-      config
+      ...(cwd === undefined ? {} : { cwd }),
+      ...(agent === undefined ? {} : { agent })
     })) as CreateSessionResult;
-    const session = this.ensureSession(result.id, result.config);
-    session.config = result.config;
+    const session = this.ensureSession(result.id, result.agent, result.cwd);
+    session.agent = result.agent;
+    session.cwd = result.cwd;
     this.notify();
     return result;
   }
@@ -719,7 +730,7 @@ export class SessionStore {
 
     switch (event.type) {
       case "session_created":
-        this.applySessionCreated(event.id, event.config);
+        this.applySessionCreated(event.id, event.agent, event.cwd ?? undefined);
         break;
       case "run_started":
         this.applyRunStarted(event.id, event.run_id);
@@ -824,9 +835,10 @@ export class SessionStore {
       ...this.sessionOrder.filter((id) => !listedIds.includes(id))
     ];
     infos.forEach((info) => {
-      const session = this.ensureSession(info.id, info.config);
+      const session = this.ensureSession(info.id, info.agent, info.cwd);
       session.info = info;
-      session.config = info.config;
+      session.agent = info.agent;
+      session.cwd = info.cwd;
       session.status = info.status;
       if (info.status === "running" && session.run.state === "idle") {
         session.run = { state: "running" };
@@ -883,9 +895,10 @@ export class SessionStore {
     }
   }
 
-  private applySessionCreated(id: SessionId, config: SessionConfig): void {
-    const session = this.ensureSession(id, config);
-    session.config = config;
+  private applySessionCreated(id: SessionId, agent: string, cwd?: string): void {
+    const session = this.ensureSession(id, agent, cwd);
+    session.agent = agent;
+    session.cwd = cwd;
   }
 
   private applyRunStarted(id: SessionId, runId: RunId): void {
@@ -1056,18 +1069,22 @@ export class SessionStore {
     session.thread.push({ type: "message", message });
   }
 
-  private ensureSession(id: SessionId, config?: SessionConfig): MutableSession {
+  private ensureSession(id: SessionId, agent?: string, cwd?: string): MutableSession {
     const existing = this.sessions.get(id);
     if (existing !== undefined) {
-      if (config !== undefined) {
-        existing.config = config;
+      if (agent !== undefined) {
+        existing.agent = agent;
+      }
+      if (cwd !== undefined) {
+        existing.cwd = cwd;
       }
       return existing;
     }
 
     const session: MutableSession = {
       id,
-      config,
+      agent,
+      cwd,
       status: "idle",
       messages: [],
       toolCalls: [],
@@ -1095,7 +1112,8 @@ export class SessionStore {
 
     return {
       id: session.id,
-      config: session.config,
+      agent: session.agent,
+      cwd: session.cwd,
       info: session.info,
       status: session.status,
       messages: [...session.messages],

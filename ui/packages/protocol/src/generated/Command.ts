@@ -3,7 +3,6 @@ import type { ConfigDto } from "./ConfigDto";
 import type { InteractionResponseWire } from "./InteractionResponseWire";
 import type { MessageAttachment } from "./MessageAttachment";
 import type { RequestId } from "./RequestId";
-import type { SessionConfig } from "./SessionConfig";
 import type { SessionId } from "./SessionId";
 
 /**
@@ -11,9 +10,13 @@ import type { SessionId } from "./SessionId";
  */
 export type Command = { "type": "create_session", 
 /**
- * Session configuration to persist and use for the driver.
+ * Runtime working root for the session, when the interface supplies one.
  */
-config: SessionConfig, } | { "type": "list_sessions" } | { "type": "resume_session", 
+cwd?: string | null, 
+/**
+ * Agent-template name to bind; `None` uses the configured default agent.
+ */
+agent?: string | null, } | { "type": "list_sessions" } | { "type": "resume_session", 
 /**
  * Session to resume.
  */

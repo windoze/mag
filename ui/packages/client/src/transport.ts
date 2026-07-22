@@ -76,7 +76,16 @@ export function commandToRequest(command: Command): RequestPlan {
     case "list_sessions":
       return { method: "GET", path: "/api/sessions" };
     case "create_session":
-      return { method: "POST", path: "/api/sessions", body: command.config };
+      return {
+        method: "POST",
+        path: "/api/sessions",
+        body: {
+          ...(command.cwd === undefined || command.cwd === null ? {} : { cwd: command.cwd }),
+          ...(command.agent === undefined || command.agent === null
+            ? {}
+            : { agent: command.agent })
+        }
+      };
     case "resume_session":
       return { method: "POST", path: `/api/sessions/${encodePathSegment(command.id)}/resume` };
     case "get_session_history":

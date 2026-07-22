@@ -37,7 +37,7 @@ use futures::{StreamExt, stream};
 use mag_core::{ConfigService, Engine};
 use mag_service::{
     ApprovalDecisionWire, HistoryEntry, InteractionKindWire, InteractionResponseWire, MagService,
-    RoutingMode, RunErrorKind, ServiceEvent, SessionConfig, SessionId, StepIdWire, ToolCallIdWire,
+    RunErrorKind, ServiceEvent, SessionId, StepIdWire, ToolCallIdWire,
     ToolStatusWire, UserInput,
 };
 use mag_tools::{PermissionSpec, ToolCategory, ToolPlugin, ToolRegistry, ToolRisk};
@@ -366,16 +366,10 @@ fn engine_with_config(
     Engine::with_config_service(client, tools, config)
 }
 
-/// Session config used by the web client.
-fn session_config() -> SessionConfig {
-    SessionConfig {
-        provider: "default".to_owned(),
-        model: "wire-model".to_owned(),
-        tool_profile: None,
-        cwd: None,
-        routing: RoutingMode::ModelRouted,
-        budget: None,
-    }
+/// `POST /api/sessions` request body used by the web client: binds the
+/// configured `default` agent template.
+fn session_request_body() -> serde_json::Value {
+    json!({ "agent": "default" })
 }
 
 /// A spawned loopback web server.
@@ -777,7 +771,7 @@ async fn web_protocol_e2e_drives_engine_over_http_and_sse() {
         &server,
         "POST",
         "/api/sessions",
-        Some(serde_json::to_value(session_config()).expect("session config serializes")),
+        Some(session_request_body()),
     )
     .await;
     assert_eq!(response.status, 200, "create session response");
@@ -1102,7 +1096,7 @@ async fn create_session(server: &TestServer) -> SessionId {
         server,
         "POST",
         "/api/sessions",
-        Some(serde_json::to_value(session_config()).expect("session config serializes")),
+        Some(session_request_body()),
     )
     .await;
     assert_eq!(response.status, 200, "create session response");

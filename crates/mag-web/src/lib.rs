@@ -22,9 +22,9 @@ use axum::{
 use futures::{Stream, StreamExt, stream};
 use mag_service::{
     ConfigDto, HistoryEntry, InteractionResponseWire, MagService, RequestId, RunId, ServiceError,
-    ServiceEvent, SessionConfig, SessionId, SessionInfo, SourceInfo, UserInput,
+    ServiceEvent, SessionId, SessionInfo, SourceInfo, UserInput,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     convert::Infallible,
@@ -606,10 +606,22 @@ fn content_type(path: &str) -> &'static str {
     }
 }
 
+/// `POST /api/sessions` request body. Both fields are optional: an absent
+/// `agent` binds the configured default agent, and `cwd` is the session's
+/// runtime working root.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct CreateSessionRequest {
+    cwd: Option<PathBuf>,
+    agent: Option<String>,
+}
+
 #[derive(Serialize)]
 struct CreateSessionResponse {
     id: SessionId,
-    config: SessionConfig,
+    agent: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -623,10 +635,18 @@ async fn list_sessions(State(state): State<AppState>) -> Result<Json<Vec<Session
 
 async fn create_session(
     State(state): State<AppState>,
-    Json(config): Json<SessionConfig>,
+    Json(request): Json<CreateSessionRequest>,
 ) -> Result<Json<CreateSessionResponse>, ApiError> {
-    let id = state.service.create_session(config.clone()).await?;
-    Ok(Json(CreateSessionResponse { id, config }))
+    let CreateSessionRequest { cwd, agent } = request;
+    let id = state
+        .service
+        .create_session(cwd.clone(), agent.clone())
+        .await?;
+    // The resolved binding is echoed authoritatively by the `SessionCreated`
+    // event and `list_sessions`; the synchronous response reflects the request
+    // (the requested agent name, or `default` when none was named).
+    let agent = agent.unwrap_or_else(|| "default".to_owned());
+    Ok(Json(CreateSessionResponse { id, agent, cwd }))
 }
 
 async fn resume_session(
@@ -825,7 +845,7 @@ mod tests {
         http::{HeaderValue, Method, Request},
     };
     use futures::{StreamExt, stream};
-    use mag_service::{RoutingMode, ServiceEvent, SourceKindWire};
+    use mag_service::{ServiceEvent, SourceKindWire};
     use serde::de::DeserializeOwned;
     use serde_json::{Value, json};
     use std::{
@@ -848,7 +868,7 @@ mod tests {
 
     #[derive(Clone, Debug, PartialEq)]
     enum Call {
-        CreateSession(SessionConfig),
+        CreateSession(Option<PathBuf>, Option<String>),
         ListSessions,
         ResumeSession(SessionId),
         GetSessionHistory(SessionId),
@@ -932,14 +952,18 @@ mod tests {
 
     #[async_trait]
     impl MagService for ScriptedService {
-        async fn create_session(&self, config: SessionConfig) -> Result<SessionId, ServiceError> {
-            self.push(Call::CreateSession(config));
+        async fn create_session(
+            &self,
+            cwd: Option<PathBuf>,
+            agent: Option<String>,
+        ) -> Result<SessionId, ServiceError> {
+            self.push(Call::CreateSession(cwd, agent));
             self.result(session_id())
         }
 
         async fn list_sessions(&self) -> Result<Vec<SessionInfo>, ServiceError> {
             self.push(Call::ListSessions);
-            self.result(vec![SessionInfo::new(session_id(), config())])
+            self.result(vec![session_info()])
         }
 
         async fn resume_session(&self, id: SessionId) -> Result<(), ServiceError> {
@@ -1060,15 +1084,11 @@ mod tests {
         RunId::parse_str("00000000-0000-0000-0000-000000000003").expect("valid run id")
     }
 
-    fn config() -> SessionConfig {
-        SessionConfig {
-            provider: "openai".to_owned(),
-            model: "gpt-5-codex".to_owned(),
-            tool_profile: Some("default".to_owned()),
-            cwd: None,
-            routing: RoutingMode::ModelRouted,
-            budget: None,
-        }
+    // The agent-template name the scripted service binds sessions to.
+    const AGENT_NAME: &str = "openai";
+
+    fn session_info() -> SessionInfo {
+        SessionInfo::new(session_id(), AGENT_NAME.to_owned(), None)
     }
 
     fn input(text: &str) -> UserInput {
@@ -1370,7 +1390,6 @@ mod tests {
         let id = session_id();
         let request_id = request_id();
         let session_path = format!("/api/sessions/{id}");
-        let config = config();
         let message = input("hello");
         let pivot = input("steer");
         let interaction = interaction_response();
@@ -1383,7 +1402,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             body_json::<Value>(response).await,
-            json_value(vec![SessionInfo::new(id, config.clone())])
+            json_value(vec![session_info()])
         );
 
         let response = app
@@ -1391,14 +1410,14 @@ mod tests {
             .oneshot(request(
                 Method::POST,
                 "/api/sessions",
-                Some(json_value(config.clone())),
+                Some(json!({ "agent": AGENT_NAME })),
             ))
             .await
             .expect("create session response");
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             body_json::<Value>(response).await,
-            json!({ "id": id, "config": config.clone() })
+            json!({ "id": id, "agent": AGENT_NAME })
         );
 
         let response = app
@@ -1554,7 +1573,7 @@ mod tests {
             service.calls(),
             vec![
                 Call::ListSessions,
-                Call::CreateSession(config.clone()),
+                Call::CreateSession(None, Some(AGENT_NAME.to_owned())),
                 Call::ResumeSession(id),
                 Call::GetSessionHistory(id),
                 Call::SendMessage(id, message),
@@ -1698,7 +1717,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             body_json::<Value>(response).await,
-            json_value(vec![SessionInfo::new(session_id(), config())])
+            json_value(vec![session_info()])
         );
         assert_eq!(service.calls(), vec![Call::ListSessions]);
     }

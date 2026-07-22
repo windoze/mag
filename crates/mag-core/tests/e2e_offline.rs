@@ -42,8 +42,8 @@ use async_trait::async_trait;
 use futures::{StreamExt, stream, stream::BoxStream};
 use mag_core::Engine;
 use mag_service::{
-    ApprovalDecisionWire, InteractionKindWire, InteractionResponseWire, MagService, RoutingMode,
-    ServiceEvent, SessionConfig, SessionId, StepIdWire, ToolCallIdWire, UserInput,
+    ApprovalDecisionWire, InteractionKindWire, InteractionResponseWire, MagService, ServiceEvent,
+    SessionId, StepIdWire, ToolCallIdWire, UserInput,
 };
 use mag_tools::{PermissionSpec, ToolCategory, ToolPlugin, ToolRegistry, ToolRisk};
 use serde_json::{Value, json};
@@ -333,18 +333,35 @@ impl Drop for TempDb {
     }
 }
 
-// —— Shared helpers ——————————————————————————————————————————————————————————
+/// A unique temporary directory holding a `config.toml`, removed on drop.
+struct TempConfigDir(PathBuf);
 
-fn config(model: &str) -> SessionConfig {
-    SessionConfig {
-        provider: "fake".to_owned(),
-        model: model.to_owned(),
-        tool_profile: None,
-        cwd: None,
-        routing: RoutingMode::ModelRouted,
-        budget: None,
+impl TempConfigDir {
+    fn new() -> Self {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!("mag-e2e-cfg-{}-{nanos}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&path).expect("create temp config dir");
+        Self(path)
+    }
+
+    fn config_path(&self) -> PathBuf {
+        self.0.join("config.toml")
     }
 }
+
+impl Drop for TempConfigDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+// —— Shared helpers ——————————————————————————————————————————————————————————
 
 /// Builds an approval response; `step_id`/`call_id` are reconstructed from the
 /// stored interaction, so nil placeholders are fine (`docs/DESIGN.md` §3.3).
@@ -453,7 +470,7 @@ async fn full_offline_backbone_through_service() {
     // Step 0: create a session and observe the SessionCreated event.
     let mut global = service1.subscribe(None);
     let session = service1
-        .create_session(config("fake-main"))
+        .create_session(None, None)
         .await
         .expect("create session");
     assert!(
@@ -661,24 +678,41 @@ async fn full_offline_backbone_through_service() {
 /// isolation across the shared event bus.
 #[tokio::test]
 async fn concurrent_sessions_are_isolated_by_subscription() {
-    // Per-model routing makes each session's reply deterministic regardless of the
-    // order the two concurrent actors pull scripts.
+    // Each session binds a distinct agent template (`a` / `b`) whose model keys
+    // the fake client's per-model queue, so each session's reply is deterministic
+    // regardless of the order the two concurrent actors pull scripts.
     let fake = FakeLlm::by_model(vec![
         ("fake-a", vec![text_turn(&["alpha"], usage(1, 1))]),
         ("fake-b", vec![text_turn(&["beta"], usage(1, 1))]),
     ]);
     let client: Arc<dyn LlmClient> = fake;
-    let service: Arc<dyn MagService> = Arc::new(Engine::with_llm_client_and_tools(
+
+    let dir = TempConfigDir::new();
+    std::fs::write(
+        dir.config_path(),
+        r#"
+[agents.a]
+model = "fake-a"
+
+[agents.b]
+model = "fake-b"
+"#,
+    )
+    .expect("write config");
+    let config =
+        Arc::new(mag_core::ConfigService::load_or_default(dir.config_path()).expect("load config"));
+    let service: Arc<dyn MagService> = Arc::new(Engine::with_config_service(
         client,
         ToolRegistry::new(),
+        config,
     ));
 
     let a = service
-        .create_session(config("fake-a"))
+        .create_session(None, Some("a".to_owned()))
         .await
         .expect("create session a");
     let b = service
-        .create_session(config("fake-b"))
+        .create_session(None, Some("b".to_owned()))
         .await
         .expect("create session b");
     let mut events_a = service.subscribe(Some(a));

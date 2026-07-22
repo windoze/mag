@@ -36,12 +36,6 @@ import {
 import { ConfigPage } from "./ConfigPage";
 import { SourcesPage } from "./SourcesPage";
 
-const DEFAULT_SESSION_CONFIG = {
-  provider: "openai",
-  model: "gpt-5-codex",
-  routing: "model_routed"
-} satisfies Parameters<SessionStore["createSession"]>[0];
-
 let browserStore: SessionStore | undefined;
 
 /** Draft-map key for the composer before any session is selected. */
@@ -162,7 +156,7 @@ export function App(props: AppProps = {}): React.JSX.Element {
   };
 
   const createAndOpenSession = async (): Promise<string> => {
-    const created = await store.createSession(DEFAULT_SESSION_CONFIG);
+    const created = await store.createSession();
     setRoute({ page: "session", sessionId: created.id });
     await store.openSession(created.id);
     await store.refreshSessions();
@@ -355,14 +349,15 @@ function selectActiveSession(
 }
 
 function toSidebarSession(session: SessionView): SidebarSessionView {
-  const config = session.info?.config ?? session.config;
+  const agent = session.info?.agent ?? session.agent;
+  const cwd = session.info?.cwd ?? session.cwd;
   return {
     id: session.id,
     title: session.info?.title ?? firstUserMessage(session)?.text ?? session.id,
-    cwd: config?.cwd,
+    cwd,
     lastActiveAt: session.info?.last_active_at,
     status: session.status,
-    subtitle: config === undefined ? undefined : `${config.provider} / ${config.model}`
+    subtitle: agent
   };
 }
 

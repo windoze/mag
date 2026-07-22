@@ -63,11 +63,8 @@ export const historyEntry = {
 
 export const sessionInfo = {
   id: sessionId,
-  config: {
-    provider: "anthropic",
-    model: "claude-sonnet-4-5",
-    routing: "model_routed"
-  },
+  agent: "default",
+  cwd: "/work/session-root",
   title: "Inspect README",
   last_active_at: 1721234567890,
   status: "idle"

@@ -19,6 +19,12 @@
 //! `#[non_exhaustive]`) may be added, but the semantics, names, and shapes of
 //! existing items must not change. Any breaking change requires re-opening this
 //! contract review rather than silently editing an interface crate around it.
+//!
+//! The pre-release removal of the `SessionConfig` wire type (session creation now
+//! takes an optional agent-template name plus an optional runtime `cwd`, both
+//! resolved against the current configuration snapshot) is one such re-opened
+//! change: `provider`/`model`/`budget`/`routing`/`tool_profile` were properties
+//! of the bound `[agents.<name>]` template, not per-session wire inputs.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -132,10 +138,19 @@ define_id!(
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
-    /// Create a new session with the supplied configuration.
+    /// Create a new session.
+    ///
+    /// Both fields are optional. `agent` names the `[agents.<name>]` (or
+    /// `[external_agents.<name>]`) template to bind; `None` binds the
+    /// `[session].default_agent` (else the built-in `default`). `cwd` is the
+    /// session's runtime working root; `None` keeps the agent's default `"."`.
     CreateSession {
-        /// Session configuration to persist and use for the driver.
-        config: SessionConfig,
+        /// Runtime working root for the session, when the interface supplies one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<PathBuf>,
+        /// Agent-template name to bind; `None` uses the configured default agent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
     },
     /// List currently known sessions.
     ListSessions,
@@ -212,8 +227,11 @@ pub enum Event {
     SessionCreated {
         /// Created session identity.
         id: SessionId,
-        /// Configuration stored for the session.
-        config: SessionConfig,
+        /// Resolved agent-template name the session bound to.
+        agent: String,
+        /// Runtime working root the session was created with, when set.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<PathBuf>,
     },
     /// A run started for a session.
     RunStarted {
@@ -400,47 +418,6 @@ pub enum RunErrorKind {
     BudgetExhausted,
 }
 
-/// Configuration used when creating or resuming a session.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts-export", ts(optional_fields))]
-pub struct SessionConfig {
-    /// AI provider or source key, such as `openai` or `local`.
-    pub provider: String,
-    /// Model identifier understood by the selected provider.
-    pub model: String,
-    /// Named tool profile to attach to the session.
-    ///
-    /// **Reserved, currently a dead field**: nothing in mag-core reads it —
-    /// the session's tool surface comes from the bound `agents.<name>` entry
-    /// of the pinned config snapshot. It stays on the wire for forward
-    /// compatibility (serde round-trips it), and a future tool-profile
-    /// concept may give it meaning.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_profile: Option<String>,
-    /// Session working root supplied by the interface (for ACP, the client's
-    /// absolute `cwd`).
-    ///
-    /// When present, the path becomes the facade agent's worktree, so the
-    /// built-in tools (`read_file`/`shell`/`grep`/`list_dir`) resolve relative
-    /// to it under `safe_join`. `None` keeps the agent's default `"."` root and,
-    /// because the field is `#[serde(default)]`, also lets snapshots persisted
-    /// before this field existed deserialize unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<PathBuf>,
-    /// Routing strategy for future delegation support.
-    #[serde(default)]
-    pub routing: RoutingMode,
-    /// Optional per-run budget limits enforced by agent-lib's budget ledger.
-    ///
-    /// `None` (the default) keeps the run unbounded, matching agent-lib's
-    /// `BudgetLimits::unbounded()`. When the ledger refuses further work the
-    /// run ends with a [`RunErrorKind::BudgetExhausted`] error. The budget
-    /// resets on every top-level run, so limits apply per turn.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub budget: Option<SessionBudget>,
-}
-
 /// Per-run budget limits configurable on a session.
 ///
 /// Mirrors agent-lib's `BudgetLimits` with a wire-friendly shape (wall time in
@@ -462,19 +439,6 @@ pub struct SessionBudget {
     /// Maximum wall-clock time per run, in seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_wall_time_secs: Option<u64>,
-}
-
-/// Delegation routing mode reserved in the session configuration.
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
-pub enum RoutingMode {
-    /// Supervisor model decides when and where to delegate.
-    #[default]
-    ModelRouted,
-    /// A dispatcher component decides which delegate should receive a task.
-    Dispatcher,
 }
 
 /// Optional user-message attachment metadata.
@@ -997,14 +961,12 @@ mod ts_exports {
         export_type::<PermissionDecisionWire>(&config);
         export_type::<PermissionRiskWire>(&config);
         export_type::<RequestId>(&config);
-        export_type::<RoutingMode>(&config);
         export_type::<RunErrorKind>(&config);
         export_type::<RunId>(&config);
         export_type::<RunOutput>(&config);
         export_type::<ServiceError>(&config);
         export_type::<ServiceEvent>(&config);
         export_type::<SessionBudget>(&config);
-        export_type::<SessionConfig>(&config);
         export_type::<SessionId>(&config);
         export_type::<SessionInfo>(&config);
         export_type::<SessionStatusWire>(&config);
@@ -1054,17 +1016,6 @@ mod tests {
 
     fn call_id() -> ToolCallIdWire {
         ToolCallIdWire::new(uuid(6))
-    }
-
-    fn config() -> SessionConfig {
-        SessionConfig {
-            provider: "openai".to_owned(),
-            model: "gpt-5-codex".to_owned(),
-            tool_profile: Some("default".to_owned()),
-            cwd: None,
-            routing: RoutingMode::ModelRouted,
-            budget: None,
-        }
     }
 
     fn attachment() -> MessageAttachment {
@@ -1177,7 +1128,10 @@ mod tests {
     fn command_variants_round_trip_and_keep_stable_tags() {
         let cases = vec![
             (
-                Command::CreateSession { config: config() },
+                Command::CreateSession {
+                    cwd: Some(std::path::PathBuf::from("/work/session-root")),
+                    agent: Some("default".to_owned()),
+                },
                 "create_session",
             ),
             (Command::ListSessions, "list_sessions"),
@@ -1267,7 +1221,8 @@ mod tests {
             (
                 Event::SessionCreated {
                     id: session_id(),
-                    config: config(),
+                    agent: "default".to_owned(),
+                    cwd: Some(std::path::PathBuf::from("/work/session-root")),
                 },
                 "session_created",
             ),
@@ -1565,49 +1520,26 @@ mod tests {
     }
 
     #[test]
-    fn session_config_defaults_to_model_routed() {
-        let decoded = serde_json::from_value::<SessionConfig>(json!({
-            "provider": "openai",
-            "model": "gpt-5-codex"
-        }))
-        .expect("config with default routing");
-
-        assert_eq!(decoded.routing, RoutingMode::ModelRouted);
-    }
-
-    #[test]
-    fn session_config_round_trips_cwd() {
-        let config = SessionConfig {
-            provider: "openai".to_owned(),
-            model: "gpt-5-codex".to_owned(),
-            tool_profile: None,
-            cwd: Some(std::path::PathBuf::from("/work/session-root")),
-            routing: RoutingMode::ModelRouted,
-            budget: None,
-        };
-
-        let json = serde_json::to_value(&config).expect("serialize config");
-        assert_eq!(json["cwd"], Value::String("/work/session-root".to_owned()));
-
-        let decoded =
-            serde_json::from_value::<SessionConfig>(json).expect("deserialize config with cwd");
-        assert_eq!(decoded, config);
-    }
-
-    #[test]
-    fn session_config_without_cwd_is_backward_compatible() {
-        let decoded = serde_json::from_value::<SessionConfig>(json!({
-            "provider": "openai",
-            "model": "gpt-5-codex"
-        }))
-        .expect("legacy config without cwd key");
-
-        assert_eq!(decoded.cwd, None);
-
-        let json = serde_json::to_value(&decoded).expect("serialize config");
+    fn create_session_omits_absent_cwd_and_agent() {
+        let json = serde_json::to_value(Command::CreateSession {
+            cwd: None,
+            agent: None,
+        })
+        .expect("serialize create_session");
+        assert_eq!(json["type"], Value::String("create_session".to_owned()));
         assert!(
-            json.get("cwd").is_none(),
-            "absent cwd must not round-trip a null key"
+            json.get("cwd").is_none() && json.get("agent").is_none(),
+            "absent cwd/agent must not round-trip as null keys"
+        );
+
+        let decoded = serde_json::from_value::<Command>(json!({ "type": "create_session" }))
+            .expect("create_session with no fields");
+        assert_eq!(
+            decoded,
+            Command::CreateSession {
+                cwd: None,
+                agent: None
+            }
         );
     }
 
@@ -1636,9 +1568,6 @@ mod tests {
             RunErrorKind::BudgetExhausted,
         ] {
             assert_round_trip(kind);
-        }
-        for mode in [RoutingMode::ModelRouted, RoutingMode::Dispatcher] {
-            assert_round_trip(mode);
         }
         for status in [
             ToolStatusWire::Started,

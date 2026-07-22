@@ -20,7 +20,7 @@
 //! local write, so lock contention is negligible.
 
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Mutex, MutexGuard, PoisonError},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -33,7 +33,7 @@ fn lock_recovering<'a, T>(mutex: &'a Mutex<T>) -> MutexGuard<'a, T> {
 }
 
 use agent_lib::facade::AgentSnapshot;
-use mag_service::{SessionConfig, SessionId, SessionInfo};
+use mag_service::{SessionId, SessionInfo};
 use rusqlite::{Connection, OptionalExtension};
 
 /// Current on-disk schema version, stored in `schema_meta` so a future migration
@@ -140,7 +140,8 @@ impl Persistence {
              );
              CREATE TABLE IF NOT EXISTS sessions (
                  id          TEXT    PRIMARY KEY,
-                 config_json TEXT    NOT NULL,
+                 agent       TEXT,
+                 cwd         TEXT,
                  created_at  INTEGER NOT NULL
              );
              CREATE TABLE IF NOT EXISTS snapshots (
@@ -168,49 +169,47 @@ impl Persistence {
         })
     }
 
-    /// Persists a session's configuration, replacing any existing row.
+    /// Persists a session's bound agent template and runtime working root,
+    /// replacing any existing row.
     ///
     /// # Errors
     ///
-    /// Returns [`PersistenceError`] when the config cannot be serialized or the
-    /// row cannot be written.
+    /// Returns [`PersistenceError`] when the row cannot be written.
     pub(crate) fn save_session(
         &self,
         id: SessionId,
-        config: &SessionConfig,
+        agent: &str,
+        cwd: Option<&std::path::Path>,
     ) -> Result<(), PersistenceError> {
-        let config_json = serde_json::to_string(config)?;
+        let cwd = cwd.map(|path| path.to_string_lossy().into_owned());
         let connection = lock_recovering(&self.connection);
         connection.execute(
-            "INSERT INTO sessions (id, config_json, created_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT (id) DO UPDATE SET config_json = excluded.config_json",
-            rusqlite::params![session_key(id), config_json, now_millis()],
+            "INSERT INTO sessions (id, agent, cwd, created_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (id) DO UPDATE SET agent = excluded.agent, cwd = excluded.cwd",
+            rusqlite::params![session_key(id), agent, cwd, now_millis()],
         )?;
         Ok(())
     }
 
-    /// Loads a session's configuration, if the session is stored.
+    /// Loads a session's bound agent template and working root, if the session
+    /// is stored.
     ///
     /// # Errors
     ///
-    /// Returns [`PersistenceError`] when the row cannot be read or the stored
-    /// config cannot be deserialized.
+    /// Returns [`PersistenceError`] when the row cannot be read.
     pub(crate) fn load_session(
         &self,
         id: SessionId,
-    ) -> Result<Option<SessionConfig>, PersistenceError> {
+    ) -> Result<Option<(String, Option<PathBuf>)>, PersistenceError> {
         let connection = lock_recovering(&self.connection);
-        let config_json: Option<String> = connection
+        let row: Option<(String, Option<String>)> = connection
             .query_row(
-                "SELECT config_json FROM sessions WHERE id = ?1",
+                "SELECT agent, cwd FROM sessions WHERE id = ?1",
                 rusqlite::params![session_key(id)],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        match config_json {
-            Some(json) => Ok(Some(serde_json::from_str(&json)?)),
-            None => Ok(None),
-        }
+        Ok(row.map(|(agent, cwd)| (agent, cwd.map(PathBuf::from))))
     }
 
     /// Lists every stored session, ordered by creation time.
@@ -222,26 +221,31 @@ impl Persistence {
     pub(crate) fn list_sessions(&self) -> Result<Vec<SessionInfo>, PersistenceError> {
         let connection = lock_recovering(&self.connection);
         let mut statement = connection.prepare(
-            "SELECT sessions.id, sessions.config_json, sessions.created_at, snapshots.committed_at
+            "SELECT sessions.id, sessions.agent, sessions.cwd, sessions.created_at, \
+             snapshots.committed_at
              FROM sessions
              LEFT JOIN snapshots ON snapshots.session_id = sessions.id
              ORDER BY sessions.created_at, sessions.id",
         )?;
         let rows = statement.query_map([], |row| {
             let id: String = row.get(0)?;
-            let config_json: String = row.get(1)?;
-            let created_at: i64 = row.get(2)?;
-            let committed_at: Option<i64> = row.get(3)?;
-            Ok((id, config_json, created_at, committed_at))
+            let agent: Option<String> = row.get(1)?;
+            let cwd: Option<String> = row.get(2)?;
+            let created_at: i64 = row.get(3)?;
+            let committed_at: Option<i64> = row.get(4)?;
+            Ok((id, agent, cwd, created_at, committed_at))
         })?;
 
         let mut sessions = Vec::new();
         for row in rows {
-            let (id, config_json, created_at, committed_at) = row?;
+            let (id, agent, cwd, created_at, committed_at) = row?;
             let id = SessionId::parse_str(&id)
                 .map_err(|_| PersistenceError::InvalidSessionId(id.clone()))?;
-            let config = serde_json::from_str(&config_json)?;
-            let mut info = SessionInfo::new(id, config);
+            let mut info = SessionInfo::new(
+                id,
+                agent.unwrap_or_else(|| crate::assembly::DEFAULT_AGENT_NAME.to_owned()),
+                cwd.map(PathBuf::from),
+            );
             let last_active_at = committed_at.unwrap_or(created_at).max(created_at);
             info.last_active_at = Some(u64::try_from(last_active_at).unwrap_or(0));
             sessions.push(info);
@@ -366,22 +370,11 @@ mod tests {
         facade::{Agent, AgentSnapshot},
         model::usage::Usage,
     };
-    use mag_service::{RoutingMode, SessionConfig, SessionId};
+    use mag_service::SessionId;
     use uuid::Uuid;
 
     use super::Persistence;
     use crate::test_support::{FakeLlmClient, text_stream_with_usage};
-
-    fn config(model: &str) -> SessionConfig {
-        SessionConfig {
-            provider: "fake".to_owned(),
-            model: model.to_owned(),
-            tool_profile: None,
-            cwd: None,
-            routing: RoutingMode::ModelRouted,
-            budget: None,
-        }
-    }
 
     fn session_id(value: u128) -> SessionId {
         SessionId::new(Uuid::from_u128(value))
@@ -415,30 +408,48 @@ mod tests {
     fn save_and_load_session_round_trips() {
         let store = Persistence::in_memory().expect("open store");
         let id = session_id(1);
-        let config = config("model-a");
+        let cwd = std::path::PathBuf::from("/work/root");
 
         assert_eq!(store.load_session(id).expect("load missing"), None);
-        store.save_session(id, &config).expect("save session");
+        store
+            .save_session(id, "reviewer", Some(&cwd))
+            .expect("save session");
 
-        assert_eq!(store.load_session(id).expect("load session"), Some(config));
+        assert_eq!(
+            store.load_session(id).expect("load session"),
+            Some(("reviewer".to_owned(), Some(cwd)))
+        );
+    }
+
+    #[test]
+    fn save_session_round_trips_absent_cwd() {
+        let store = Persistence::in_memory().expect("open store");
+        let id = session_id(2);
+        store
+            .save_session(id, "default", None)
+            .expect("save session");
+        assert_eq!(
+            store.load_session(id).expect("load session"),
+            Some(("default".to_owned(), None))
+        );
     }
 
     #[test]
     fn list_sessions_reports_stored_sessions_in_creation_order() {
         let store = Persistence::in_memory().expect("open store");
         store
-            .save_session(session_id(1), &config("a"))
+            .save_session(session_id(1), "a", None)
             .expect("save a");
         store
-            .save_session(session_id(2), &config("b"))
+            .save_session(session_id(2), "b", None)
             .expect("save b");
 
         let listed = store.list_sessions().expect("list sessions");
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].id, session_id(1));
-        assert_eq!(listed[0].config, config("a"));
+        assert_eq!(listed[0].agent, "a");
         assert_eq!(listed[1].id, session_id(2));
-        assert_eq!(listed[1].config, config("b"));
+        assert_eq!(listed[1].agent, "b");
     }
 
     #[tokio::test]
@@ -446,7 +457,7 @@ mod tests {
         let store = Persistence::in_memory().expect("open store");
         let id = session_id(7);
         store
-            .save_session(id, &config("model-a"))
+            .save_session(id, "default", None)
             .expect("save session");
 
         assert!(store.load_snapshot(id).expect("load missing").is_none());
@@ -489,7 +500,7 @@ mod tests {
         let store = Persistence::in_memory().expect("open store");
         let id = session_id(3);
         store
-            .save_session(id, &config("model-a"))
+            .save_session(id, "default", None)
             .expect("save session");
         let snapshot = committed_snapshot("bye").await;
         store.save_snapshot(id, &snapshot).expect("save snapshot");
@@ -509,13 +520,13 @@ mod tests {
         assert_eq!(store.max_session_id_value().expect("empty max"), None);
 
         store
-            .save_session(session_id(1), &config("a"))
+            .save_session(session_id(1), "a", None)
             .expect("save 1");
         store
-            .save_session(session_id(9), &config("b"))
+            .save_session(session_id(9), "b", None)
             .expect("save 9");
         store
-            .save_session(session_id(4), &config("c"))
+            .save_session(session_id(4), "c", None)
             .expect("save 4");
 
         assert_eq!(store.max_session_id_value().expect("max"), Some(9));

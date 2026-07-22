@@ -11,12 +11,14 @@ use std::{
 };
 
 use agent_lib::{client::LlmClient, facade::AgentSnapshot};
+use std::path::PathBuf;
+
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
 use mag_config::{ConfigError, ConfigSnapshot, ResolvedExternalAgent, ResolvedProvider};
 use mag_service::{
     HistoryEntry, InteractionResponseWire, MagService, RequestId, RunId, ServiceError,
-    ServiceEvent, SessionConfig, SessionId, SessionInfo, SourceInfo, SourceKindWire, UserInput,
+    ServiceEvent, SessionId, SessionInfo, SourceInfo, SourceKindWire, UserInput,
 };
 use mag_sources::SourceRegistry;
 use mag_tools::ToolRegistry;
@@ -204,27 +206,52 @@ impl Engine {
 
 #[async_trait]
 impl MagService for Engine {
-    async fn create_session(&self, config: SessionConfig) -> Result<SessionId, ServiceError> {
+    async fn create_session(
+        &self,
+        cwd: Option<PathBuf>,
+        agent: Option<String>,
+    ) -> Result<SessionId, ServiceError> {
+        // Resolve the requested agent template against the current snapshot,
+        // rejecting an unknown template or a local one with no usable model
+        // before the session goes live (`docs/CLI.md` §4.4). Without a config
+        // backend there is no template to validate against, so the requested
+        // name (or the default) is taken as-is.
+        let agent_name = match self.inner.config_apply.as_ref() {
+            Some(config_apply) => crate::assembly::validate_agent_binding(
+                agent.as_deref(),
+                &config_apply.service().current(),
+            )?,
+            None => agent
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .unwrap_or(crate::assembly::DEFAULT_AGENT_NAME)
+                .to_owned(),
+        };
+
         let id = self.inner.session_ids.next_id();
 
-        // Persist the session config before it becomes live so a restart can find
-        // and resume it (`docs/DESIGN.md` §3.6).
+        // Persist the session binding before it becomes live so a restart can
+        // find and resume it (`docs/DESIGN.md` §3.6).
         self.inner
             .store
-            .save_session(id, &config)
+            .save_session(id, &agent_name, cwd.as_deref())
             .map_err(persistence_backend)?;
 
         {
             let mut sessions = self.inner.sessions.lock().await;
-            sessions.insert(id, config.clone());
+            sessions.insert(id, (agent_name.clone(), cwd.clone()));
         }
 
-        self.inner.manager.create_session(id, config.clone());
+        self.inner
+            .manager
+            .create_session(id, Some(agent_name.clone()), cwd.clone());
 
-        let _ = self
-            .inner
-            .event_bus
-            .emit(mag_service::Event::SessionCreated { id, config });
+        let _ = self.inner.event_bus.emit(mag_service::Event::SessionCreated {
+            id,
+            agent: agent_name,
+            cwd,
+        });
 
         Ok(id)
     }
@@ -267,10 +294,11 @@ impl MagService for Engine {
     }
 
     async fn resume_session(&self, id: SessionId) -> Result<(), ServiceError> {
-        // Load the persisted config and latest committed snapshot before making
-        // the session live again (`docs/DESIGN.md` §3.6). An unknown session id
-        // has no stored config, so it is reported as not found.
-        let config = self
+        // Load the persisted binding (agent template + cwd) and latest committed
+        // snapshot before making the session live again (`docs/DESIGN.md` §3.6).
+        // An unknown session id has no stored binding, so it is reported as not
+        // found.
+        let (agent, cwd) = self
             .inner
             .store
             .load_session(id)
@@ -288,14 +316,18 @@ impl MagService for Engine {
                 // Already live: resuming an active session is a no-op.
                 return Ok(());
             }
-            sessions.insert(id, config.clone());
+            sessions.insert(id, (agent.clone(), cwd.clone()));
         }
 
         // Rebuild the session's agent from the snapshot (re-injecting client,
         // tools, and the `IpcApproval` handler). A missing snapshot resumes the
         // session with empty history — the same shape a freshly created session
         // has before its first run.
-        if let Err(error) = self.inner.manager.resume_session(id, config, snapshot) {
+        if let Err(error) = self
+            .inner
+            .manager
+            .resume_session(id, Some(agent), cwd, snapshot)
+        {
             self.inner.sessions.lock().await.remove(&id);
             return Err(error);
         }
@@ -505,7 +537,10 @@ impl Default for Engine {
 }
 
 struct EngineInner {
-    sessions: Mutex<BTreeMap<SessionId, SessionConfig>>,
+    /// Live sessions keyed by id, each carrying its bound agent-template name
+    /// and optional runtime working root. The value is metadata only; routing
+    /// consults it solely for membership (`contains_key`).
+    sessions: Mutex<BTreeMap<SessionId, (String, Option<PathBuf>)>>,
     event_bus: EventBus,
     session_ids: SessionIdSource,
     store: Arc<Persistence>,
@@ -805,24 +840,12 @@ mod skeleton {
     use futures::StreamExt;
     use futures::stream::BoxStream;
     use mag_service::{
-        InteractionResponseWire, MagService, RequestId, RoutingMode, ServiceError, ServiceEvent,
-        SessionConfig, SessionId,
+        InteractionResponseWire, MagService, RequestId, ServiceError, ServiceEvent, SessionId,
     };
     use tokio::time::{Duration, timeout};
     use uuid::Uuid;
 
     use super::Engine;
-
-    fn config(model: &str) -> SessionConfig {
-        SessionConfig {
-            provider: "fake".to_owned(),
-            model: model.to_owned(),
-            tool_profile: None,
-            cwd: None,
-            routing: RoutingMode::ModelRouted,
-            budget: None,
-        }
-    }
 
     async fn next_event(events: &mut BoxStream<'static, ServiceEvent>) -> ServiceEvent {
         timeout(Duration::from_secs(1), events.next())
@@ -835,10 +858,9 @@ mod skeleton {
     async fn create_session_emits_session_created() {
         let engine = Engine::new();
         let mut events = engine.subscribe(None);
-        let config = config("model-a");
 
         let id = engine
-            .create_session(config.clone())
+            .create_session(None, None)
             .await
             .expect("create session");
         let event = next_event(&mut events).await;
@@ -847,14 +869,16 @@ mod skeleton {
             event,
             ServiceEvent::SessionCreated {
                 id,
-                config: config.clone(),
+                agent: "default".to_owned(),
+                cwd: None,
             }
         );
 
         let sessions = engine.list_sessions().await.expect("list sessions");
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, id);
-        assert_eq!(sessions[0].config, config);
+        assert_eq!(sessions[0].agent, "default");
+        assert_eq!(sessions[0].cwd, None);
     }
 
     #[tokio::test]
@@ -862,11 +886,11 @@ mod skeleton {
         let engine = Engine::new();
 
         let first = engine
-            .create_session(config("model-a"))
+            .create_session(None, None)
             .await
             .expect("create first session");
         let second = engine
-            .create_session(config("model-b"))
+            .create_session(None, None)
             .await
             .expect("create second session");
 
@@ -874,9 +898,9 @@ mod skeleton {
 
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].id, first);
-        assert_eq!(listed[0].config, config("model-a"));
+        assert_eq!(listed[0].agent, "default");
         assert_eq!(listed[1].id, second);
-        assert_eq!(listed[1].config, config("model-b"));
+        assert_eq!(listed[1].agent, "default");
     }
 
     #[tokio::test]
@@ -884,13 +908,16 @@ mod skeleton {
         let engine = Engine::new();
         let mut first_subscriber = engine.subscribe(None);
         let mut second_subscriber = engine.subscribe(None);
-        let config = config("model-a");
 
         let id = engine
-            .create_session(config.clone())
+            .create_session(None, None)
             .await
             .expect("create session");
-        let expected = ServiceEvent::SessionCreated { id, config };
+        let expected = ServiceEvent::SessionCreated {
+            id,
+            agent: "default".to_owned(),
+            cwd: None,
+        };
 
         assert_eq!(next_event(&mut first_subscriber).await, expected);
         assert_eq!(next_event(&mut second_subscriber).await, expected);
@@ -952,7 +979,7 @@ mod skeleton {
         // already-live session succeeds without spawning a duplicate actor.
         let engine = Engine::new();
         let id = engine
-            .create_session(config("model-a"))
+            .create_session(None, None)
             .await
             .expect("create session");
 
@@ -969,7 +996,7 @@ mod skeleton {
         // request id as unknown rather than the retired `Unsupported`.
         let engine = Engine::new();
         let id = engine
-            .create_session(config("model-a"))
+            .create_session(None, None)
             .await
             .expect("create session");
         let request_id = RequestId::new(Uuid::from_u128(9));
@@ -1007,7 +1034,7 @@ mod skeleton {
     async fn cancel_and_delete_known_session_succeed() {
         let engine = Engine::new();
         let id = engine
-            .create_session(config("model-a"))
+            .create_session(None, None)
             .await
             .expect("create session");
 
@@ -1058,25 +1085,14 @@ mod chat {
     use futures::StreamExt;
     use futures::stream::BoxStream;
     use mag_service::{
-        InteractionKindWire, InteractionResponseWire, MagService, RoutingMode, RunErrorKind,
-        ServiceError, ServiceEvent, SessionConfig, SessionId, UsageInfo, UserInput,
+        InteractionKindWire, InteractionResponseWire, MagService, RunErrorKind, ServiceError,
+        ServiceEvent, SessionId, UsageInfo, UserInput,
     };
     use tokio::time::{Duration, timeout};
 
     use crate::test_support::{FakeLlmClient, text_stream_with_usage};
 
     use super::Engine;
-
-    fn config(model: &str) -> SessionConfig {
-        SessionConfig {
-            provider: "fake".to_owned(),
-            model: model.to_owned(),
-            tool_profile: None,
-            cwd: None,
-            routing: RoutingMode::ModelRouted,
-            budget: None,
-        }
-    }
 
     fn usage(input: u32, output: u32) -> Usage {
         Usage {
@@ -1101,7 +1117,7 @@ mod chat {
 
     async fn create_session(engine: &Engine) -> SessionId {
         engine
-            .create_session(config("fake-chat"))
+            .create_session(None, None)
             .await
             .expect("create session")
     }
@@ -1193,7 +1209,9 @@ mod chat {
 
         let requests = fake.stream_requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].model, "fake-chat");
+        // A clientless/config-less engine binds the built-in default agent,
+        // whose model is the last-resort `DEFAULT_MODEL`.
+        assert_eq!(requests[0].model, crate::assembly::DEFAULT_MODEL);
         assert!(requests[0].stream);
         assert_eq!(requests[0].messages.len(), 1);
         assert_eq!(requests[0].messages[0].role, Role::User);
@@ -1206,7 +1224,7 @@ mod chat {
         let service: Arc<dyn MagService> = Arc::new(engine_with_fake(fake));
 
         let session = service
-            .create_session(config("fake-chat"))
+            .create_session(None, None)
             .await
             .expect("create session");
         let mut events = service.subscribe(Some(session));
@@ -1253,17 +1271,36 @@ mod chat {
         // A session budget of 1 token is blown by the first scripted response
         // (usage 9): agent-lib refuses the charge and the run ends with
         // `FacadeError::BudgetExhausted`, which mag must classify structurally.
+        // The budget now rides on the bound agent template rather than the wire,
+        // so the session is created against a config that pins `[agents.default]`
+        // with a one-token budget.
+        let dir = std::env::temp_dir().join(format!(
+            "mag-budget-{}-{:?}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::write(
+            &dir,
+            "[agents.default]\nmodel = \"fake-chat\"\nbudget = { max_tokens = 1 }\n",
+        )
+        .expect("write budget config");
+        let service =
+            Arc::new(crate::ConfigService::load_or_default(dir.clone()).expect("load config"));
         let fake = FakeLlmClient::scripted(vec![text_stream_with_usage(&["hi"], usage(7, 2))]);
-        let engine = engine_with_fake(fake);
-        let mut budgeted = config("fake-chat");
-        budgeted.budget = Some(mag_service::SessionBudget {
-            max_tokens: Some(1),
-            ..mag_service::SessionBudget::default()
-        });
+        let client: Arc<dyn LlmClient> = fake;
+        let engine = Engine::with_config_service(
+            client,
+            mag_tools::ToolRegistry::with_builtins(),
+            service,
+        );
         let session = engine
-            .create_session(budgeted)
+            .create_session(None, None)
             .await
             .expect("create session");
+        let _ = std::fs::remove_file(&dir);
         let mut events = engine.subscribe(Some(session));
 
         engine
@@ -1312,7 +1349,7 @@ mod chat {
         let engine =
             Engine::with_llm_client_and_tools(client, mag_tools::ToolRegistry::with_builtins());
         let session = engine
-            .create_session(config("fake-chat"))
+            .create_session(None, None)
             .await
             .expect("create session");
         let mut events = engine.subscribe(Some(session));
@@ -1641,8 +1678,7 @@ mod session {
     use agent_lib::{client::LlmClient, model::usage::Usage};
     use futures::stream::BoxStream;
     use mag_service::{
-        MagService, RoutingMode, ServiceEvent, SessionConfig, SessionId, SessionStatusWire,
-        UserInput,
+        MagService, ServiceEvent, SessionId, SessionStatusWire, UserInput,
     };
     use tokio::time::{Duration, timeout};
 
@@ -1651,17 +1687,6 @@ mod session {
     };
 
     use super::Engine;
-
-    fn config(model: &str) -> SessionConfig {
-        SessionConfig {
-            provider: "fake".to_owned(),
-            model: model.to_owned(),
-            tool_profile: None,
-            cwd: None,
-            routing: RoutingMode::ModelRouted,
-            budget: None,
-        }
-    }
 
     fn usage(input: u32, output: u32) -> Usage {
         Usage {
@@ -1681,9 +1706,12 @@ mod session {
         Engine::with_llm_client(client)
     }
 
-    async fn create_session(engine: &Engine, model: &str) -> SessionId {
+    /// Creates a session bound to the built-in default agent. `_label` is a
+    /// human-readable tag kept only to keep the call sites self-documenting;
+    /// the model now comes from the bound template, not the wire.
+    async fn create_session(engine: &Engine, _label: &str) -> SessionId {
         engine
-            .create_session(config(model))
+            .create_session(None, None)
             .await
             .expect("create session")
     }
@@ -1911,8 +1939,7 @@ mod tool_turn {
     use futures::stream::BoxStream;
     use mag_service::{
         ApprovalDecisionWire, InteractionKindWire, InteractionResponseWire, MagService,
-        RoutingMode, ServiceEvent, SessionConfig, SessionId, SessionStatusWire, StepIdWire,
-        ToolCallIdWire, UserInput,
+        ServiceEvent, SessionId, SessionStatusWire, StepIdWire, ToolCallIdWire, UserInput,
     };
     use mag_tools::{PermissionSpec, ToolCategory, ToolPlugin, ToolRegistry, ToolRisk};
     use serde_json::{Value, json};
@@ -1970,17 +1997,6 @@ mod tool_turn {
             }))
     }
 
-    fn config() -> SessionConfig {
-        SessionConfig {
-            provider: "fake".to_owned(),
-            model: "fake-tool".to_owned(),
-            tool_profile: None,
-            cwd: None,
-            routing: RoutingMode::ModelRouted,
-            budget: None,
-        }
-    }
-
     fn usage(input: u32, output: u32) -> Usage {
         Usage {
             input,
@@ -2033,7 +2049,7 @@ mod tool_turn {
 
     async fn create_session(engine: &Engine) -> SessionId {
         engine
-            .create_session(config())
+            .create_session(None, None)
             .await
             .expect("create session")
     }
@@ -2241,8 +2257,8 @@ mod persist {
     use futures::stream::BoxStream;
     use mag_service::{
         ApprovalDecisionWire, HistoryEntry, InteractionKindWire, InteractionResponseWire,
-        MagService, RoutingMode, ServiceEvent, SessionConfig, SessionId, SessionStatusWire,
-        StepIdWire, ToolCallIdWire, ToolStatusWire, UserInput,
+        MagService, ServiceEvent, SessionId, SessionStatusWire, StepIdWire, ToolCallIdWire,
+        ToolStatusWire, UserInput,
     };
     use mag_sources::SourceRegistry;
     use mag_tools::{PermissionSpec, ToolCategory, ToolPlugin, ToolRegistry, ToolRisk};
@@ -2284,17 +2300,6 @@ mod persist {
             let _ = std::fs::remove_file(self.path.with_extension("sqlite-wal"));
             let _ = std::fs::remove_file(self.path.with_extension("sqlite-shm"));
             let _ = std::fs::remove_file(self.path.with_extension("toml"));
-        }
-    }
-
-    fn config(model: &str) -> SessionConfig {
-        SessionConfig {
-            provider: "fake".to_owned(),
-            model: model.to_owned(),
-            tool_profile: None,
-            cwd: None,
-            routing: RoutingMode::ModelRouted,
-            budget: None,
         }
     }
 
@@ -2448,7 +2453,7 @@ mod persist {
             .expect("open persistent engine");
 
         let session = engine
-            .create_session(config("fake-persist"))
+            .create_session(None, None)
             .await
             .expect("create session");
         let mut events = engine.subscribe(Some(session));
@@ -2510,7 +2515,7 @@ mod persist {
         let engine1 = Engine::with_persistence(client1, ToolRegistry::new(), &db.path)
             .expect("open first engine");
         let session = engine1
-            .create_session(config("fake-resume"))
+            .create_session(None, None)
             .await
             .expect("create session");
         let mut events1 = engine1.subscribe(Some(session));
@@ -2563,7 +2568,7 @@ mod persist {
         // A freshly created session on the restarted engine gets a new id past the
         // resumed one, so ids never collide across a restart.
         let fresh = engine2
-            .create_session(config("fake-fresh"))
+            .create_session(None, None)
             .await
             .expect("create fresh session");
         assert_ne!(
@@ -2586,7 +2591,7 @@ mod persist {
         let engine = Engine::with_persistence(client, ToolRegistry::new(), &db.path)
             .expect("open persistent engine");
         let session = engine
-            .create_session(config("fake-clean"))
+            .create_session(None, None)
             .await
             .expect("create session");
         let mut events = engine.subscribe(Some(session));
@@ -2620,7 +2625,7 @@ mod persist {
         let engine1 = Engine::with_persistence(client1, gated_registry(), &db.path)
             .expect("open first engine");
         let session = engine1
-            .create_session(config("fake-approve"))
+            .create_session(None, None)
             .await
             .expect("create session");
         let mut events1 = engine1.subscribe(Some(session));
@@ -2712,7 +2717,7 @@ model = "model-d"
         let engine1 =
             engine_with_persistent_config(client1, history_registry(), &db, history_config);
         let session = engine1
-            .create_session(config("default"))
+            .create_session(None, None)
             .await
             .expect("create session");
         let mut events1 = engine1.subscribe(Some(session));
@@ -2798,7 +2803,7 @@ role = "Researches topics and reports findings."
             FakeLlmClient::scripted(vec![text_stream_with_usage(&["ready"], usage(2, 1))]);
         let engine1 = engine_with_persistent_config(client1, history_registry(), &db, toml);
         let session = engine1
-            .create_session(config("default"))
+            .create_session(None, None)
             .await
             .expect("create session");
         let mut events1 = engine1.subscribe(Some(session));
@@ -2928,8 +2933,7 @@ mod pivot {
     use async_trait::async_trait;
     use futures::stream::BoxStream;
     use mag_service::{
-        MagService, RoutingMode, RunErrorKind, ServiceError, ServiceEvent, SessionConfig,
-        SessionId, UserInput,
+        MagService, RunErrorKind, ServiceError, ServiceEvent, SessionId, UserInput,
     };
     use mag_tools::{ToolPlugin, ToolRegistry};
     use serde_json::{Value, json};
@@ -3004,17 +3008,6 @@ mod pivot {
         ToolRegistry::new().register(Arc::new(GatedTool { gate }))
     }
 
-    fn config() -> SessionConfig {
-        SessionConfig {
-            provider: "fake".to_owned(),
-            model: "fake-pivot".to_owned(),
-            tool_profile: None,
-            cwd: None,
-            routing: RoutingMode::ModelRouted,
-            budget: None,
-        }
-    }
-
     fn usage(input: u32, output: u32) -> Usage {
         Usage {
             input,
@@ -3026,7 +3019,7 @@ mod pivot {
 
     async fn create_session(engine: &Engine) -> SessionId {
         engine
-            .create_session(config())
+            .create_session(None, None)
             .await
             .expect("create session")
     }
@@ -3391,7 +3384,7 @@ mod config_apply {
     use futures::StreamExt;
     use futures::stream::BoxStream;
     use mag_service::{
-        MagService, RoutingMode, ServiceError, ServiceEvent, SessionConfig, SessionId, UserInput,
+        MagService, ServiceError, ServiceEvent, SessionId, UserInput,
     };
     use tokio::time::{Duration, timeout};
 
@@ -3452,17 +3445,6 @@ tools = ["read_file"]
 model = "model-b"
 system_prompt = "old system"
 "#;
-
-    fn session_config(model: &str) -> SessionConfig {
-        SessionConfig {
-            provider: "fake".to_owned(),
-            model: model.to_owned(),
-            tool_profile: None,
-            cwd: None,
-            routing: RoutingMode::ModelRouted,
-            budget: None,
-        }
-    }
 
     fn usage(input: u32, output: u32) -> Usage {
         Usage {
@@ -3570,7 +3552,7 @@ system_prompt = "old system"
             ))],
         );
         let session = engine
-            .create_session(session_config("fake-chat"))
+            .create_session(None, None)
             .await
             .expect("create session");
         let mut events = engine.subscribe(Some(session));
@@ -3614,7 +3596,7 @@ system_prompt = "old system"
             ],
         );
         let session = engine
-            .create_session(session_config("fake-chat"))
+            .create_session(None, None)
             .await
             .expect("create session");
         let mut events = engine.subscribe(Some(session));
@@ -3681,7 +3663,7 @@ system_prompt = "old system"
             ],
         );
         let session = engine
-            .create_session(session_config("fake-chat"))
+            .create_session(None, None)
             .await
             .expect("create session");
         let mut events = engine.subscribe(Some(session));
@@ -3735,7 +3717,7 @@ system_prompt = "old system"
         engine.add_turn_complete_listener(recorder.clone());
 
         let session = engine
-            .create_session(session_config("fake-chat"))
+            .create_session(None, None)
             .await
             .expect("create session");
         let mut events = engine.subscribe(Some(session));
@@ -3762,7 +3744,7 @@ system_prompt = "old system"
         engine.add_turn_complete_listener(recorder.clone());
 
         let session = engine
-            .create_session(session_config("fake-chat"))
+            .create_session(None, None)
             .await
             .expect("create session");
         let mut events = engine.subscribe(Some(session));
@@ -3900,8 +3882,8 @@ mod session_binding {
     use async_trait::async_trait;
     use futures::stream::BoxStream;
     use mag_service::{
-        ApprovalDecisionWire, InteractionResponseWire, MagService, RoutingMode, ServiceEvent,
-        SessionConfig, StepIdWire, ToolCallIdWire, UserInput,
+        ApprovalDecisionWire, InteractionResponseWire, MagService, ServiceEvent, StepIdWire,
+        ToolCallIdWire, UserInput,
     };
     use mag_tools::{PermissionSpec, ToolCategory, ToolPlugin, ToolRegistry, ToolRisk};
     use serde_json::{Value, json};
@@ -4003,17 +3985,6 @@ mod session_binding {
         (dir, engine, fake)
     }
 
-    fn session_config(provider: &str, model: &str) -> SessionConfig {
-        SessionConfig {
-            provider: provider.to_owned(),
-            model: model.to_owned(),
-            tool_profile: None,
-            cwd: None,
-            routing: RoutingMode::ModelRouted,
-            budget: None,
-        }
-    }
-
     fn usage() -> Usage {
         Usage {
             input: 2,
@@ -4060,8 +4031,7 @@ mod session_binding {
     }
 
     /// Create-time binding: a new session is assembled from the bound
-    /// `agents.default` entry — its model overrides the wire
-    /// `SessionConfig.model` and its tool list narrows the surface
+    /// `agents.default` entry — its model and its tool list narrow the surface
     /// (`docs/CLI.md` §4.4: new sessions use the current DO graph).
     #[tokio::test]
     async fn create_session_binds_model_and_tools_from_the_default_entry() {
@@ -4074,7 +4044,7 @@ tools = ["read_file"]
             vec![text_stream_with_usage(&["ok"], usage())],
         );
         let session = engine
-            .create_session(session_config("fake", "fake-chat"))
+            .create_session(None, None)
             .await
             .expect("create session");
         let mut events = engine.subscribe(Some(session));
@@ -4108,12 +4078,13 @@ tools = ["read_file"]
         let (_dir, engine, fake) = engine_with_config(
             r#"
 [agents.default]
+model = "fake-chat"
 tools = []
 "#,
             vec![text_stream_with_usage(&["ok"], usage())],
         );
         let session = engine
-            .create_session(session_config("fake", "fake-chat"))
+            .create_session(None, None)
             .await
             .expect("create session");
         let mut events = engine.subscribe(Some(session));
@@ -4156,7 +4127,7 @@ model = "model-r1"
             ],
         );
         let session = engine
-            .create_session(session_config("reviewer", "fake-chat"))
+            .create_session(None, Some("reviewer".to_owned()))
             .await
             .expect("create session");
         let mut events = engine.subscribe(Some(session));
@@ -4202,7 +4173,7 @@ default_policy = "ask"
             ],
         );
         let session = engine
-            .create_session(session_config("fake", "fake-chat"))
+            .create_session(None, None)
             .await
             .expect("create session");
         let mut events = engine.subscribe(Some(session));
@@ -4259,7 +4230,7 @@ approval = "allow"
             ],
         );
         let session = engine
-            .create_session(session_config("fake", "fake-chat"))
+            .create_session(None, None)
             .await
             .expect("create session");
         let mut events = engine.subscribe(Some(session));
@@ -4292,6 +4263,7 @@ approval = "allow"
         let (_dir, engine, fake) = engine_with_config(
             r#"
 [agents.default]
+model = "fake-chat"
 tools = ["read_file", "shell"]
 
 [tools.shell]
@@ -4300,7 +4272,7 @@ enabled = false
             vec![text_stream_with_usage(&["ok"], usage())],
         );
         let session = engine
-            .create_session(session_config("fake", "fake-chat"))
+            .create_session(None, None)
             .await
             .expect("create session");
         let mut events = engine.subscribe(Some(session));
@@ -4588,7 +4560,7 @@ mod instances {
     use async_trait::async_trait;
     use futures::{FutureExt, stream::BoxStream};
     use mag_service::{
-        AgentInstanceStatusWire, MagService, RoutingMode, ServiceEvent, SessionConfig, UserInput,
+        AgentInstanceStatusWire, MagService, ServiceEvent, UserInput,
     };
     use mag_tools::{PermissionSpec, ToolCategory, ToolPlugin, ToolRegistry, ToolRisk};
     use serde_json::{Value, json};
@@ -4725,17 +4697,6 @@ mod instances {
         (dir, engine)
     }
 
-    fn session_config(provider: &str, model: &str) -> SessionConfig {
-        SessionConfig {
-            provider: provider.to_owned(),
-            model: model.to_owned(),
-            tool_profile: None,
-            cwd: None,
-            routing: RoutingMode::ModelRouted,
-            budget: None,
-        }
-    }
-
     fn usage() -> Usage {
         Usage {
             input: 2,
@@ -4809,7 +4770,7 @@ role = "Researches topics and reports findings."
             vec![text_stream_with_usage(&["ok"], usage())],
         );
         let session = engine
-            .create_session(session_config("default", "fake-chat"))
+            .create_session(None, None)
             .await
             .expect("create session");
         let mut events = engine.subscribe(Some(session));
@@ -4866,7 +4827,7 @@ approval = "deny"
             ],
         );
         let session = engine
-            .create_session(session_config("default", "fake-chat"))
+            .create_session(None, None)
             .await
             .expect("create session");
         let mut events = engine.subscribe(Some(session));
@@ -4978,7 +4939,7 @@ model = "model-d"
             fake.clone(),
         );
         let session = engine
-            .create_session(session_config("default", "fake-chat"))
+            .create_session(None, None)
             .await
             .expect("create session");
         let mut events = engine.subscribe(Some(session));
@@ -5093,7 +5054,7 @@ model = "model-d"
             fake.clone(),
         );
         let session = engine
-            .create_session(session_config("default", "fake-chat"))
+            .create_session(None, None)
             .await
             .expect("create session");
         let mut events = engine.subscribe(Some(session));
@@ -5211,7 +5172,7 @@ model = "model-d"
             fake.clone(),
         );
         let session = engine
-            .create_session(session_config("default", "fake-chat"))
+            .create_session(None, None)
             .await
             .expect("create session");
         let mut events = engine.subscribe(Some(session));
@@ -5535,7 +5496,7 @@ model = "model-d"
             fake.clone(),
         );
         let session = engine
-            .create_session(session_config("default", "fake-chat"))
+            .create_session(None, None)
             .await
             .expect("create session");
         let mut events = engine.subscribe(Some(session));
@@ -5660,7 +5621,7 @@ model = "model-d"
             fake.clone(),
         );
         let session = engine
-            .create_session(session_config("default", "fake-chat"))
+            .create_session(None, None)
             .await
             .expect("create session");
         let mut events = engine.subscribe(Some(session));
@@ -5754,7 +5715,7 @@ model = "model-d"
             fake.clone(),
         );
         let session = engine
-            .create_session(session_config("default", "fake-chat"))
+            .create_session(None, None)
             .await
             .expect("create session");
         let mut events = engine.subscribe(Some(session));
@@ -5893,7 +5854,7 @@ model = "model-d"
             fake.clone(),
         );
         let session = engine
-            .create_session(session_config("default", "fake-chat"))
+            .create_session(None, None)
             .await
             .expect("create session");
         let mut events = engine.subscribe(Some(session));
@@ -6000,7 +5961,7 @@ command = ["{}", "{}", "mag-e2e-acp-session"]
         ]);
         let (_dir, engine) = engine_with_client(&toml, registry(), fake.clone());
         let session = engine
-            .create_session(session_config("default", "fake-chat"))
+            .create_session(None, None)
             .await
             .expect("create session");
         let mut events = engine.subscribe(Some(session));
@@ -6160,9 +6121,10 @@ system_prompt = "TOML BODY MARKER"
             registry(),
             fake.clone(),
         );
-        let mut config = session_config("default", "fake-chat");
-        config.cwd = Some(project.0.clone());
-        let session = engine.create_session(config).await.expect("create session");
+        let session = engine
+            .create_session(Some(project.0.clone()), None)
+            .await
+            .expect("create session");
         let mut events = engine.subscribe(Some(session));
         engine
             .send_message(session, UserInput::text("use foo"))

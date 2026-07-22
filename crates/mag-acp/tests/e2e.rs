@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
 use mag_service::{
     HistoryEntry, InteractionResponseWire, MagService, RequestId, RunId, ServiceError,
-    ServiceEvent, SessionConfig, SessionId, SessionInfo, SourceInfo, UserInput,
+    ServiceEvent, SessionId, SessionInfo, SourceInfo, UserInput,
 };
 
 // A fixed, valid UUID string so the fake can mint ids without pulling in the
@@ -31,20 +31,24 @@ const SESSION_UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
 
 /// A minimal fake service: every method returns a benign default and the event
 /// stream is empty. `create_session` additionally records the received
-/// [`SessionConfig`] (so handler tests can assert the mapping, e.g. that the ACP
+/// `cwd` (so handler tests can assert the mapping, e.g. that the ACP
 /// `cwd` is carried through) and returns a fixed [`SESSION_UUID`] session id. It
 /// is enough to exercise the M1 handlers and is the seed for richer scripted
 /// fakes in later milestones.
 #[derive(Default)]
 struct FakeService {
-    recorded_config: Arc<Mutex<Option<SessionConfig>>>,
+    recorded_cwd: Arc<Mutex<Option<Option<PathBuf>>>>,
     recorded_resume: Arc<Mutex<Option<SessionId>>>,
 }
 
 #[async_trait]
 impl MagService for FakeService {
-    async fn create_session(&self, config: SessionConfig) -> Result<SessionId, ServiceError> {
-        *self.recorded_config.lock().expect("lock not poisoned") = Some(config);
+    async fn create_session(
+        &self,
+        cwd: Option<PathBuf>,
+        _agent: Option<String>,
+    ) -> Result<SessionId, ServiceError> {
+        *self.recorded_cwd.lock().expect("lock not poisoned") = Some(cwd);
         Ok(SessionId::parse_str(SESSION_UUID).expect("valid uuid"))
     }
 
@@ -171,15 +175,15 @@ async fn initialize_round_trips_over_in_memory_pipe() {
 
 /// Drives `initialize` then `session/new` from the real ACP client, through the
 /// in-memory pipe, into [`mag_acp::serve`], and proves the mapping round-trips:
-/// the fake service records a [`SessionConfig`] whose `cwd` equals the request's
+/// the fake service records a `cwd` that equals the request's
 /// absolute `cwd` (M1-3/M1-4 contract — the client cwd is carried through, never
 /// dropped), and the ACP `SessionId` returned to the client maps back to the exact
 /// mag `SessionId` the service produced (`docs/ACP.md` §3.2/§4).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_new_round_trips_over_in_memory_pipe() {
-    let recorded: Arc<Mutex<Option<SessionConfig>>> = Arc::new(Mutex::new(None));
+    let recorded: Arc<Mutex<Option<Option<PathBuf>>>> = Arc::new(Mutex::new(None));
     let service: Arc<dyn MagService> = Arc::new(FakeService {
-        recorded_config: Arc::clone(&recorded),
+        recorded_cwd: Arc::clone(&recorded),
         ..FakeService::default()
     });
 
@@ -209,13 +213,13 @@ async fn session_new_round_trips_over_in_memory_pipe() {
 
     server.abort();
 
-    // The service saw a config whose cwd is the client's absolute cwd.
-    let config = recorded
+    // The service saw a cwd equal to the client's absolute cwd.
+    let recorded_cwd = recorded
         .lock()
         .expect("lock not poisoned")
         .clone()
         .expect("create_session must have been called");
-    assert_eq!(config.cwd, Some(cwd));
+    assert_eq!(recorded_cwd, Some(cwd));
 
     // The ACP session id resolves back to the exact mag session id the fake
     // produced, proving the id mapping is faithful end to end.

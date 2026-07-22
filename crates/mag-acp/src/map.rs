@@ -10,19 +10,9 @@ use std::fmt;
 use agent_client_protocol::schema::v1 as acp;
 use mag_service::{
     ApprovalDecisionWire, ApprovalRequirementWire, InteractionKindWire, InteractionResponseWire,
-    PermissionCategoryWire, PermissionDecisionWire, RoutingMode, RunErrorKind, ServiceEvent,
-    SessionConfig, StepIdWire, ToolCallIdWire, ToolStatusWire, ToolTrace, UserInput,
+    PermissionCategoryWire, PermissionDecisionWire, RunErrorKind, ServiceEvent, StepIdWire,
+    ToolCallIdWire, ToolStatusWire, ToolTrace, UserInput,
 };
-
-/// Default model identifier used for ACP-created sessions.
-///
-/// ACP's `session/new` does not carry an LLM selection (`docs/ACP.md` §3.2), so
-/// the provider field is left empty — on a configuration-backed engine an empty
-/// provider binds the configured default agent (`[session].default_agent`, else
-/// the `default` entry). The model stays a placeholder fallback for agents that
-/// pin no model of their own; a later interface/config source can override it
-/// without changing this mapping.
-pub const DEFAULT_MODEL: &str = "gpt-5-codex";
 
 /// Converts a mag [`SessionId`](mag_service::SessionId) into an ACP
 /// [`SessionId`](acp::SessionId).
@@ -80,30 +70,19 @@ pub fn acp_session_id_to_mag(
     })
 }
 
-/// Builds a mag [`SessionConfig`] from an ACP
+/// Extracts the session working root from an ACP
 /// [`NewSessionRequest`](acp::NewSessionRequest) (`docs/ACP.md` §3.2).
 ///
-/// The request's absolute `cwd` becomes the session working root and is carried
-/// through unchanged as [`SessionConfig::cwd`] (`Some(req.cwd)`), so mag-core can
-/// place it as the facade agent's worktree (M1-3). It is never dropped on the
-/// mag-acp side.
-///
-/// ACP does not carry an LLM selection, so `provider` is left empty (the
-/// engine binds the configured default agent) and `model` falls back to
-/// [`DEFAULT_MODEL`]; `tool_profile` is
-/// left unset and `routing` uses [`RoutingMode::default`]. The first version
-/// ignores `additional_directories` and `mcp_servers` (later source integration
-/// points, out of scope here per `docs/ACP.md` §3.2).
+/// The request's absolute `cwd` becomes the session working root, so mag-core
+/// can place it as the facade agent's worktree (M1-3). ACP does not carry an
+/// LLM/agent selection, so `create_session` is called with `agent = None`, which
+/// binds the configured default agent (`[session].default_agent`, else the
+/// `default` entry). The first version ignores `additional_directories` and
+/// `mcp_servers` (later source integration points, out of scope here per
+/// `docs/ACP.md` §3.2).
 #[must_use]
-pub fn new_session_request_to_config(req: &acp::NewSessionRequest) -> SessionConfig {
-    SessionConfig {
-        provider: String::new(),
-        model: DEFAULT_MODEL.to_owned(),
-        tool_profile: None,
-        cwd: Some(req.cwd.clone()),
-        routing: RoutingMode::default(),
-        budget: None,
-    }
+pub fn new_session_request_cwd(req: &acp::NewSessionRequest) -> std::path::PathBuf {
+    req.cwd.clone()
 }
 
 /// Builds the [`AgentCapabilities`](acp::AgentCapabilities) mag advertises during
@@ -706,20 +685,14 @@ mod tests {
     }
 
     #[test]
-    fn new_session_request_carries_cwd_and_defaults() {
+    fn new_session_request_carries_cwd() {
         let cwd = std::path::PathBuf::from("/abs/work/root");
         let req = acp::NewSessionRequest::new(cwd.clone());
 
-        let config = new_session_request_to_config(&req);
-
-        // The absolute cwd is carried through unchanged (never dropped).
-        assert_eq!(config.cwd, Some(cwd));
-        // ACP carries no LLM selection: the provider is empty so the engine
-        // binds the configured default agent; the model keeps its placeholder.
-        assert_eq!(config.provider, "");
-        assert_eq!(config.model, DEFAULT_MODEL);
-        assert_eq!(config.tool_profile, None);
-        assert_eq!(config.routing, mag_service::RoutingMode::default());
+        // The absolute cwd is carried through unchanged (never dropped); ACP
+        // carries no agent selection, so the handler passes `agent = None` and
+        // the engine binds the configured default agent.
+        assert_eq!(new_session_request_cwd(&req), cwd);
     }
 
     #[test]
