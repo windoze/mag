@@ -1,6 +1,6 @@
 //! The `agent` spawn tool, its `agent_result` / `agent_cancel` companions,
-//! and the local-instance drive task (`docs/dyn-agents.md` §4/§5, TODO
-//! M3-3/M3-4).
+//! and the instance drive tasks (`docs/dyn-agents.md` §4/§5/§6, TODO
+//! M3-3/M3-4/M4-1).
 //!
 //! One shared [`InstanceSpawnContext`] per spawning agent (the session's root
 //! supervisor at depth `0`, or a spawned instance at its own depth) backs the
@@ -12,17 +12,21 @@
 //! facade run future is deliberately `!Send`, so `tokio::spawn` is not an
 //! option and never compiles here (see `crate::session`).
 //!
-//! The drive task assembles the child facade agent from the definition: the
-//! layered system prompt ([`SUBAGENT_SKELETON`] + definition body, §4), the
-//! supervisor's tool surface filtered by the supervisor's own surface bound
-//! and the definition's `tools` allowlist plus the `agent` tool itself for
-//! nesting (§5.4/§7), the supervisor's approval-policy projection, and an
-//! [`OriginRouter`] that bubbles every paused interaction to the root
-//! session's [`IpcApproval`] with the instance's attribution (§4/§7). The
-//! run's final assistant text becomes the instance report (the report
-//! contract of §4); the terminal transition goes through
-//! [`AgentInstanceRegistry::complete`] and is announced as
-//! [`Event::AgentInstanceFinished`].
+//! The drive task assembles the child from the definition: a `kind: local`
+//! definition builds a child facade agent (the layered system prompt of
+//! [`SUBAGENT_SKELETON`] + definition body, §4; the supervisor's tool surface
+//! filtered by the supervisor's own surface bound and the definition's
+//! `tools` allowlist plus the `agent` tool itself for nesting, §5.4/§7; the
+//! supervisor's approval-policy projection), while a `kind: acp` definition
+//! launches one external ACP process per instance and drives it through
+//! agent-lib's one-shot [`run_external_once`](agent_lib::facade::run_external_once)
+//! (§6, feature-gated `external-acp`). Both paths bubble every paused
+//! interaction to the root session's [`IpcApproval`] through an
+//! [`OriginRouter`] with the instance's attribution (§4/§6/§7). The run's
+//! final text (a local child's final assistant message, §4; the external
+//! peer's final message, §6) becomes the instance report; the terminal
+//! transition goes through [`AgentInstanceRegistry::complete`] and is
+//! announced as [`Event::AgentInstanceFinished`].
 //!
 //! `agent_result` (§5.1, D8) blocks on one instance's terminal state under a
 //! caller-bounded timeout (`timeout_secs`, default 600): it answers the
@@ -43,6 +47,11 @@ use std::{
     sync::{Arc, PoisonError, RwLock},
     time::Duration,
 };
+#[cfg(feature = "external-acp")]
+use std::{
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use agent_lib::{
     agent::{
@@ -52,6 +61,14 @@ use agent_lib::{
     },
     client::LlmClient,
     facade::{Agent, ModelRef, Tool, ToolContext, ToolResult},
+};
+#[cfg(feature = "external-acp")]
+use agent_lib::{
+    agent::{
+        BudgetLimits, CancellationToken,
+        external::{AcpAdapter, AcpConfig, ExternalSessionRegistry, GitWorktreeManager},
+    },
+    facade::{FacadeIds, ManagedExternalAgent, RegistryExternalSessionHandler, run_external_once},
 };
 use async_trait::async_trait;
 use mag_config::{AgentDefinition, AgentDefinitionRegistry, AgentKindDef};
@@ -373,10 +390,12 @@ fn spawn_instance(ctx: &Arc<InstanceSpawnContext>, args: Value) -> ToolResult {
              further instances; finish the task directly or report the blocker"
         ));
     }
-    if !matches!(definition.kind, AgentKindDef::Local { .. }) {
+    #[cfg(not(feature = "external-acp"))]
+    if matches!(definition.kind, AgentKindDef::ExternalAcp { .. }) {
         return ToolResult::error(format!(
-            "agent type `{agent_type}` is external (kind: acp); external instances are not \
-             supported yet (they land in M4)"
+            "agent type `{agent_type}` is external (kind: acp), but this build has the \
+             `external-acp` feature disabled; rebuild mag-core with the feature enabled (it is \
+             on by default) to spawn external instances"
         ));
     }
 
@@ -690,7 +709,12 @@ async fn drive_instance(
     instance: Arc<Instance>,
     task: String,
 ) {
-    let result = drive_local(&ctx, &definition, &instance, &task).await;
+    let result = match &definition.kind {
+        AgentKindDef::Local { .. } => drive_local(&ctx, &definition, &instance, &task).await,
+        AgentKindDef::ExternalAcp { .. } => {
+            drive_external(&ctx, &definition, &instance, &task).await
+        }
+    };
     let status = match result {
         Ok(report) => InstanceStatus::Completed { report },
         // A fired cancel handle means the registry already transitioned the
@@ -739,8 +763,7 @@ async fn drive_local(
         max_steps,
     } = &definition.kind
     else {
-        // The handler filters external definitions synchronously, so this is
-        // unreachable until M4 routes them to their own drive path.
+        // The dispatch matches on the kind, so this is unreachable.
         return Err(format!(
             "agent type `{}` is not a local definition",
             definition.name
@@ -807,6 +830,154 @@ async fn drive_local(
         .await
         .map_err(|error| error.to_string())?;
     Ok(output.reply.text().to_owned())
+}
+
+/// Launches one external ACP process for a `kind: acp` instance and drives it
+/// through agent-lib's one-shot [`run_external_once`] (`docs/dyn-agents.md`
+/// §6, TODO M4-1), returning the peer's final message as the instance report.
+///
+/// The runtime is assembled per instance with the parameters M3-5 recorded
+/// from the retired static-delegate path: an [`AcpConfig`] with a 120s
+/// request timeout, the definition's `env` overrides, and the session's
+/// worktree as the child's working directory, behind a fresh
+/// [`ExternalSessionRegistry`] (process isolation is natural — concurrent
+/// instances are independent processes; the registry is dropped with this
+/// drive task and `run_external_once`'s one-shot semantics reclaim the
+/// process at every terminal state). The peer's ACP permission requests
+/// bubble to the root session through the same [`OriginRouter`] the local
+/// path uses (§6: 与 local 一致的 origin 冒泡).
+///
+/// Cancellation bridges the instance's registry-fired cancel handle onto the
+/// one-shot call's [`CancellationToken`]: [`await_terminal`] observes the
+/// registry's `cancel` / `cancel_all` transition (this drive's own completion
+/// lands only after it returns, so a mid-drive terminal transition is always
+/// a cancel win), fires the token, and the call abandons the session and
+/// schedules its own cleanup sweep.
+#[cfg(feature = "external-acp")]
+async fn drive_external(
+    ctx: &Arc<InstanceSpawnContext>,
+    definition: &AgentDefinition,
+    instance: &Arc<Instance>,
+    task: &str,
+) -> Result<String, String> {
+    let AgentKindDef::ExternalAcp { command, env } = &definition.kind else {
+        // The dispatch matches on the kind, so this is unreachable.
+        return Err(format!(
+            "agent type `{}` is not an external ACP definition",
+            definition.name
+        ));
+    };
+    let Some((binary, args)) = split_external_command(command) else {
+        return Err(format!(
+            "agent type `{}` has an empty `command` (expected argv form, binary first)",
+            definition.name
+        ));
+    };
+
+    let mut acp_config =
+        AcpConfig::new(binary.clone(), args.clone()).with_timeout(Duration::from_secs(120));
+    for (key, value) in env {
+        acp_config = acp_config.with_env(key.clone(), value.clone());
+    }
+    let worktree = ctx.worktree.path().to_path_buf();
+    acp_config = acp_config.with_working_dir(worktree.clone());
+    let registry = Arc::new(ExternalSessionRegistry::with_worktree_manager(
+        Arc::new(AcpAdapter::new(acp_config)),
+        Arc::new(GitWorktreeManager::new().with_root(external_worktree_root())),
+    ));
+    let agent = ManagedExternalAgent::acp(binary, args)
+        .session_handler(Arc::new(RegistryExternalSessionHandler::new(registry)))
+        .worktree(worktree)
+        .build()
+        .map_err(|error| error.to_string())?;
+
+    let origin = Arc::new(OriginRouter {
+        label: instance.id.clone(),
+        depth: instance.depth,
+        parent: ctx.interaction.clone() as Arc<dyn InteractionHandler>,
+    });
+    let ids = FacadeIds::new();
+    let cancel = CancellationToken::new();
+    let drive = run_external_once(
+        &definition.name,
+        &agent,
+        &ids,
+        external_task(&definition.body, task),
+        Some(origin as Arc<dyn InteractionHandler>),
+        // No per-step budget maps onto a black-box external runtime
+        // (agent-lib's own one-shot callers pass an unbounded budget); the
+        // backstops are the ACP request timeout above and the instance's
+        // cooperative cancel.
+        BudgetLimits::unbounded(),
+        cancel.clone(),
+    );
+    tokio::pin!(drive);
+    let outcome = tokio::select! {
+        biased;
+        outcome = &mut drive => outcome,
+        _ = await_terminal(instance) => {
+            cancel.cancel();
+            drive.await
+        }
+    };
+    match outcome {
+        Ok(outcome) if outcome.completed => Ok(outcome.summary),
+        Ok(_) => Err(format!(
+            "external agent `{}` ended before completing its task",
+            definition.name
+        )),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// The feature-off counterpart of the external drive: the spawn handler
+/// refuses external definitions synchronously, so this only keeps the
+/// dispatch arm compiling and stays unreachable at runtime.
+#[cfg(not(feature = "external-acp"))]
+async fn drive_external(
+    _ctx: &Arc<InstanceSpawnContext>,
+    definition: &AgentDefinition,
+    _instance: &Arc<Instance>,
+    _task: &str,
+) -> Result<String, String> {
+    Err(format!(
+        "agent type `{}` is external (kind: acp), but this build has the `external-acp` feature \
+         disabled",
+        definition.name
+    ))
+}
+
+/// Builds an external instance's opening task (§6): the definition body is
+/// the task-frame template prepended to the caller's task.
+#[cfg(feature = "external-acp")]
+fn external_task(body: &str, task: &str) -> String {
+    let body = body.trim();
+    if body.is_empty() {
+        task.to_owned()
+    } else {
+        format!("{body}\n\n{task}")
+    }
+}
+
+/// Splits an argv-form external command into binary + args; `None` when the
+/// command is empty (TOML `[external_agents]` projection does not validate
+/// it, unlike the markdown frontmatter parser).
+#[cfg(feature = "external-acp")]
+fn split_external_command(command: &[String]) -> Option<(PathBuf, Vec<String>)> {
+    let (binary, args) = command.split_first()?;
+    Some((binary.into(), args.to_vec()))
+}
+
+/// Unique root for the per-instance ephemeral worktrees (the M3-5 recorded
+/// parameter: `temp_dir/mag-external-worktrees-{pid}-{counter}`).
+#[cfg(feature = "external-acp")]
+fn external_worktree_root() -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "mag-external-worktrees-{}-{unique}",
+        std::process::id()
+    ))
 }
 
 #[cfg(test)]
@@ -2185,5 +2356,383 @@ mod tests {
             layered.len(),
             SUBAGENT_SKELETON.len() + 2 + "Body text.".len()
         );
+    }
+
+    /// External ACP instance tests (TODO M4-1, `docs/dyn-agents.md` §6): a
+    /// `kind: acp` definition spawns one process per instance through the
+    /// same `agent` tool, and the one-shot drive reclaims it at every
+    /// terminal state. The fake-acp.sh 范式 follows the retired M3-5
+    /// `engine.rs:4457` infrastructure, extended with `hang` (cancel path)
+    /// and `permission` (origin bubbling) modes.
+    #[cfg(all(unix, feature = "external-acp"))]
+    mod external_acp {
+        use std::path::Path;
+
+        use mag_service::PermissionDecisionWire;
+
+        use super::*;
+
+        /// Writes the fake ACP agent script: a line-oriented JSON-RPC peer
+        /// logging every received frame to `$1` (the log path), answering
+        /// `initialize` / `session/new` / `session/prompt` in `$2` mode
+        /// (`success`, `crash_prompt`, `hang`, `permission`), and exiting on
+        /// `session/cancel` with a `SESSION_CANCELLED` marker. `$3` is the
+        /// session id to advertise. Returns `(script, log)`.
+        fn fake_acp_script(dir: &TempAgentsDir) -> (PathBuf, PathBuf) {
+            use std::os::unix::fs::PermissionsExt;
+
+            let script = dir.0.join("fake-acp.sh");
+            fs::write(
+                &script,
+                r#"#!/bin/sh
+set -eu
+MAG_FAKE_ACP_LOG="$1"
+mode="$2"
+session="$3"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$MAG_FAKE_ACP_LOG"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}'
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"%s"}}\n' "$session"
+      ;;
+    *'"method":"session/prompt"'*)
+      if [ "$mode" = "crash_prompt" ]; then exit 9; fi
+      if [ "$mode" = "hang" ]; then continue; fi
+      if [ "$mode" = "permission" ]; then
+        printf '{"jsonrpc":"2.0","id":100,"method":"session/request_permission","params":{"sessionId":"%s","toolCall":{"toolCallId":"call-1","title":"write src/x.rs"},"options":[{"optionId":"allow","name":"Allow","kind":"allow_once"},{"optionId":"reject","name":"Reject","kind":"reject_once"}]}}\n' "$session"
+        while IFS= read -r answer; do
+          printf '%s\n' "$answer" >> "$MAG_FAKE_ACP_LOG"
+          case "$answer" in
+            *'"id":100'*) break ;;
+          esac
+        done
+      fi
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"external summary"}}}}\n' "$session"
+      printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
+      ;;
+    *'"method":"session/cancel"'*)
+      printf '%s\n' 'SESSION_CANCELLED' >> "$MAG_FAKE_ACP_LOG"
+      exit 0
+      ;;
+  esac
+done
+"#,
+            )
+            .expect("write fake ACP script");
+            let mut permissions = fs::metadata(&script)
+                .expect("fake ACP script metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).expect("chmod fake ACP script");
+            (script, dir.0.join("fake-acp.log"))
+        }
+
+        /// Writes the `kind: acp` `peer` definition whose command runs the
+        /// fake script with the log path and mode as arguments.
+        fn write_peer_definition(dir: &TempAgentsDir, script: &Path, log: &Path, mode: &str) {
+            dir.write(
+                "peer.md",
+                &format!(
+                    "---\nname: peer\ndescription: fake ACP peer for tests\nkind: acp\ncommand: \
+                     [{}, {}, {mode}, mag-fake-acp-session]\n---\nTask frame template.\n",
+                    script.display(),
+                    log.display(),
+                ),
+            );
+        }
+
+        /// Polls the fake's log until `needle` appears (5s backstop via
+        /// [`await_until`]; a hang is a bug).
+        async fn await_log_line(log: &Path, needle: &'static str) {
+            await_until(|| {
+                fs::read_to_string(log)
+                    .map(|text| text.contains(needle))
+                    .unwrap_or(false)
+            })
+            .await;
+        }
+
+        /// The one-shot reclamation observable: the terminal sweep's
+        /// best-effort `session/cancel` reaches the fake, which logs it
+        /// (raw frame and/or the `SESSION_CANCELLED` marker) and exits.
+        async fn await_process_reclaimed(log: &Path) {
+            await_until(|| {
+                fs::read_to_string(log)
+                    .map(|text| {
+                        text.contains(r#""method":"session/cancel""#)
+                            || text.contains("SESSION_CANCELLED")
+                    })
+                    .unwrap_or(false)
+            })
+            .await;
+        }
+
+        #[test]
+        fn external_instance_completes_and_reclaims_the_process() {
+            run_local(async {
+                let dir = TempAgentsDir::new();
+                let (script, log) = fake_acp_script(&dir);
+                write_peer_definition(&dir, &script, &log, "success");
+                let client = FakeLlmClient::scripted_streams(supervisor_scripts(json!({
+                    "type": "peer",
+                    "task": "inspect the vault",
+                    "description": "acp work",
+                })));
+                let rig = rig(&client, ToolRegistry::with_builtins(), dir.definitions());
+                let mut subscriber = rig.events.subscribe();
+                let mut agent = supervisor_agent(&rig);
+
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    drive_supervisor(&mut agent, "please delegate"),
+                )
+                .await
+                .expect("supervisor turn completes");
+
+                let instance = rig.registry.get("peer-1").expect("instance registered");
+                assert_eq!(
+                    wait_terminal(&instance).await,
+                    InstanceStatus::Completed {
+                        report: "external summary".to_owned(),
+                    },
+                    "the peer's final message is the instance report"
+                );
+
+                // Lifecycle events in order, with the same wire shape as the
+                // local path.
+                let events = pending_events(&mut subscriber);
+                let started_at = events
+                    .iter()
+                    .position(|event| matches!(event, Event::AgentInstanceStarted { .. }))
+                    .expect("started event");
+                let finished_at = events
+                    .iter()
+                    .position(|event| matches!(event, Event::AgentInstanceFinished { .. }))
+                    .expect("finished event");
+                assert!(started_at < finished_at);
+                let Event::AgentInstanceStarted {
+                    id,
+                    instance_id,
+                    agent_type,
+                    description,
+                    depth,
+                } = &events[started_at]
+                else {
+                    unreachable!()
+                };
+                assert_eq!(*id, rig.ctx.session_id);
+                assert_eq!(instance_id, "peer-1");
+                assert_eq!(agent_type, "peer");
+                assert_eq!(description.as_deref(), Some("acp work"));
+                assert_eq!(*depth, 1);
+                assert_eq!(
+                    events[finished_at],
+                    Event::AgentInstanceFinished {
+                        id: rig.ctx.session_id,
+                        instance_id: "peer-1".to_owned(),
+                        agent_type: "peer".to_owned(),
+                        status: AgentInstanceStatusWire::Completed,
+                        report: Some("external summary".to_owned()),
+                        error: None,
+                    }
+                );
+
+                // The process was driven through the ACP handshake; the
+                // opening prompt carries the definition body as the
+                // task-frame template joined to the caller's task (§6).
+                let log_text = fs::read_to_string(&log).expect("fake ACP log");
+                assert!(
+                    log_text.contains(r#""method":"initialize""#)
+                        && log_text.contains(r#""method":"session/new""#)
+                        && log_text.contains(r#""method":"session/prompt""#),
+                    "the ACP process was driven: {log_text}"
+                );
+                assert!(
+                    log_text.contains("Task frame template.\\n\\ninspect the vault"),
+                    "body template joined to the task: {log_text}"
+                );
+
+                await_process_reclaimed(&log).await;
+            });
+        }
+
+        #[test]
+        fn external_instance_cancel_abandons_and_reclaims_the_process() {
+            run_local(async {
+                let dir = TempAgentsDir::new();
+                let (script, log) = fake_acp_script(&dir);
+                write_peer_definition(&dir, &script, &log, "hang");
+                let client = FakeLlmClient::scripted_streams(supervisor_scripts(json!({
+                    "type": "peer",
+                    "task": "hang on the prompt",
+                })));
+                let rig = rig(&client, ToolRegistry::with_builtins(), dir.definitions());
+                let mut subscriber = rig.events.subscribe();
+                let mut agent = supervisor_agent(&rig);
+
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    drive_supervisor(&mut agent, "please delegate"),
+                )
+                .await
+                .expect("supervisor turn completes");
+
+                let instance = rig.registry.get("peer-1").expect("instance registered");
+                // The fake received the prompt and is hanging on it.
+                await_log_line(&log, r#""method":"session/prompt""#).await;
+                assert_eq!(instance.status(), InstanceStatus::Running);
+
+                assert_eq!(
+                    rig.registry.cancel("peer-1"),
+                    Some(InstanceStatus::Cancelled)
+                );
+                assert!(instance.cancel_handle().is_cancelled());
+                assert_eq!(wait_terminal(&instance).await, InstanceStatus::Cancelled);
+
+                let event = next_matching(&mut subscriber, |event| {
+                    matches!(event, Event::AgentInstanceFinished { .. })
+                })
+                .await;
+                assert_eq!(
+                    event,
+                    Event::AgentInstanceFinished {
+                        id: rig.ctx.session_id,
+                        instance_id: "peer-1".to_owned(),
+                        agent_type: "peer".to_owned(),
+                        status: AgentInstanceStatusWire::Cancelled,
+                        report: None,
+                        error: None,
+                    }
+                );
+
+                await_process_reclaimed(&log).await;
+            });
+        }
+
+        #[test]
+        fn external_permission_request_bubbles_to_root_with_origin() {
+            run_local(async {
+                let dir = TempAgentsDir::new();
+                let (script, log) = fake_acp_script(&dir);
+                write_peer_definition(&dir, &script, &log, "permission");
+                let client = FakeLlmClient::scripted_streams(supervisor_scripts(json!({
+                    "type": "peer",
+                    "task": "write the file",
+                })));
+                let rig = rig(&client, ToolRegistry::with_builtins(), dir.definitions());
+                let mut subscriber = rig.events.subscribe();
+                let mut agent = supervisor_agent(&rig);
+
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    drive_supervisor(&mut agent, "please delegate"),
+                )
+                .await
+                .expect("supervisor turn completes");
+
+                // The peer's ACP `session/request_permission` pops on the root
+                // session's event stream with the instance's origin.
+                let event = next_matching(&mut subscriber, |event| {
+                    matches!(event, Event::InteractionRequested { .. })
+                })
+                .await;
+                let Event::InteractionRequested {
+                    request_id,
+                    origin,
+                    kind,
+                    ..
+                } = event
+                else {
+                    unreachable!()
+                };
+                assert_eq!(origin.delegate.as_deref(), Some("peer-1"));
+                assert_eq!(origin.depth, 1);
+                assert!(!origin.is_root());
+                let InteractionKindWire::Permission { action_id, .. } = kind else {
+                    panic!("expected a Permission interaction, got {kind:?}");
+                };
+
+                rig.ipc
+                    .respond(
+                        request_id,
+                        InteractionResponseWire::Permission {
+                            action_id,
+                            decision: PermissionDecisionWire::Approve,
+                        },
+                    )
+                    .expect("respond approve");
+
+                let instance = rig.registry.get("peer-1").expect("instance registered");
+                assert_eq!(
+                    wait_terminal(&instance).await,
+                    InstanceStatus::Completed {
+                        report: "external summary".to_owned(),
+                    },
+                    "the approved peer resumed and completed"
+                );
+                // The fake received the host's answer before finishing.
+                let log_text = fs::read_to_string(&log).expect("fake ACP log");
+                assert!(
+                    log_text.contains(r#""id":100"#),
+                    "the host's permission answer reached the peer: {log_text}"
+                );
+
+                await_process_reclaimed(&log).await;
+            });
+        }
+
+        #[test]
+        fn external_process_crash_marks_the_instance_failed() {
+            run_local(async {
+                let dir = TempAgentsDir::new();
+                let (script, log) = fake_acp_script(&dir);
+                write_peer_definition(&dir, &script, &log, "crash_prompt");
+                let client = FakeLlmClient::scripted_streams(supervisor_scripts(json!({
+                    "type": "peer",
+                    "task": "doomed",
+                })));
+                let rig = rig(&client, ToolRegistry::with_builtins(), dir.definitions());
+                let mut subscriber = rig.events.subscribe();
+                let mut agent = supervisor_agent(&rig);
+
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    drive_supervisor(&mut agent, "please delegate"),
+                )
+                .await
+                .expect("supervisor turn completes");
+
+                let instance = rig.registry.get("peer-1").expect("instance registered");
+                let status = wait_terminal(&instance).await;
+                let InstanceStatus::Failed { error } = status else {
+                    panic!("expected Failed, got {status:?}");
+                };
+                assert!(!error.is_empty(), "the failure carries a diagnostic");
+
+                let event = next_matching(&mut subscriber, |event| {
+                    matches!(event, Event::AgentInstanceFinished { .. })
+                })
+                .await;
+                let Event::AgentInstanceFinished {
+                    status,
+                    report,
+                    error: wire_error,
+                    ..
+                } = event
+                else {
+                    unreachable!()
+                };
+                assert_eq!(status, AgentInstanceStatusWire::Failed);
+                assert_eq!(report, None);
+                assert_eq!(wire_error, Some(error));
+
+                // The drive failing at all proves the crashed process is
+                // gone: a live-but-mute peer would leave the drive parked on
+                // its prompt read and `wait_terminal` would time out.
+            });
+        }
     }
 }

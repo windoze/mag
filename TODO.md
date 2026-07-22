@@ -1254,7 +1254,7 @@ child 面，防提权意图落空），已最小修复随本 review 提交；另
 
 ## M4 — external 实例化
 
-### M4-1 [TODO] mag-core：`agent` 工具 external 分派 + 生命周期 + fake-acp 测试
+### M4-1 [DONE] mag-core：`agent` 工具 external 分派 + 生命周期 + fake-acp 测试
 
 **目标**：`kind: acp` 的定义经同一 `agent` 工具 spawn，按实例拉起进程、完成回收。
 
@@ -1284,6 +1284,73 @@ child 面，防提权意图落空），已最小修复随本 review 提交；另
   session/request_permission，断言 InteractionRequested 带 origin）。
 - feature off 时编译干净（`cargo check -p mag-core --no-default-features` 或对应 feature
   组合）。门禁全绿。
+
+**完成记录**（2026-07-22）：
+
+- 改动（全部在 `crates/mag-core/src/instances/spawn.rs`）：
+  - spawn handler 同步段：`external-acp` feature on 时 `AgentKindDef::ExternalAcp` 与 Local
+    走同一注册/Started/`spawn_local` 路径；feature off 时 acp 类型 spawn 同步返回清晰错误
+    （指明 rebuild 需启用 `external-acp`，默认开启）。
+  - `drive_instance` 按 `definition.kind` 分派 `drive_local` / `drive_external`；
+    feature off 时 `drive_external` 为同签名 stub（spawn 已同步拒绝，运行期不可达）。
+  - `drive_external`（feature-gated）：task = `def.body` trim 后非空 + `"\n\n"` + 调用方
+    task（`external_task`，§6 任务框架模板）；**每实例新建** `ExternalSessionRegistry`，
+    组装参数照 M3-5 记录——`AcpConfig::new(binary, args).with_timeout(120s)` + 逐项
+    `with_env`（定义 env）+ `with_working_dir(ctx.worktree)`、
+    `GitWorktreeManager::new().with_root(temp_dir/mag-external-worktrees-{pid}-{counter})`、
+    `RegistryExternalSessionHandler`；`ManagedExternalAgent::acp(binary,
+    args).session_handler(..).worktree(ctx.worktree)`。registry 随驱动任务 drop，进程回收
+    由 `run_external_once` 的一次性语义（三终态 detached sweep）保证，无需 M3-5 旧
+    tracked-handler 常驻清扫。
+  - 驱动任务内调 `run_external_once(name, &agent, &FacadeIds::new(), task,
+    Some(origin_router), BudgetLimits::unbounded(), cancel)`：`parent_interaction` 复用
+    M3-3 的 `OriginRouter`（label=实例 id、depth=实例 depth；agent-lib 内层
+    `DelegationInteractionRouter` 的 origin 标注被它整体覆盖，与 local 路径一致冒泡到
+    root `IpcApproval`）；`outcome.completed` → `outcome.summary` 为实例报告；
+    `completed=false` → Failed，drive error → Failed。
+  - cancel 桥接：`run_external_once` 要 agent 层 `CancellationToken`，而实例持有 facade
+    `CancelHandle`（其 token 私有）。驱动任务 `tokio::select!` biased 竞争 drive future
+    与既有 `await_terminal(instance)`（check→enable→re-check→wait 无竞态范式）：驱动在
+    飞期间观察到终态迁移必是 registry `cancel`/`cancel_all` 胜（自身 complete 在 drive
+    返回后才发生），随即 fire token 让一次性调用自行 abandon + sweep，再 `drive.await`
+    收尸。无轮询、无泄漏 watcher。
+  - `describe_for_tool()` 的 `(acp)` 标注为 M2 既有，本任务未动；启动审批维持 M3-5 结论
+    （`[tools.agent]` 统一 per-tool tier），未额外做。
+- 偏差：
+  1. **budget 传 `BudgetLimits::unbounded()`**（任务单只写"传 budget"，§7"实例必须有预算
+     兜底"未对 external 落地字段）：external 运行时对 mag 是黑盒，agent-lib 自身一次性
+     调用测试也用 unbounded；external 实例的兜底是 ACP 120s 请求超时 + 实例协作式
+     cancel。定义模型当前无 external budget 字段，留作后续。
+  2. 空 `command` 防御：md frontmatter 解析已强制非空，TOML `[external_agents]` 投影不
+     校验——`split_external_command` 返回 `Option`，空 command 在 drive 时映射为
+     Failed（报文指明 argv 形式）。
+  3. fake-acp.sh 范式从 M3-5 删除的 `engine.rs:4457` 基建恢复并简化为纯 argv 传参
+     （log/mode/session），新增 `hang`（cancel 路径）与 `permission`（权限冒泡）两模式；
+     响应 id 硬编码 1/2/3 的依据复核为 adapter `next_request_id` 从 0 预增
+     （initialize=1、session/new=2、session/prompt=3）。
+- 测试（`spawn.rs` 新增 `#[cfg(all(unix, feature = "external-acp"))] mod external_acp`，
+  全离线、tempdir、共约 1.3s）：
+  - `external_instance_completes_and_reclaims_the_process`：spawn → 立即 running →
+    Completed(report="external summary")；Started/Finished 事件顺序与 wire 字段与
+    local 路径一致；fake 日志含 initialize/session/new/session/prompt 且 prompt 文本为
+    `Task frame template.\n\ninspect the vault`（模板拼接实证）；sweep 的
+    session/cancel 到达 fake（SESSION_CANCELLED）→ 进程退出。
+  - `external_instance_cancel_abandons_and_reclaims_the_process`：hang 模式卡 prompt →
+    `registry.cancel` → Cancelled + Finished(Cancelled) 事件 → sweep 回收
+    （session/cancel 到 fake）。
+  - `external_permission_request_bubbles_to_root_with_origin`：fake 发
+    `session/request_permission` → root 事件流 InteractionRequested 带
+    origin(delegate="peer-1", depth=1)、kind=Permission → 答 Approve → 对端收到
+    `"id":100` 应答后续跑完成。
+  - `external_process_crash_marks_instance_failed`：crash_prompt 模式 → Failed + 非空
+    诊断 + Finished(Failed)；drive 失败本身即进程已退出的实证（否则 wait_terminal
+    超时）。
+- 门禁结果（全部实跑）：`cargo fmt --all -- --check` ✅；聚焦测试（instances::spawn 21、
+  instances 全量 36、mag-core 154）✅；`cargo check -p mag-core --no-default-features`
+  ✅；`cargo clippy --all-targets -- -D warnings` ✅（0 warning）；
+  `cargo test --workspace` ✅（32 套件全 ok、0 failed）；`cargo doc --no-deps
+  --workspace` ✅（mag-config 1 个既有 rustdoc warning，同 M3-1..M3-6 记录）；新 4 测试
+  复跑一遍仍全绿，测试后 `ps` 无 fake-acp 进程残留。
 
 ### M4-R [TODO] M4 review：external 实例化
 
